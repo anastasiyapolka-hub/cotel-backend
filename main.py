@@ -1,13 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import json
 
 app = FastAPI()
 
-# Для MVP можно открыть CORS для всех, потом сузим
+# CORS (пока открытый, потом ограничим доменом фронта)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # позже сюда подставим URL фронта
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,26 +22,50 @@ async def health():
 @app.post("/analyze")
 async def analyze_chat(
     file: UploadFile = File(...),
-    params: str | None = Form(None),  # на будущее, пока можно не использовать
+    params: str | None = Form(None),  # параметры на будущее
 ):
-    # 1. читаем файл в память
+    # 1. Проверяем расширение файла
+    if not file.filename.lower().endswith(".json"):
+        raise HTTPException(
+            status_code=400,
+            detail="Ожидается JSON-файл экспорта Telegram (.json)",
+        )
+
+    # 2. Читаем файл в память
     raw_bytes = await file.read()
 
-    # 2. пробуем распарсить JSON
+    # 3. Пробуем распарсить JSON
     try:
-        chat_json = json.loads(raw_bytes)
-    except Exception as e:
-        return {"error": f"Не удалось прочитать JSON: {e}"}
+        data = json.loads(raw_bytes)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Ошибка: Файл не является корректным JSON."
+        )
 
-    # 3. простая заглушка: посчитаем количество сообщений
-    messages_count = 0
-    if isinstance(chat_json, dict) and "messages" in chat_json:
-        messages_count = len(chat_json["messages"])
+    # 4. Проверка структуры Telegram экспорта (опционально)
+    messages = data.get("messages")
+    if messages is None:
+        # необязательная проверка, но полезно
+        raise HTTPException(
+            status_code=400,
+            detail="JSON не содержит поле 'messages'. Возможно, экспорт выполнен в HTML-формате."
+        )
 
-    # 4. вернём результат фронту
+    if not isinstance(messages, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Поле 'messages' должно быть списком сообщений"
+        )
+
+    # 5. Количество сообщений
+    messages_count = len(messages)
+
+    # 6. Ответ фронту
     return {
         "status": "ok",
+        "message": "Файл успешно загружен",
         "filename": file.filename,
         "messages_count": messages_count,
-        "note": "Файл получен и распарсен. Аналитика LLM будет добавлена позже.",
+        "note": "Файл принят. Анализ LLM добавим позже."
     }
