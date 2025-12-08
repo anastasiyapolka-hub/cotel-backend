@@ -1,8 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import json
+import os
+from openai import OpenAI
 
 app = FastAPI()
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 # CORS (пока открытый, потом ограничим доменом фронта)
 app.add_middleware(
