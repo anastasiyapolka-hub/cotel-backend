@@ -22,7 +22,7 @@ async def health():
 @app.post("/analyze")
 async def analyze_chat(
     file: UploadFile = File(...),
-    params: str | None = Form(None),  # параметры на будущее
+    params: str | None = Form(None),
 ):
     # 1. Проверяем расширение файла
     if not file.filename.lower().endswith(".json"):
@@ -52,6 +52,9 @@ async def analyze_chat(
             detail="JSON не содержит поле 'messages'. Возможно, экспорт выполнен в HTML-формате."
         )
 
+    # 📌 Извлекаем имя чата (если есть)
+    chat_name = data.get("name") or data.get("title") or "Без названия"
+
     if not isinstance(messages, list):
         raise HTTPException(
             status_code=400,
@@ -67,5 +70,6 @@ async def analyze_chat(
         "message": "Файл успешно загружен",
         "filename": file.filename,
         "messages_count": messages_count,
+        "chat_name": chat_name,  # <--- ВОТ ЭТО
         "note": "Файл принят. Анализ LLM добавим позже."
     }
