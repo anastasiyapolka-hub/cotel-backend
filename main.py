@@ -46,14 +46,10 @@ async def analyze_chat(
     # 4. Проверка структуры Telegram экспорта (опционально)
     messages = data.get("messages")
     if messages is None:
-        # необязательная проверка, но полезно
         raise HTTPException(
             status_code=400,
             detail="JSON не содержит поле 'messages'. Возможно, экспорт выполнен в HTML-формате."
         )
-
-    # 📌 Извлекаем имя чата (если есть)
-    chat_name = data.get("name") or data.get("title") or "Без названия"
 
     if not isinstance(messages, list):
         raise HTTPException(
@@ -61,15 +57,33 @@ async def analyze_chat(
             detail="Поле 'messages' должно быть списком сообщений"
         )
 
-    # 5. Количество сообщений
+    # 📌 Извлекаем имя чата
+    chat_name = data.get("name") or data.get("title") or "Без названия"
+
+    # 📌 Извлекаем тип чата (сырой) и маппим в человекочитаемый русский
+    raw_type = (data.get("type") or "").lower()
+
+    type_map = {
+        "personal_chat": "Личный чат",
+        "private": "Личный чат",
+        "group": "Группа",
+        "supergroup": "Супергруппа",
+        "channel": "Канал",
+    }
+
+    chat_type = type_map.get(raw_type, "Чат")
+
+    # Количество сообщений
     messages_count = len(messages)
 
-    # 6. Ответ фронту
+    # Ответ фронту
     return {
         "status": "ok",
         "message": "Файл успешно загружен",
         "filename": file.filename,
         "messages_count": messages_count,
-        "chat_name": chat_name,  # <--- ВОТ ЭТО
+        "chat_name": chat_name,
+        "chat_type": chat_type,  # <─ добавили
         "note": "Файл принят. Анализ LLM добавим позже."
     }
+
