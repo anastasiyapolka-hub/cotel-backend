@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
 from openai import OpenAI
-from telethon import TelegramClient
 import os
 
 from telegram_service import (
@@ -13,10 +12,6 @@ from telegram_service import (
     fetch_chat_messages,
 )
 
-api_id = int(os.environ["TELEGRAM_API_ID"])
-api_hash = os.environ["TELEGRAM_API_HASH"]
-
-tg_client = TelegramClient("session_cotel", api_id, api_hash)
 app = FastAPI()
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
