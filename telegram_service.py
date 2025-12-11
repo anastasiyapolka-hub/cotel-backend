@@ -63,3 +63,6 @@ async def get_current_user():
         return None
 
     return await tg_client.get_me()
+
+async def fetch_chat_messages(chat_link: str, days: int = 7):
+    raise NotImplementedError("fetch_chat_messages will be implemented later")
