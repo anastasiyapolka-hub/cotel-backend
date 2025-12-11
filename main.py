@@ -3,10 +3,23 @@ from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
 from openai import OpenAI
+from telethon import TelegramClient
+import os
 
+from telegram_service import (
+    send_login_code,
+    confirm_login,
+    get_current_user,
+    fetch_chat_messages,
+)
+
+api_id = int(os.environ["TELEGRAM_API_ID"])
+api_hash = os.environ["TELEGRAM_API_HASH"]
+
+tg_client = TelegramClient("session_cotel", api_id, api_hash)
 app = FastAPI()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 # CORS (пока открытый, потом ограничим доменом фронта)
@@ -100,7 +113,7 @@ async def call_openai_summary(user_query: str, chat_name: str, text_messages):
         "Сделай ответ именно по запросу выше. Структурируй ответ в 3–6 абзацев или списком."
     )
 
-    completion = client.chat.completions.create(
+    completion = openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -209,4 +222,62 @@ async def analyze_chat(
         "result_type": result_type,
         "summary": summary
     }
+
+@app.post("/tg/send_code")
+async def tg_send_code(payload: dict):
+    phone = (payload.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(400, "PHONE_REQUIRED")
+    try:
+        await send_login_code(phone)
+    except Exception as e:
+        raise HTTPException(400, f"TELEGRAM_ERROR: {e}")
+    return {"status": "code_sent"}
+
+@app.post("/tg/confirm_code")
+async def tg_confirm_code(payload: dict):
+    phone = (payload.get("phone") or "").strip()
+    code = (payload.get("code") or "").strip()
+    if not phone or not code:
+        raise HTTPException(400, "PHONE_AND_CODE_REQUIRED")
+    try:
+        await confirm_login(phone, code)
+        me = await get_current_user()
+    except PhoneCodeInvalidError:
+        raise HTTPException(400, "PHONE_CODE_INVALID")
+    # SessionPasswordNeededError и т.п. — по мере необходимости
+    return {
+        "status": "authorized",
+        "user_id": me.id,
+        "username": me.username,
+        "first_name": me.first_name,
+        "phone": me.phone,
+    }
+
+@app.post("/tg/analyze_chat")
+async def tg_analyze_chat(payload: dict):
+    chat_link = (payload.get("chat_link") or "").strip()
+    user_query = (payload.get("user_query") or "").strip()
+    days = int(payload.get("days") or 7)
+
+    me = await get_current_user()
+    if not me:
+        raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
+
+    entity, messages = await fetch_chat_messages(chat_link, days)
+    chat_name = getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
+
+    summary = await call_openai_summary(
+        user_query=user_query,
+        chat_name=chat_name,
+        text_messages=messages,
+    )
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "chat_name": chat_name,
+        "messages_count": len(messages),
+    }
+
 
