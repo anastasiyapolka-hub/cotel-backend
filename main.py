@@ -17,7 +17,7 @@ app = FastAPI()
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-# CORS (пока открытый, потом ограничим доменом фронта)
+# CORS ( пока открытый, потом ограничим доменом фронта)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

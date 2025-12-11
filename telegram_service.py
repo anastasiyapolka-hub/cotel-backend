@@ -18,7 +18,7 @@ api_hash = os.environ["TELEGRAM_API_HASH"]
 tg_client = TelegramClient("session_cotel", api_id, api_hash)
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------
+# ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------
 
 async def ensure_connected():
     """Подключаемся к Telegram, если соединение отсутствует."""
