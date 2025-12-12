@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 import json
-import os
 from openai import OpenAI
 import os
 
@@ -14,17 +14,20 @@ from telegram_service import (
 
 app = FastAPI()
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-# CORS ( пока открытый, потом ограничим доменом фронта)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://cotel.onrender.com",
+        "http://localhost:3000",
+        "http://127.0.0.1:5500",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 
 @app.get("/health")
@@ -231,23 +234,54 @@ async def tg_send_code(payload: dict):
 
 @app.post("/tg/confirm_code")
 async def tg_confirm_code(payload: dict):
-    phone = (payload.get("phone") or "").strip()
-    code = (payload.get("code") or "").strip()
-    if not phone or not code:
-        raise HTTPException(400, "PHONE_AND_CODE_REQUIRED")
     try:
-        await confirm_login(phone, code)
-        me = await get_current_user()
-    except PhoneCodeInvalidError:
-        raise HTTPException(400, "PHONE_CODE_INVALID")
-    # SessionPasswordNeededError и т.п. — по мере необходимости
-    return {
-        "status": "authorized",
-        "user_id": me.id,
-        "username": me.username,
-        "first_name": me.first_name,
-        "phone": me.phone,
-    }
+        phone = (payload.get("phone") or "").strip()
+        code = (payload.get("code") or "").strip()
+
+        if not phone or not code:
+            raise HTTPException(
+                status_code=400,
+                detail="PHONE_AND_CODE_REQUIRED"
+            )
+
+        try:
+            # подтверждаем код
+            await confirm_login(phone, code)
+
+            # получаем текущего пользователя
+            me = await get_current_user()
+
+        except PhoneCodeInvalidError:
+            raise HTTPException(
+                status_code=400,
+                detail="PHONE_CODE_INVALID"
+            )
+
+        except SessionPasswordNeededError:
+            # на будущее: 2FA
+            raise HTTPException(
+                status_code=400,
+                detail="SESSION_PASSWORD_NEEDED"
+            )
+
+        return {
+            "status": "authorized",
+            "user_id": me.id,
+            "username": me.username,
+            "first_name": me.first_name,
+            "phone": me.phone,
+        }
+
+    except HTTPException:
+        # даём FastAPI вернуть нормальный ответ + CORS
+        raise
+
+    except Exception as e:
+        # ловим ВСЁ остальное, чтобы не было "No CORS headers"
+        raise HTTPException(
+            status_code=400,
+            detail=f"TG_CONFIRM_FAILED: {str(e)}"
+        )
 
 @app.post("/tg/analyze_chat")
 async def tg_analyze_chat(payload: dict):
