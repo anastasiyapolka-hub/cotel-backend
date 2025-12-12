@@ -252,18 +252,18 @@ async def tg_confirm_code(payload: dict):
             # получаем текущего пользователя
             me = await get_current_user()
 
-        except PhoneCodeInvalidError:
-            raise HTTPException(
-                status_code=400,
-                detail="PHONE_CODE_INVALID"
-            )
 
-        except SessionPasswordNeededError:
-            # на будущее: 2FA
-            raise HTTPException(
-                status_code=400,
-                detail="SESSION_PASSWORD_NEEDED"
-            )
+        except ValueError as ve:
+
+            err = str(ve)
+
+            if err == "PHONE_CODE_INVALID":
+                raise HTTPException(status_code=400, detail="PHONE_CODE_INVALID")
+
+            if err == "PASSWORD_NEEDED":
+                raise HTTPException(status_code=400, detail="SESSION_PASSWORD_NEEDED")
+
+            raise HTTPException(status_code=400, detail=f"TELEGRAM_ERROR: {err}")
 
         return {
             "status": "authorized",

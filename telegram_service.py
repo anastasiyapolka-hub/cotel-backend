@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime, timedelta, timezone
-
+from telethon.tl.types import Message
 from telethon import TelegramClient
 from telethon.errors import (
     PhoneCodeInvalidError,
@@ -68,5 +68,84 @@ async def get_current_user():
 
     return await tg_client.get_me()
 
+
 async def fetch_chat_messages(chat_link: str, days: int = 7):
-    raise NotImplementedError("fetch_chat_messages will be implemented later")
+    """
+    Возвращает:
+      entity: объект чата/канала (Telethon entity)
+      messages: список в формате [{date, from, text}, ...] для LLM
+    """
+    await ensure_connected()
+
+    if not await tg_client.is_user_authorized():
+        raise ValueError("TELEGRAM_NOT_AUTHORIZED")
+
+    if not chat_link:
+        raise ValueError("CHAT_LINK_REQUIRED")
+
+    # Нормализуем ввод: https://t.me/xxx -> xxx, @xxx -> xxx
+    link = chat_link.strip()
+    if "t.me/" in link:
+        link = link.split("t.me/")[-1].split("?")[0].strip("/")
+    if link.startswith("@"):
+        link = link[1:].strip()
+
+    # Дата отсечения
+    since_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
+
+    try:
+        entity = await tg_client.get_entity(link)
+    except Exception as e:
+        # сюда попадают: неверный username, приватный канал без доступа, и т.д.
+        raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+
+    collected = []
+    try:
+        # Telethon iter_messages возвращает от новых к старым
+        async for msg in tg_client.iter_messages(entity, limit=5000):
+            if not isinstance(msg, Message):
+                continue
+
+            # Иногда date может быть naive — приводим к UTC
+            msg_dt = msg.date
+            if msg_dt is None:
+                continue
+            if msg_dt.tzinfo is None:
+                msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+
+            # Как только дошли до сообщений старше периода — выходим
+            if msg_dt < since_dt:
+                break
+
+            text = (msg.message or "").strip()
+            if not text:
+                continue
+
+            sender_name = "Unknown"
+            try:
+                sender = await msg.get_sender()
+                if sender is not None:
+                    # username предпочтительнее, иначе имя/фамилия
+                    if getattr(sender, "username", None):
+                        sender_name = "@" + sender.username
+                    else:
+                        first = (getattr(sender, "first_name", "") or "").strip()
+                        last = (getattr(sender, "last_name", "") or "").strip()
+                        sender_name = (first + " " + last).strip() or "Unknown"
+            except Exception:
+                # если не получилось получить отправителя — не критично
+                pass
+
+            collected.append({
+                "date": msg_dt.isoformat(),
+                "from": sender_name,
+                "text": text,
+            })
+
+    except Exception as e:
+        raise ValueError(f"CHAT_FETCH_FAILED: {str(e)}")
+
+    # collected сейчас от новых к старым — разворачиваем, чтобы было "старые -> новые"
+    collected.reverse()
+
+    return entity, collected
