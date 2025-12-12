@@ -283,6 +283,40 @@ async def tg_confirm_code(payload: dict):
             detail=f"TG_CONFIRM_FAILED: {str(e)}"
         )
 
+@app.post("/tg/confirm_password")
+async def tg_confirm_password(payload: dict):
+    try:
+        password = (payload.get("password") or "").strip()
+
+        if not password:
+            raise HTTPException(
+                status_code=400,
+                detail="PASSWORD_REQUIRED"
+            )
+
+        # завершаем 2FA-авторизацию
+        await confirm_login(password=password)
+
+        me = await get_current_user()
+
+        return {
+            "status": "authorized",
+            "user_id": me.id,
+            "username": me.username,
+            "first_name": me.first_name,
+            "phone": me.phone,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"TG_PASSWORD_CONFIRM_FAILED: {str(e)}"
+        )
+
+
 @app.post("/tg/analyze_chat")
 async def tg_analyze_chat(payload: dict):
     chat_link = (payload.get("chat_link") or "").strip()
