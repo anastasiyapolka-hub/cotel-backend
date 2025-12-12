@@ -53,6 +53,10 @@ async def confirm_login(phone: str, code: str):
     except SessionPasswordNeededError:
         raise ValueError("PASSWORD_NEEDED")   # 2FA включена
 
+async def confirm_password(password: str):
+    await ensure_connected()
+    # завершает вход при включённой 2FA
+    await tg_client.sign_in(password=password)
 
 async def get_current_user():
     """

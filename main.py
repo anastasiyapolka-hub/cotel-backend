@@ -8,6 +8,7 @@ import os
 from telegram_service import (
     send_login_code,
     confirm_login,
+    confirm_password,
     get_current_user,
     fetch_chat_messages,
 )
@@ -295,7 +296,7 @@ async def tg_confirm_password(payload: dict):
             )
 
         # завершаем 2FA-авторизацию
-        await confirm_login(password=password)
+        await confirm_password(password)
 
         me = await get_current_user()
 
