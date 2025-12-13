@@ -9,6 +9,8 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneNumberInvalidError,
 )
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.errors import InviteHashInvalidError, InviteHashExpiredError, UserAlreadyParticipantError
 
 # Получаем ключи
 api_id = int(os.environ["TELEGRAM_API_ID"])
@@ -93,11 +95,55 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
     # Дата отсечения
     since_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    try:
-        entity = await tg_client.get_entity(link)
-    except Exception as e:
-        # сюда попадают: неверный username, приватный канал без доступа, и т.д.
-        raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+    # --- INVITE LINKS: t.me/+HASH or t.me/joinchat/HASH ---
+    invite_hash = None
+
+    # link после твоей нормализации может быть "+HASH"
+    if link.startswith("+"):
+        invite_hash = link[1:]
+
+    # или "joinchat/HASH"
+    if link.startswith("joinchat/"):
+        invite_hash = link.split("joinchat/")[-1].strip("/")
+
+    if invite_hash:
+        try:
+            invite = await tg_client(CheckChatInviteRequest(invite_hash))
+
+            # Если уже участник — Telethon вернёт объект с чатом
+            if hasattr(invite, "chat") and invite.chat:
+                entity = invite.chat
+            else:
+                # Иначе нужно вступить (для чтения приватной истории иначе доступа не будет)
+                try:
+                    upd = await tg_client(ImportChatInviteRequest(invite_hash))
+                    # upd может содержать chats/users; удобнее просто резолвить снова по hash через get_entity не надо
+                    # Берём первый чат из upd.chats, если есть
+                    if getattr(upd, "chats", None):
+                        entity = upd.chats[0]
+                    else:
+                        # fallback: если чатов нет — попробуем получить через invite.chat (на некоторых типах)
+                        entity = getattr(invite, "chat", None)
+                except UserAlreadyParticipantError:
+                    # если уже участник, но import вернул это — попробуем взять chat из invite
+                    entity = getattr(invite, "chat", None)
+
+            if not entity:
+                raise ValueError("INVITE_JOIN_FAILED")
+
+        except (InviteHashInvalidError, InviteHashExpiredError):
+            raise ValueError("INVITE_LINK_INVALID_OR_EXPIRED")
+
+        except Exception as e:
+            raise ValueError(f"INVITE_HANDLE_FAILED: {str(e)}")
+
+    else:
+        # --- обычный публичный username / @username ---
+        try:
+            entity = await tg_client.get_entity(link)
+        except Exception as e:
+            raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+
 
     collected = []
     try:

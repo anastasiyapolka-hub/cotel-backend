@@ -328,7 +328,11 @@ async def tg_analyze_chat(payload: dict):
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
-    entity, messages = await fetch_chat_messages(chat_link, days)
+    try:
+        entity, messages = await fetch_chat_messages(chat_link, days)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     chat_name = getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
 
     summary = await call_openai_summary(
