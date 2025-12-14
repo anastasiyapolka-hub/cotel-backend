@@ -198,7 +198,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
 from telethon.tl.types import User, Chat, Channel
 
-async def list_user_chats(limit: int = 300):
+async def list_user_chats(limit: int = 500):
     """
     Возвращает список доступных диалогов пользователя для выбора на фронте.
     Отдаём минимум полей: id, title, type, username (если есть).
