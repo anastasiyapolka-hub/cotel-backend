@@ -11,6 +11,7 @@ from telegram_service import (
     confirm_password,
     get_current_user,
     fetch_chat_messages,
+    list_user_chats,
 )
 
 app = FastAPI()
@@ -348,4 +349,21 @@ async def tg_analyze_chat(payload: dict):
         "messages_count": len(messages),
     }
 
+@app.get("/tg/chats")
+async def tg_list_chats(limit: int = 200):
+    me = await get_current_user()
+    if not me:
+        raise HTTPException(status_code=401, detail="TELEGRAM_NOT_AUTHORIZED")
+
+    try:
+        chats = await list_user_chats(limit=limit)
+        return {
+            "status": "ok",
+            "count": len(chats),
+            "chats": chats,
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TG_CHATS_FAILED: {str(e)}")
 

@@ -195,3 +195,53 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
     collected.reverse()
 
     return entity, collected
+
+from telethon.tl.types import User, Chat, Channel
+
+async def list_user_chats(limit: int = 300):
+    """
+    Возвращает список доступных диалогов пользователя для выбора на фронте.
+    Отдаём минимум полей: id, title, type, username (если есть).
+    """
+    await ensure_connected()
+
+    if not await tg_client.is_user_authorized():
+        raise ValueError("TELEGRAM_NOT_AUTHORIZED")
+
+    dialogs = await tg_client.get_dialogs(limit=limit)
+
+    result = []
+    for d in dialogs:
+        ent = d.entity
+
+        # Тип
+        if isinstance(ent, User):
+            chat_type = "user"
+            title = " ".join(filter(None, [getattr(ent, "first_name", None), getattr(ent, "last_name", None)])).strip()
+            if not title:
+                title = getattr(ent, "username", None) or f"User {ent.id}"
+        elif isinstance(ent, Chat):
+            chat_type = "group"
+            title = getattr(ent, "title", None) or f"Group {ent.id}"
+        elif isinstance(ent, Channel):
+            # Channel может быть и каналом, и супергруппой
+            chat_type = "channel" if getattr(ent, "broadcast", False) else "supergroup"
+            title = getattr(ent, "title", None) or f"Channel {ent.id}"
+        else:
+            # На всякий случай
+            continue
+
+        # Базовые поля
+        item = {
+            "id": ent.id,
+            "title": title,
+            "type": chat_type,
+            "username": getattr(ent, "username", None),
+        }
+
+        # (опционально) признаки для UI
+        # is_verified / is_scam / is_fake можно добавить позже, если захочешь
+
+        result.append(item)
+
+    return result
