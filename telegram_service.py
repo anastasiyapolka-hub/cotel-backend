@@ -138,14 +138,40 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
             raise ValueError(f"INVITE_HANDLE_FAILED: {str(e)}")
 
     else:
-        # --- обычный публичный username / @username ---
-        try:
-            entity = await tg_client.get_entity(link)
-        except Exception as e:
-            raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+        else:
+        # --- обычный публичный username / @username / numeric chat_id ---
+        entity = None
+
+        # 1) Если link — число, это chat_id из dialogs (частый случай)
+        if link.isdigit():
+            target_id = int(link)
+
+            try:
+                dialogs = await tg_client.get_dialogs(limit=500)
+                for d in dialogs:
+                    ent = d.entity
+                    if getattr(ent, "id", None) == target_id:
+                        entity = ent
+                        break
+            except Exception:
+                pass
+
+            # fallback: иногда срабатывает напрямую
+            if entity is None:
+                try:
+                    entity = await tg_client.get_entity(target_id)
+                except Exception as e:
+                    raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+
+        # 2) Иначе — username / @username
+        else:
+            try:
+                entity = await tg_client.get_entity(link)
+            except Exception as e:
+                raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
 
 
-    collected = []
+collected = []
     try:
         # Telethon iter_messages возвращает от новых к старым
         async for msg in tg_client.iter_messages(entity, limit=5000):
