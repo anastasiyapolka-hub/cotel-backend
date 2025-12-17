@@ -292,3 +292,37 @@ async def list_user_chats(limit: int = 500):
         result.append(item)
 
     return result
+
+# --- LOGOUT / CLEAN SESSION ---
+
+import os
+from pathlib import Path
+
+async def logout_telegram():
+    """
+    Корректно завершает сессию Telegram:
+    1) log_out() -> чтобы Telegram убрал активную сессию из списка устройств
+    2) disconnect()
+    3) удаляем локальные файлы session_cotel.session (и journal если есть)
+    """
+    await ensure_connected()
+
+    try:
+        # если уже авторизованы — делаем log_out, чтобы сессия исчезла в Telegram
+        if await tg_client.is_user_authorized():
+            await tg_client.log_out()
+    finally:
+        # на всякий случай рвём соединение, чтобы не держать sqlite-lock
+        try:
+            await tg_client.disconnect()
+        except Exception:
+            pass
+
+        # чистим локальный файл сессии
+        for fname in ["session_cotel.session", "session_cotel.session-journal"]:
+            try:
+                Path(fname).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    return True

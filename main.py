@@ -12,6 +12,7 @@ from telegram_service import (
     get_current_user,
     fetch_chat_messages,
     list_user_chats,
+    logout_telegram,
 )
 
 app = FastAPI()
@@ -366,4 +367,12 @@ async def tg_list_chats(limit: int = 200):
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_CHATS_FAILED: {str(e)}")
+
+@app.post("/tg/logout")
+async def tg_logout():
+    try:
+        await logout_telegram()
+        return {"status": "logged_out"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TG_LOGOUT_FAILED: {str(e)}")
 
