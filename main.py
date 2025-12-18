@@ -13,6 +13,8 @@ from telegram_service import (
     fetch_chat_messages,
     list_user_chats,
     logout_telegram,
+    qr_login_start,
+    qr_login_status,
 )
 
 app = FastAPI()
@@ -376,3 +378,22 @@ async def tg_logout():
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_LOGOUT_FAILED: {str(e)}")
 
+
+@app.post("/tg/qr/start")
+async def tg_qr_start():
+    try:
+        data = await qr_login_start()
+        return {"status": "ok", **data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TG_QR_START_FAILED: {str(e)}")
+
+
+@app.get("/tg/qr/status")
+async def tg_qr_status():
+    try:
+        data = await qr_login_status()
+        # если авторизованы — это уже готовая сессия Telethon, ничего отдельно сохранять не надо:
+        # tg_client сам пишет session файл "session_cotel.session" как и раньше :contentReference[oaicite:4]{index=4}
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")

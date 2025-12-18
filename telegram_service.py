@@ -1,5 +1,5 @@
 # telegram_service.py
-
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from telethon.tl.types import Message
@@ -11,6 +11,8 @@ from telethon.errors import (
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.errors import InviteHashInvalidError, InviteHashExpiredError, UserAlreadyParticipantError
+
+_qr_login = None  # telethon.tl.custom.qrlogin.QRLogin | None
 
 # Получаем ключи
 api_id = int(os.environ["TELEGRAM_API_ID"])
@@ -326,3 +328,80 @@ async def logout_telegram():
                 pass
 
     return True
+
+async def qr_login_start():
+    """
+    Создаёт новый QR login token/url.
+    Возвращает dict: {url, expires_iso}
+    """
+    global _qr_login
+    await ensure_connected()
+
+    # Важно: если уже есть активный QR — лучше пересоздать
+    # (особенно если пользователь нажимает повторно)
+    _qr_login = await tg_client.qr_login()
+
+    expires = getattr(_qr_login, "expires", None)
+    return {
+        "url": _qr_login.url,
+        "expires": expires.isoformat() if expires else None,
+    }
+
+async def qr_login_status():
+    """
+    Проверяет состояние QR login:
+    - waiting
+    - authorized
+    - expired
+    - password_needed
+    """
+    global _qr_login
+    await ensure_connected()
+
+    if _qr_login is None:
+        return {"status": "no_qr"}
+
+    # 1) проверка истечения по expires
+    expires = getattr(_qr_login, "expires", None)
+    if expires is not None:
+        now = datetime.now(timezone.utc)
+        exp = expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)
+        if now >= exp:
+            return {"status": "expired"}
+
+    # 2) неблокирующая проверка: “успел ли пользователь подтвердить QR”
+    try:
+        # ждём очень коротко; если не подтвердил — timeout => waiting
+        await asyncio.wait_for(_qr_login.wait(), timeout=0.2)
+
+        me = await get_current_user()
+        if not me:
+            # теоретически редко, но пусть будет
+            return {"status": "authorized", "username": None}
+
+        return {
+            "status": "authorized",
+            "user_id": me.id,
+            "username": me.username,
+            "first_name": me.first_name,
+            "phone": me.phone,
+        }
+
+    except asyncio.TimeoutError:
+        return {"status": "waiting"}
+
+    except SessionPasswordNeededError:
+        # Telegram потребовал 2FA после подтверждения QR
+        return {"status": "password_needed"}
+
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+async def qr_login_recreate():
+    global _qr_login
+    await ensure_connected()
+    if _qr_login is None:
+        return await qr_login_start()
+    await _qr_login.recreate()
+    expires = getattr(_qr_login, "expires", None)
+    return {"url": _qr_login.url, "expires": expires.isoformat() if expires else None}
