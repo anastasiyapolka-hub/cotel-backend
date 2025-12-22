@@ -7,3 +7,4 @@ SQLAlchemy>=2.0
 alembic
 asyncpg
 psycopg[binary]
+psycopg2-binary
