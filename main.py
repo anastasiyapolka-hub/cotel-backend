@@ -5,6 +5,13 @@ import json
 from openai import OpenAI
 import os
 
+from fastapi import Request, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+
+from db.session import get_db
+from db.models import BotUserLink
+
 from telegram_service import (
     send_login_code,
     confirm_login,
@@ -397,3 +404,57 @@ async def tg_qr_status():
         return data
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")
+
+
+@app.post("/tg/bot/webhook")
+async def tg_bot_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    # 1) Проверка секрета
+    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
+    if not expected or got != expected:
+        raise HTTPException(status_code=401, detail="WEBHOOK_SECRET_INVALID")
+
+    update = await request.json()
+
+    # 2) Извлечь message/chat/user/text
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+    text = (message.get("text") or "").strip()
+
+    telegram_chat_id = chat.get("id")
+    telegram_user_id = user.get("id")
+
+    if not telegram_chat_id:
+        return {"ok": True}
+
+    # 3) Реакция только на /start (MVP)
+    if not text.startswith("/start"):
+        return {"ok": True}
+
+    # 4) Upsert в bot_user_link по уникальному telegram_chat_id
+    stmt = insert(BotUserLink).values(
+        owner_user_id=None,  # пока нет auth — оставляем пустым
+        telegram_chat_id=telegram_chat_id,
+        telegram_user_id=telegram_user_id,
+        is_blocked=False,
+    ).on_conflict_do_update(
+        index_elements=["telegram_chat_id"],
+        set_={
+            "telegram_user_id": telegram_user_id,
+            "is_blocked": False,
+            "updated_at": sa.text("now()"),
+        },
+    )
+
+    await db.execute(stmt)
+    await db.commit()
+
+    return {"ok": True}
