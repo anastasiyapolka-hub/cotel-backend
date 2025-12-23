@@ -4,6 +4,7 @@ from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 import json
 from openai import OpenAI
 import os
+import sqlalchemy as sa
 
 from fastapi import Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
