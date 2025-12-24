@@ -5,6 +5,7 @@ import json
 from openai import OpenAI
 import os
 import sqlalchemy as sa
+import httpx
 
 from fastapi import Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +41,7 @@ app.add_middleware(
 )
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 @app.get("/health")
@@ -407,6 +408,16 @@ async def tg_qr_status():
         raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")
 
 
+async def bot_send_message(chat_id: int, text: str):
+    if not BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={
+            "chat_id": chat_id,
+            "text": text,
+        })
+
 @app.post("/tg/bot/webhook")
 async def tg_bot_webhook(
     request: Request,
@@ -455,7 +466,18 @@ async def tg_bot_webhook(
         },
     )
 
+
     await db.execute(stmt)
     await db.commit()
 
+    await bot_send_message(
+        telegram_chat_id,
+        "👋 Бот CoTel подключён.\n\n"
+        "Теперь ты можешь создавать подписки в веб-интерфейсе, "
+        "и я буду присылать уведомления, когда в чатах появятся нужные сообщения."
+    )
+
     return {"ok": True}
+
+
+
