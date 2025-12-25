@@ -9,6 +9,7 @@ import os
 import httpx
 import json
 import sqlalchemy as sa
+from datetime import datetime
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,13 +149,26 @@ async def call_openai_summary(user_query: str, chat_name: str, text_messages):
 
     return completion.choices[0].message.content.strip()
 
+def parse_dt(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            # ISO 8601: "2025-12-25T20:44:51+00:00"
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
+
 async def call_openai_subscription_match(prompt: str, chat_title: str, messages: list[dict]) -> dict:
     """
     Возвращает JSON строго по контракту:
     {found: bool, matches: [...], summary_reason: str, confidence: float}
     """
     # ограничим контекст, чтобы не сжечь токены на MVP
-    tail = messages[-250:]
+    tail = messages[-1000:]
 
     lines = []
     for m in tail:
@@ -220,6 +234,8 @@ async def call_openai_subscription_match(prompt: str, chat_title: str, messages:
             return json.loads(raw[start:end+1])
         raise
 
+
+
 @app.post("/subscriptions/run")
 async def run_subscriptions(db: AsyncSession = Depends(get_db)):
     t0 = time.perf_counter()
@@ -275,7 +291,11 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
         total_checked += checked
 
         # 5) Обновим last_message_id (если что-то прочитали)
-        newest_id = max([m["message_id"] for m in msgs], default=last_message_id)
+        ids = []
+        for m in msgs:
+            if isinstance(m, dict) and m.get("message_id") is not None:
+                ids.append(int(m["message_id"]))
+        newest_id = max(ids) if ids else last_message_id
 
         # 6) LLM вызываем только если есть что анализировать
         matches_written = 0
@@ -301,14 +321,17 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
 
             if found and isinstance(matches, list):
                 for m in matches:
+
+
                     mid = m.get("message_id")
                     if not mid:
                         continue
 
+                    ts = parse_dt(m.get("message_ts"))
                     stmt = insert(MatchEvent).values(
                         subscription_id=sub.id,
                         message_id=int(mid),
-                        message_ts=m.get("message_ts"),
+                        message_ts=ts,
                         author_id=m.get("author_id"),
                         author_display=m.get("author_display"),
                         excerpt=m.get("excerpt"),
@@ -319,7 +342,12 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                         constraint="uq_match_subscription_message"
                     )
 
-                    r = await db.execute(stmt)
+                    try:
+                        r = await db.execute(stmt)
+                    except Exception as e:
+                        # не валим всю подписку из-за одного матча
+                        print("MATCH_INSERT_FAILED", sub.id, mid, str(e))
+                        continue
                     # rowcount может быть 0 при конфликте (дедуп)
                     if getattr(r, "rowcount", 0) == 1:
                         matches_written += 1
