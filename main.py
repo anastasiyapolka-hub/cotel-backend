@@ -4,15 +4,22 @@ from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 import json
 from openai import OpenAI
 import os
-import sqlalchemy as sa
 import httpx
 
 from fastapi import Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
-from db.session import get_db
 from db.models import BotUserLink
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+import sqlalchemy as sa
+
+from db.models import Subscription, SubscriptionState  # как у тебя называется
+from db.session import get_db  # как у тебя называется
+from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 
 from telegram_service import (
     send_login_code,
@@ -479,5 +486,66 @@ async def tg_bot_webhook(
 
     return {"ok": True}
 
+@app.post("/subscriptions", response_model=SubscriptionOut)
+async def create_subscription(payload: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
+    # 1) создаём подписку
+    sub = Subscription(
+        owner_user_id=payload.owner_user_id,
+        name=payload.name,
+        source_mode=payload.source_mode,
+        chat_ref=payload.chat_ref,
+        chat_id=None,  # пока не резолвим в числовой id
+        frequency_minutes=payload.frequency_minutes,
+        prompt=payload.prompt,
+        is_active=payload.is_active,
+        status="active" if payload.is_active else "paused",
+        last_error=None,
+    )
 
+    db.add(sub)
+
+    try:
+        await db.flush()  # чтобы получить sub.id без commit
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="SUBSCRIPTION_CONFLICT")
+
+    # 2) сразу создаём subscription_state
+    state = SubscriptionState(
+        subscription_id=sub.id,
+        last_message_id=None,
+        last_checked_at=None,
+        last_success_at=None,
+    )
+    db.add(state)
+
+    await db.commit()
+    await db.refresh(sub)
+
+    return sub
+
+
+@app.get("/subscriptions", response_model=list[SubscriptionOut])
+async def list_subscriptions(db: AsyncSession = Depends(get_db)):
+    # пока без фильтра по owner_user_id — так как один пользователь
+    res = await db.execute(select(Subscription).order_by(Subscription.id.desc()))
+    return res.scalars().all()
+
+
+@app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
+async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    sub = res.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+
+    sub.is_active = payload.is_active
+    sub.status = "active" if payload.is_active else "paused"
+    sub.last_error = None
+    # updated_at у тебя server_default now() — но при update лучше руками:
+    sub.updated_at = sa.text("now()")  # или просто не трогать, если триггер/orm делает
+
+    await db.commit()
+    await db.refresh(sub)
+    return sub
 
