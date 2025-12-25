@@ -1,24 +1,25 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request, Depends
+
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
-import json
+
 from openai import OpenAI
 import os
 import httpx
+import json
+import sqlalchemy as sa
 
-from fastapi import Request, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
-
-from db.models import BotUserLink
-
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-import sqlalchemy as sa
+
 
 from db.models import Subscription, SubscriptionState  # как у тебя называется
 from db.session import get_db  # как у тебя называется
+from db.models import BotUserLink
+
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 
 from telegram_service import (
@@ -337,7 +338,6 @@ async def tg_confirm_password(payload: dict):
             detail=f"TG_PASSWORD_CONFIRM_FAILED: {str(e)}"
         )
 
-
 @app.post("/tg/analyze_chat")
 async def tg_analyze_chat(payload: dict):
     chat_link = (payload.get("chat_link") or "").strip()
@@ -394,7 +394,6 @@ async def tg_logout():
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_LOGOUT_FAILED: {str(e)}")
 
-
 @app.post("/tg/qr/start")
 async def tg_qr_start():
     try:
@@ -402,7 +401,6 @@ async def tg_qr_start():
         return {"status": "ok", **data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_START_FAILED: {str(e)}")
-
 
 @app.get("/tg/qr/status")
 async def tg_qr_status():
@@ -485,6 +483,12 @@ async def tg_bot_webhook(
     )
 
     return {"ok": True}
+
+@app.get("/tg/bot/link/status")
+async def tg_bot_link_status(db: AsyncSession = Depends(get_db)):
+    q = select(sa.func.count()).select_from(BotUserLink).where(BotUserLink.is_blocked == False)  # noqa: E712
+    count = (await db.execute(q)).scalar_one()
+    return {"connected": count > 0}
 
 @app.post("/subscriptions", response_model=SubscriptionOut)
 async def create_subscription(payload: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
