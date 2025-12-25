@@ -760,7 +760,7 @@ async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: 
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
-    # updated_at у тебя server_default now() — но при update лучше руками:
+    # updated_at у тебя server_default now() — но  при update лучше руками:
     sub.updated_at = sa.text("now()")  # или просто не трогать, если триггер/orm делает
 
     await db.commit()
