@@ -16,11 +16,14 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 
-from db.models import Subscription, SubscriptionState  # как у тебя называется
+from db.models import Subscription, SubscriptionState, MatchEvent  # как у тебя называется
 from db.session import get_db  # как у тебя называется
 from db.models import BotUserLink
 
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
+
+import time
+from datetime import datetime, timedelta, timezone
 
 from telegram_service import (
     send_login_code,
@@ -32,6 +35,7 @@ from telegram_service import (
     logout_telegram,
     qr_login_start,
     qr_login_status,
+    fetch_chat_messages_for_subscription,
 )
 
 app = FastAPI()
@@ -143,6 +147,216 @@ async def call_openai_summary(user_query: str, chat_name: str, text_messages):
     )
 
     return completion.choices[0].message.content.strip()
+
+async def call_openai_subscription_match(prompt: str, chat_title: str, messages: list[dict]) -> dict:
+    """
+    Возвращает JSON строго по контракту:
+    {found: bool, matches: [...], summary_reason: str, confidence: float}
+    """
+    # ограничим контекст, чтобы не сжечь токены на MVP
+    tail = messages[-250:]
+
+    lines = []
+    for m in tail:
+        mid = m.get("message_id")
+        ts = m.get("message_ts")
+        a = m.get("author_display") or "Unknown"
+        txt = m.get("text") or ""
+        lines.append(f"[{mid}] [{ts}] {a}: {txt}")
+
+    context = "\n".join(lines)
+    if not context:
+        return {"found": False, "matches": [], "summary_reason": "Нет текстовых сообщений.", "confidence": 0.0}
+
+    system_prompt = (
+        "Ты ассистент, который ищет смысловые совпадения в новых сообщениях Telegram-чата.\n"
+        "Ответь СТРОГО валидным JSON без markdown/кода/комментариев.\n"
+        "Если совпадений нет — found=false и matches=[]\n"
+        "message_id бери только из входных строк вида [12345].\n"
+    )
+
+    user_prompt = (
+        f"Название чата: {chat_title}\n\n"
+        f"Запрос подписки пользователя:\n{prompt}\n\n"
+        f"Новые сообщения (каждая строка содержит message_id в квадратных скобках):\n{context}\n\n"
+        "Верни JSON формата:\n"
+        "{\n"
+        '  "found": true/false,\n'
+        '  "matches": [\n'
+        "    {\n"
+        '      "message_id": 123,\n'
+        '      "message_ts": "ISO8601",\n'
+        '      "author_display": "string",\n'
+        '      "author_id": 123,\n'
+        '      "excerpt": "string",\n'
+        '      "reason": "string"\n'
+        "    }\n"
+        "  ],\n"
+        '  "summary_reason": "string",\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+    )
+
+    raw = completion.choices[0].message.content.strip()
+
+    # простая, но рабочая защита от “лишнего текста”
+    import json
+    try:
+        return json.loads(raw)
+    except Exception:
+        # попытка вытащить JSON-блок
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(raw[start:end+1])
+        raise
+
+@app.post("/subscriptions/run")
+async def run_subscriptions(db: AsyncSession = Depends(get_db)):
+    t0 = time.perf_counter()
+
+    # 1) Берём активные подписки (MVP: без owner_user_id фильтра)
+    res = await db.execute(
+        select(Subscription).where(Subscription.is_active == True)
+    )
+    subs = list(res.scalars().all())
+
+    total_checked = 0
+    total_matches = 0
+    processed = 0
+
+    now = datetime.now(timezone.utc)
+
+    for sub in subs:
+        processed += 1
+
+        # 2) Берём state
+        st_res = await db.execute(
+            select(SubscriptionState).where(SubscriptionState.subscription_id == sub.id)
+        )
+        st = st_res.scalar_one_or_none()
+
+        last_message_id = getattr(st, "last_message_id", None) if st else None
+
+        # 3) Определяем окно чтения
+        #    - если last_message_id нет => читаем за frequency_minutes назад (первый запуск)
+        #    - если есть => читаем только новые по min_id, since_dt оставляем тоже как “страховку”
+        freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
+        since_dt = now - timedelta(minutes=freq_min)
+
+        # 4) Читаем сообщения
+        try:
+            entity, msgs = await fetch_chat_messages_for_subscription(
+                chat_link=sub.chat_ref,
+                since_dt=since_dt,
+                min_id=int(last_message_id) if last_message_id else None,
+                limit=3000,
+            )
+        except Exception as e:
+            # пишем ошибку в подписку и идём дальше
+            await db.execute(
+                update(Subscription)
+                .where(Subscription.id == sub.id)
+                .values(status="error", last_error=str(e), updated_at=sa.func.now())
+            )
+            await db.commit()
+            continue
+
+        checked = len(msgs)
+        total_checked += checked
+
+        # 5) Обновим last_message_id (если что-то прочитали)
+        newest_id = max([m["message_id"] for m in msgs], default=last_message_id)
+
+        # 6) LLM вызываем только если есть что анализировать
+        matches_written = 0
+        if checked > 0:
+            chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
+            try:
+                llm_json = await call_openai_subscription_match(
+                    prompt=sub.prompt,
+                    chat_title=chat_title,
+                    messages=msgs,
+                )
+            except Exception as e:
+                await db.execute(
+                    update(Subscription)
+                    .where(Subscription.id == sub.id)
+                    .values(status="error", last_error=f"LLM_ERROR: {str(e)}", updated_at=sa.func.now())
+                )
+                await db.commit()
+                continue
+
+            found = bool(llm_json.get("found"))
+            matches = llm_json.get("matches") or []
+
+            if found and isinstance(matches, list):
+                for m in matches:
+                    mid = m.get("message_id")
+                    if not mid:
+                        continue
+
+                    stmt = insert(MatchEvent).values(
+                        subscription_id=sub.id,
+                        message_id=int(mid),
+                        message_ts=m.get("message_ts"),
+                        author_id=m.get("author_id"),
+                        author_display=m.get("author_display"),
+                        excerpt=m.get("excerpt"),
+                        reason=m.get("reason"),
+                        llm_payload=llm_json,
+                        notify_status="queued",
+                    ).on_conflict_do_nothing(
+                        constraint="uq_match_subscription_message"
+                    )
+
+                    r = await db.execute(stmt)
+                    # rowcount может быть 0 при конфликте (дедуп)
+                    if getattr(r, "rowcount", 0) == 1:
+                        matches_written += 1
+
+        total_matches += matches_written
+
+        # 7) Обновляем state
+        # state должен быть уже создан у тебя при создании подписки, но на всякий:
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+
+        st.last_checked_at = now
+        if newest_id:
+            st.last_message_id = int(newest_id)
+            st.last_success_at = now
+
+        db.add(st)
+
+        # 8) Обновим подписку “ok”
+        await db.execute(
+            update(Subscription)
+            .where(Subscription.id == sub.id)
+            .values(status="ok", last_error=None, updated_at=sa.func.now())
+        )
+
+        await db.commit()
+
+    elapsed = round(time.perf_counter() - t0, 2)
+
+    return {
+        "status": "ok",
+        "processed_subscriptions": processed,
+        "checked_messages": total_checked,
+        "found_matches": total_matches,
+        "elapsed_seconds": elapsed,
+        "ui_message": f"Проверено {total_checked} сообщений, найдено {total_matches}",
+    }
 
 @app.post("/analyze")
 async def analyze_chat(

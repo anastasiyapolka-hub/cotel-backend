@@ -1,6 +1,8 @@
 # telegram_service.py
 import asyncio
 import os
+
+from typing import Optional, Tuple, List, Dict
 from datetime import datetime, timedelta, timezone
 from telethon.tl.types import Message
 from telethon import TelegramClient
@@ -345,6 +347,81 @@ async def qr_login_start():
         "expires": expires.isoformat() if expires else None,
     }
 
+
+async def fetch_chat_messages_for_subscription(
+    chat_link: str,
+    since_dt: datetime,
+    min_id: Optional[int] = None,
+    limit: int = 3000,
+) -> Tuple[object, List[Dict]]:
+    """
+    Возвращает entity и список сообщений (старые -> новые) со стабильными message_id.
+    since_dt: нижняя граница по времени (UTC).
+    min_id: если задан — берём только сообщения с id > min_id (cursor).
+    """
+    await ensure_connected()
+
+    if not await tg_client.is_user_authorized():
+        raise ValueError("TELEGRAM_NOT_AUTHORIZED")
+
+    # нормализация, как в fetch_chat_messages
+    link = chat_link.strip()
+    if "t.me/" in link:
+        link = link.split("t.me/")[-1].split("?")[0].strip("/")
+    if link.startswith("@"):
+        link = link[1:].strip()
+
+    # резолв entity через уже существующую логику:
+    # проще всего: переиспользовать твой fetch_chat_messages для получения entity,
+    # но он тянет историю. Поэтому аккуратно: дернем get_entity аналогично.
+    # Минимально: попробуем get_entity на link; invite можно добавить позже.
+    entity = await tg_client.get_entity(link)
+
+    if since_dt.tzinfo is None:
+        since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    out = []
+    async for msg in tg_client.iter_messages(entity, limit=limit, min_id=min_id or 0):
+        if not msg or not getattr(msg, "date", None):
+            continue
+
+        msg_dt = msg.date
+        if msg_dt.tzinfo is None:
+            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+
+        # фильтр по времени (работает и для первого запуска)
+        if msg_dt < since_dt:
+            break
+
+        text = (msg.message or "").strip()
+        if not text:
+            continue
+
+        author_id = None
+        author_display = "Unknown"
+        try:
+            sender = await msg.get_sender()
+            if sender is not None:
+                author_id = getattr(sender, "id", None)
+                if getattr(sender, "username", None):
+                    author_display = "@" + sender.username
+                else:
+                    first = (getattr(sender, "first_name", "") or "").strip()
+                    last = (getattr(sender, "last_name", "") or "").strip()
+                    author_display = (first + " " + last).strip() or "Unknown"
+        except Exception:
+            pass
+
+        out.append({
+            "message_id": msg.id,
+            "message_ts": msg_dt.isoformat(),
+            "author_id": author_id,
+            "author_display": author_display,
+            "text": text,
+        })
+
+    out.reverse()  # старые -> новые
+    return entity, out
 
 async def qr_login_status():
     global _qr_login, _qr_wait_task
