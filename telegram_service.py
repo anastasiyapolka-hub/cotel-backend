@@ -27,11 +27,48 @@ tg_client = TelegramClient("session_cotel", api_id, api_hash)
 
 # ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------
 
+import re
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+
+INVITE_RE = re.compile(r"(?:t\.me\/\+|t\.me\/joinchat\/)([A-Za-z0-9_-]+)")
+
+async def resolve_entity_with_invite(client, chat_link: str):
+    link = (chat_link or "").strip()
+
+    # 1) invite-ссылка
+    m = INVITE_RE.search(link)
+    if m:
+        invite_hash = m.group(1)
+
+        info = await client(CheckChatInviteRequest(invite_hash))
+        # если уже участник — info.chat даст entity
+        chat = getattr(info, "chat", None)
+        if chat:
+            return chat
+
+        # если не участник — пробуем join
+        await client(ImportChatInviteRequest(invite_hash))
+
+        # после join повторяем check, чтобы получить chat entity
+        info2 = await client(CheckChatInviteRequest(invite_hash))
+        chat2 = getattr(info2, "chat", None)
+        if chat2:
+            return chat2
+
+        raise RuntimeError("INVITE_RESOLVE_FAILED")
+
+    # 2) обычная ссылка / username
+    # примеры: https://t.me/xxx, @xxx, xxx
+    link = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+    if link.startswith("@"):
+        link = link[1:]
+
+    return await client.get_entity(link)
+
 async def ensure_connected():
     """Подключаемся к Telegram, если соединение отсутствует."""
     if not tg_client.is_connected():
         await tg_client.connect()
-
 
 async def send_login_code(phone: str):
     """
@@ -42,7 +79,6 @@ async def send_login_code(phone: str):
         return await tg_client.send_code_request(phone)
     except PhoneNumberInvalidError:
         raise ValueError("PHONE_NUMBER_INVALID")
-
 
 async def confirm_login(phone: str, code: str):
     """
@@ -371,11 +407,8 @@ async def fetch_chat_messages_for_subscription(
     if link.startswith("@"):
         link = link[1:].strip()
 
-    # резолв entity через уже существующую логику:
-    # проще всего: переиспользовать твой fetch_chat_messages для получения entity,
-    # но он тянет историю. Поэтому аккуратно: дернем get_entity аналогично.
-    # Минимально: попробуем get_entity на link; invite можно добавить позже.
-    entity = await tg_client.get_entity(link)
+    # ВАЖНО: вместо get_entity — invite-aware резолвер
+    entity = await resolve_entity_with_invite(tg_client, chat_link)
 
     if since_dt.tzinfo is None:
         since_dt = since_dt.replace(tzinfo=timezone.utc)
