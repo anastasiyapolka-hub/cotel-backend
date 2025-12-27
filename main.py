@@ -286,6 +286,11 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             "matches_written": 0,
             "error": None,
             "llm_json": None,        # что вернула модель
+            "llm_found": None,
+            "llm_confidence": None,
+            "llm_summary_reason": None,
+            "llm_matches_count": 0,
+            "inserted_message_ids": [],
             "match_events": [],      # что реально записалось в БД
         }
 
@@ -321,6 +326,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             newest_id = max(ids) if ids else last_message_id
 
             matches_written = 0
+            inserted_message_ids: list[int] = []
 
             # 6) LLM — только если есть что анализировать
             if checked > 0:
@@ -331,6 +337,14 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                     chat_title=chat_title,
                     messages=msgs,
                 )
+
+                sub_report["llm_found"] = bool(llm_json.get("found")) if isinstance(llm_json, dict) else None
+                sub_report["llm_confidence"] = llm_json.get("confidence") if isinstance(llm_json, dict) else None
+                sub_report["llm_summary_reason"] = llm_json.get("summary_reason") if isinstance(llm_json,
+                                                                                                dict) else None
+                sub_report["llm_matches_count"] = len(llm_json.get("matches") or []) if isinstance(llm_json,
+                                                                                                   dict) else 0
+
                 sub_report["llm_json"] = llm_json
 
                 found = bool(llm_json.get("found"))
@@ -370,11 +384,14 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                             r = await db.execute(stmt)
                             if getattr(r, "rowcount", 0) == 1:
                                 matches_written += 1
+                                inserted_message_ids.append(int(mid))
+
                         except Exception as e:
                             # не валим всю подписку из-за одного матча
                             print("MATCH_INSERT_FAILED", sub.id, mid, str(e))
                             continue
 
+            sub_report["inserted_message_ids"] = inserted_message_ids
             sub_report["matches_written"] = matches_written
             total_matches += matches_written
 
@@ -398,17 +415,20 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
 
             await db.commit()
 
-            # 9) ДОСТАЁМ ИЗ БД все MatchEvent, созданные в этом запуске для этой подписки
-            ev_res = await db.execute(
-                select(MatchEvent)
-                .where(
-                    MatchEvent.subscription_id == sub.id,
-                    MatchEvent.created_at >= run_started_at,
+            # 9) Достаём из БД ровно те MatchEvent, которые реально вставили (без зависимости от времени БД)
+            if inserted_message_ids:
+                ev_res = await db.execute(
+                    select(MatchEvent)
+                    .where(
+                        MatchEvent.subscription_id == sub.id,
+                        MatchEvent.message_id.in_(inserted_message_ids),
+                    )
+                    .order_by(MatchEvent.message_id.asc())
                 )
-                .order_by(MatchEvent.created_at.asc())
-            )
-            evs = list(ev_res.scalars().all())
-            sub_report["match_events"] = [_serialize_match_event(ev) for ev in evs]
+                evs = list(ev_res.scalars().all())
+                sub_report["match_events"] = [_serialize_match_event(ev) for ev in evs]
+            else:
+                sub_report["match_events"] = []
 
         except Exception as e:
             sub_report["status"] = "error"
@@ -429,6 +449,13 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
 
     elapsed = round(time.perf_counter() - t0, 2)
 
+    # DEBUG: все строки match_events (лимит), чтобы смотреть что реально в БД
+    all_ev_res = await db.execute(
+        select(MatchEvent).order_by(MatchEvent.created_at.desc()).limit(200)
+    )
+    all_evs = list(all_ev_res.scalars().all())
+    debug_all_match_events = [_serialize_match_event(ev) for ev in all_evs]
+
     return {
         "status": "ok",
         "processed_subscriptions": len(subs),
@@ -437,6 +464,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
         "elapsed_seconds": elapsed,
         "ui_message": f"Проверено {total_checked} сообщений, найдено {total_matches}",
         "results": results,
+        "debug_all_match_events": debug_all_match_events,
     }
 
 
