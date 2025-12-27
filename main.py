@@ -237,228 +237,159 @@ async def call_openai_subscription_match(prompt: str, chat_title: str, messages:
         raise
 
 
+
+from datetime import datetime, timezone, timedelta
+import time
+import sqlalchemy as sa
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
+
+# ... остальные импорты у тебя уже есть
+
+def _serialize_match_event(ev) -> dict:
+    # ev = MatchEvent ORM object
+    return {
+        "id": ev.id,
+        "subscription_id": ev.subscription_id,
+        "message_id": ev.message_id,
+        "message_ts": ev.message_ts.isoformat() if ev.message_ts else None,
+        "author_id": ev.author_id,
+        "author_display": ev.author_display,
+        "excerpt": ev.excerpt,
+        "reason": ev.reason,
+        "llm_payload": ev.llm_payload,
+        "notify_status": ev.notify_status,
+        "created_at": ev.created_at.isoformat() if ev.created_at else None,
+    }
+
 @app.post("/subscriptions/run")
 async def run_subscriptions(db: AsyncSession = Depends(get_db)):
     t0 = time.perf_counter()
-    now = datetime.now(timezone.utc)
+    run_started_at = datetime.now(timezone.utc)
+    now = run_started_at
 
-
-    # 1) активные подписки
+    # 1) Берём активные подписки (MVP: без owner_user_id фильтра)
     res = await db.execute(select(Subscription).where(Subscription.is_active == True))
     subs = list(res.scalars().all())
 
-    # 2) state заранее (одним запросом)
-    st_res = await db.execute(select(SubscriptionState))
-    states = {s.subscription_id: s for s in st_res.scalars().all()}
-
-    sub_report = {
-        "subscription_id": sub.id,
-        "name": sub.name,
-        "chat_ref": sub.chat_ref,
-        "status": "ok",
-        "checked": 0,
-        "matches_written": 0,
-        "llm_found": False,
-        "llm_confidence": None,
-        "llm_summary_reason": None,
-        "matches": [],
-        "error": None,
-    }
-
-    # 3) группировка по chat_ref
-    groups = defaultdict(list)
-    for sub in subs:
-        groups[sub.chat_ref].append(sub)
-
+    results = []
     total_checked = 0
     total_matches = 0
-    processed = 0
-    results = []
 
-    for chat_ref, chat_subs in groups.items():
-        # --- вычисляем "широкое окно" для одного чтения Telethon ---
-        # earliest since_dt среди подписок
-        since_dt = now
-        any_no_cursor = False
-        min_cursor = None
+    for sub in subs:
+        sub_report = {
+            "subscription_id": sub.id,
+            "name": getattr(sub, "name", None),
+            "chat_ref": getattr(sub, "chat_ref", None),
+            "status": "ok",
+            "checked": 0,
+            "matches_written": 0,
+            "error": None,
+            "llm_json": None,        # что вернула модель
+            "match_events": [],      # что реально записалось в БД
+        }
 
-        for sub in chat_subs:
-            st = states.get(sub.id)
+        try:
+            # 2) Берём state
+            st_res = await db.execute(
+                select(SubscriptionState).where(SubscriptionState.subscription_id == sub.id)
+            )
+            st = st_res.scalar_one_or_none()
             last_message_id = getattr(st, "last_message_id", None) if st else None
 
+            # 3) Окно чтения
             freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
-            sub_since = now - timedelta(minutes=freq_min)
-            if sub_since < since_dt:
-                since_dt = sub_since
+            since_dt = now - timedelta(minutes=freq_min)
 
-            if not last_message_id:
-                any_no_cursor = True
-            else:
-                last_message_id = int(last_message_id)
-                min_cursor = last_message_id if min_cursor is None else min(min_cursor, last_message_id)
-
-        # если хоть у одной подписки нет cursor — min_id не применяем
-        min_id = None if any_no_cursor else min_cursor
-
-        # --- читаем телеграм 1 раз на чат ---
-        try:
+            # 4) Читаем сообщения из TG
             entity, msgs = await fetch_chat_messages_for_subscription(
-                chat_link=chat_ref,
+                chat_link=sub.chat_ref,
                 since_dt=since_dt,
-                min_id=min_id,
+                min_id=int(last_message_id) if last_message_id else None,
                 limit=3000,
             )
-        except Exception as e:
-            # пометим все подписки этого чата как error
-            for sub in chat_subs:
-                await db.execute(
-                    update(Subscription)
-                    .where(Subscription.id == sub.id)
-                    .values(status="error", last_error=str(e), updated_at=sa.func.now())
-                )
-                results.append({
-                    "subscription_id": sub.id,
-                    "name": getattr(sub, "name", None),
-                    "chat_ref": sub.chat_ref,
-                    "status": "error",
-                    "checked": 0,
-                    "matches_written": 0,
-                    "error": f"TELETHON_ERROR: {str(e)}",
-                    "llm_summary": None,
-                })
-            await db.commit()
-            continue
 
-        chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
-
-        # ids в общем пуле
-        pool_ids = [int(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("message_id") is not None]
-        pool_newest_id = max(pool_ids) if pool_ids else None
-
-        # --- прогоняем каждую подписку на одном и том же msgs ---
-        for sub in chat_subs:
-            processed += 1
-            sub_report = {
-                "subscription_id": sub.id,
-                "name": getattr(sub, "name", None),
-                "chat_ref": sub.chat_ref,
-                "status": "ok",
-                "checked": 0,
-                "matches_written": 0,
-                "error": None,
-                "llm_summary": None,
-            }
-
-            st = states.get(sub.id)
-            last_message_id = getattr(st, "last_message_id", None) if st else None
-            last_message_id = int(last_message_id) if last_message_id else None
-
-            freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
-            sub_since_dt = now - timedelta(minutes=freq_min)
-
-            # фильтруем сообщения под конкретную подписку
-            filtered = []
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue
-                mid = m.get("message_id")
-                if mid is None:
-                    continue
-                mid = int(mid)
-
-                if last_message_id and mid <= last_message_id:
-                    continue
-
-                # since_dt как "страховка"
-                mts = parse_iso_ts(m.get("message_ts"))
-                if mts and mts < sub_since_dt:
-                    continue
-
-                filtered.append(m)
-
-            checked = len(filtered)
+            checked = len(msgs)
             sub_report["checked"] = checked
             total_checked += checked
 
-            newest_id = None
-            if filtered:
-                newest_id = max(int(m["message_id"]) for m in filtered if m.get("message_id") is not None)
+            # 5) newest_id
+            ids = []
+            for m in msgs:
+                if isinstance(m, dict) and m.get("message_id") is not None:
+                    ids.append(int(m["message_id"]))
+            newest_id = max(ids) if ids else last_message_id
 
-            # LLM только если есть что анализировать
-            llm_json = None
+            matches_written = 0
+
+            # 6) LLM — только если есть что анализировать
             if checked > 0:
-                try:
-                    llm_json = await call_openai_subscription_match(
-                        prompt=sub.prompt,
-                        chat_title=chat_title,
-                        messages=filtered,
-                    )
-                except Exception as e:
-                    sub_report["status"] = "error"
-                    sub_report["error"] = f"LLM_ERROR: {str(e)}"
-                    await db.execute(
-                        update(Subscription)
-                        .where(Subscription.id == sub.id)
-                        .values(status="error", last_error=sub_report["error"], updated_at=sa.func.now())
-                    )
-                    results.append(sub_report)
-                    await db.commit()
-                    continue
+                chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
 
-                sub_report["llm_summary"] = llm_json.get("summary_reason")
+                llm_json = await call_openai_subscription_match(
+                    prompt=sub.prompt,
+                    chat_title=chat_title,
+                    messages=msgs,
+                )
+                sub_report["llm_json"] = llm_json
 
                 found = bool(llm_json.get("found"))
                 matches = llm_json.get("matches") or []
 
                 if found and isinstance(matches, list):
-                    for mm in matches:
-                        mid = mm.get("message_id")
+                    for m in matches:
+                        mid = m.get("message_id")
                         if not mid:
                             continue
 
-                        stmt = insert(MatchEvent).values(
-                            subscription_id=sub.id,
-                            message_id=int(mid),
-                            message_ts=parse_iso_ts(mm.get("message_ts")),  # FIX
-                            author_id=mm.get("author_id"),
-                            author_display=mm.get("author_display"),
-                            excerpt=mm.get("excerpt"),
-                            reason=mm.get("reason"),
-                            llm_payload=llm_json,
-                            notify_status="queued",
-                        ).on_conflict_do_nothing(
-                            constraint="uq_match_subscription_message"
+                        # ВАЖНО: message_ts должен быть datetime, не строка
+                        # (у тебя уже должен быть parse_dt/parse_iso_dt — используй его)
+                        ts = None
+                        try:
+                            ts = parse_dt(m.get("message_ts"))  # <-- у тебя уже есть этот хелпер
+                        except Exception:
+                            ts = None
+
+                        stmt = (
+                            insert(MatchEvent)
+                            .values(
+                                subscription_id=sub.id,
+                                message_id=int(mid),
+                                message_ts=ts,
+                                author_id=m.get("author_id"),
+                                author_display=m.get("author_display"),
+                                excerpt=m.get("excerpt"),
+                                reason=m.get("reason"),
+                                llm_payload=llm_json,
+                                notify_status="queued",
+                            )
+                            .on_conflict_do_nothing(constraint="uq_match_subscription_message")
                         )
 
                         try:
                             r = await db.execute(stmt)
+                            if getattr(r, "rowcount", 0) == 1:
+                                matches_written += 1
                         except Exception as e:
                             # не валим всю подписку из-за одного матча
                             print("MATCH_INSERT_FAILED", sub.id, mid, str(e))
                             continue
 
-                        if getattr(r, "rowcount", 0) == 1:
-                            sub_report["matches_written"] += 1
+            sub_report["matches_written"] = matches_written
+            total_matches += matches_written
 
-            total_matches += sub_report["matches_written"]
-
-            # state (создаём если нет)
+            # 7) Обновляем state
             if st is None:
                 st = SubscriptionState(subscription_id=sub.id)
-                states[sub.id] = st
 
             st.last_checked_at = now
             if newest_id:
                 st.last_message_id = int(newest_id)
                 st.last_success_at = now
-            elif pool_newest_id and last_message_id is None:
-                # если первый запуск и мы ничего не отфильтровали, можно хотя бы зафиксировать "где мы"
-                st.last_message_id = int(pool_newest_id)
-                st.last_success_at = now
 
             db.add(st)
 
-            # подписка ok
+            # 8) Обновим подписку “ok”
             await db.execute(
                 update(Subscription)
                 .where(Subscription.id == sub.id)
@@ -466,19 +397,49 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             )
 
             await db.commit()
-            results.append(sub_report)
+
+            # 9) ДОСТАЁМ ИЗ БД все MatchEvent, созданные в этом запуске для этой подписки
+            ev_res = await db.execute(
+                select(MatchEvent)
+                .where(
+                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.created_at >= run_started_at,
+                )
+                .order_by(MatchEvent.created_at.asc())
+            )
+            evs = list(ev_res.scalars().all())
+            sub_report["match_events"] = [_serialize_match_event(ev) for ev in evs]
+
+        except Exception as e:
+            sub_report["status"] = "error"
+            sub_report["error"] = str(e)
+
+            # на всякий — статус подписки тоже отметим
+            try:
+                await db.execute(
+                    update(Subscription)
+                    .where(Subscription.id == sub.id)
+                    .values(status="error", last_error=str(e), updated_at=sa.func.now())
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+        results.append(sub_report)
 
     elapsed = round(time.perf_counter() - t0, 2)
 
     return {
         "status": "ok",
-        "processed_subscriptions": processed,
+        "processed_subscriptions": len(subs),
         "checked_messages": total_checked,
         "found_matches": total_matches,
         "elapsed_seconds": elapsed,
         "ui_message": f"Проверено {total_checked} сообщений, найдено {total_matches}",
         "results": results,
     }
+
+
 
 @app.post("/analyze")
 async def analyze_chat(
