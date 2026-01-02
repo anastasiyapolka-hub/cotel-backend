@@ -12,7 +12,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from .base import Base
-
+import sqlalchemy as sa
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
@@ -83,6 +83,30 @@ class MatchEvent(Base):
 
     __table_args__ = (
         UniqueConstraint("subscription_id", "message_id", name="uq_match_subscription_message"),
+    )
+
+class DigestEvent(Base):
+    __tablename__ = "digest_events"
+
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
+
+    window_start = Column(DateTime(timezone=True), nullable=True)
+    window_end = Column(DateTime(timezone=True), nullable=True)
+
+    start_message_id = Column(BigInteger, nullable=True)
+    end_message_id = Column(BigInteger, nullable=True)
+
+    messages_seen = Column(Integer, nullable=False, server_default="0")
+    digest_text = Column(Text, nullable=False, server_default="")
+    llm_payload = Column(JSONB, nullable=True)
+
+    notify_status = Column(String(20), nullable=False, server_default="queued")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "end_message_id", name="uq_digest_subscription_endmsg"),
+        sa.Index("ix_digest_subscription_created", "subscription_id", "created_at"),
     )
 
 
