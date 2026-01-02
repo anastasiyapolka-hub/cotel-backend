@@ -23,6 +23,7 @@ class Subscription(Base):
 
     name = Column(String(200), nullable=False)
     source_mode = Column(String(20), nullable=False, default="personal")
+    subscription_type = Column(String(30), nullable=False, server_default="events")
 
     chat_ref = Column(Text, nullable=False)  # username/link/invite как ввёл пользователь
     chat_id = Column(BigInteger, nullable=True)  # нормализованный peer id (когда распарсим)
