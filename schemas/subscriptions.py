@@ -28,6 +28,7 @@ class SubscriptionOut(BaseModel):
     last_error: Optional[str]
     created_at: datetime
     updated_at: datetime
+    subscription_type: str
 
     class Config:
         from_attributes = True
