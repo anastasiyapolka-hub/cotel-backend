@@ -13,12 +13,12 @@ import time
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
 
-from db.models import Subscription, SubscriptionState, MatchEvent  # как у тебя называется
-from db.session import get_db  # как у тебя называется
-from db.models import BotUserLink
+from db.models import Subscription, SubscriptionState, DigestEvent, MatchEvent, BotUserLink
+from db.session import get_db
+
 
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 
@@ -940,6 +940,26 @@ async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: 
     await db.commit()
     await db.refresh(sub)
     return sub
+
+@app.delete("/subscriptions/{subscription_id}")
+async def delete_subscription(subscription_id: int, db: AsyncSession = Depends(get_db)):
+    # 1) проверим, что подписка существует
+    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    sub = res.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+
+    # 2) удаляем зависимые записи (в правильном порядке)
+    await db.execute(delete(MatchEvent).where(MatchEvent.subscription_id == subscription_id))
+    await db.execute(delete(DigestEvent).where(DigestEvent.subscription_id == subscription_id))
+    await db.execute(delete(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id))
+
+    # 3) удаляем саму подписку
+    await db.execute(delete(Subscription).where(Subscription.id == subscription_id))
+
+    await db.commit()
+    return {"status": "ok", "deleted_subscription_id": subscription_id}
+
 
 @app.post("/tg/bot/dispatch")
 async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
