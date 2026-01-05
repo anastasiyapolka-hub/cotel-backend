@@ -422,8 +422,8 @@ async def fetch_chat_messages_for_subscription(
         if msg_dt.tzinfo is None:
             msg_dt = msg_dt.replace(tzinfo=timezone.utc)
 
-        # фильтр по времени (работает и для первого запуска)
-        if msg_dt < since_dt:
+        # фильтр по времени используем только для первого запуска (когда cursor не задан)
+        if (min_id is None) and (msg_dt < since_dt):
             break
 
         text = (msg.message or "").strip()

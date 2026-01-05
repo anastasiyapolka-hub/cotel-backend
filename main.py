@@ -346,9 +346,17 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             st = st_res.scalar_one_or_none()
             last_message_id = getattr(st, "last_message_id", None) if st else None
 
-            # 3) Окно чтения
+            # 3) Окно чтения (events): cursor-first
             freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
-            since_dt = now - timedelta(minutes=freq_min)
+
+            if last_message_id:
+                # cursor-mode: берём всё после last_message_id, без временного окна
+                since_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                min_id = int(last_message_id)
+            else:
+                # first run: ограничиваем чтение окном времени
+                since_dt = now - timedelta(minutes=freq_min)
+                min_id = None
 
             # тип подписки
             sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
@@ -358,9 +366,10 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             entity, msgs = await fetch_chat_messages_for_subscription(
                 chat_link=sub.chat_ref,
                 since_dt=since_dt,
-                min_id=int(last_message_id) if last_message_id else None,
-                limit=3000,
+                min_id=min_id,
+                limit=1000,
             )
+
             if getattr(sub, "chat_id", None) is None:
                 ent_id = getattr(entity, "id", None)
                 if ent_id is not None:
@@ -414,7 +423,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                             # (у тебя уже должен быть parse_dt/parse_iso_dt — используй его)
                             ts = None
                             try:
-                                ts = parse_dt(m.get("message_ts"))  # <-- у тебя уже есть этот хелпер
+                                ts = parse_iso_ts(m.get("message_ts"))  # <-- у тебя уже есть этот хелпер
                             except Exception:
                                 ts = None
 
@@ -428,7 +437,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                                     author_display=m.get("author_display"),
                                     excerpt=m.get("excerpt"),
                                     reason=m.get("reason"),
-                                    llm_payload=llm_json,
+                                    llm_payload= {}, #llm_json, - убрали запись для каждой строки полного ответа ЛЛМ
                                     notify_status="queued",
                                 )
                                 .on_conflict_do_nothing(constraint="uq_match_subscription_message")
