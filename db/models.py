@@ -56,6 +56,7 @@ class SubscriptionState(Base):
     last_message_id = Column(BigInteger, nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     last_success_at = Column(DateTime(timezone=True), nullable=True)
+    next_run_at = Column(sa.DateTime(timezone=True), nullable=True)
 
 
 class MatchEvent(Base):
