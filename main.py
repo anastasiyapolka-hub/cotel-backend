@@ -370,6 +370,16 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                 limit=1000,
             )
 
+            # map для восстановления автора/времени по message_id
+            msg_by_id = {}
+            for mm in msgs:
+                try:
+                    mid0 = mm.get("message_id")
+                    if mid0 is not None:
+                        msg_by_id[int(mid0)] = mm
+                except Exception:
+                    continue
+
             if getattr(sub, "chat_id", None) is None:
                 ent_id = getattr(entity, "id", None)
                 if ent_id is not None:
@@ -421,11 +431,31 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
 
                             # ВАЖНО: message_ts должен быть datetime, не строка
                             # (у тебя уже должен быть parse_dt/parse_iso_dt — используй его)
+                            src = msg_by_id.get(int(mid))
+
+                            # timestamp: приоритет — исходное сообщение, fallback — LLM (если вдруг нужно)
                             ts = None
                             try:
-                                ts = parse_iso_ts(m.get("message_ts"))  # <-- у тебя уже есть этот хелпер
+                                if src and src.get("message_ts"):
+                                    ts = parse_iso_ts(src.get("message_ts"))
+                                else:
+                                    ts = parse_iso_ts(m.get("message_ts"))
                             except Exception:
                                 ts = None
+
+                            # author: строго из исходного сообщения
+                            author_id = None
+                            author_display = None
+                            if src:
+                                author_id = src.get("author_id")
+                                author_display = src.get("author_display")
+
+                            # excerpt: можно брать из LLM (как “цитату до 300”), но если хочешь “не коверкать” — бери из src["text"]
+                            excerpt = (m.get("excerpt") or "").strip()
+                            if not excerpt and src:
+                                excerpt = (src.get("text") or "").strip()
+                            if len(excerpt) > 300:
+                                excerpt = excerpt[:300].rstrip() + "…"
 
                             stmt = (
                                 insert(MatchEvent)
@@ -433,11 +463,11 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
                                     subscription_id=sub.id,
                                     message_id=int(mid),
                                     message_ts=ts,
-                                    author_id=m.get("author_id"),
-                                    author_display=m.get("author_display"),
-                                    excerpt=m.get("excerpt"),
+                                    author_id=author_id,
+                                    author_display=author_display,
+                                    excerpt=excerpt,
                                     reason=m.get("reason"),
-                                    llm_payload= {}, #llm_json, - убрали запись для каждой строки полного ответа ЛЛМ
+                                    llm_payload={},  # ты убрала payload — оставляем так
                                     notify_status="queued",
                                 )
                                 .on_conflict_do_nothing(constraint="uq_match_subscription_message")
@@ -811,13 +841,23 @@ async def tg_qr_status():
 
 async def bot_send_message(chat_id: int, text: str):
     if not BOT_TOKEN:
-        return
+        raise RuntimeError("BOT_TOKEN_MISSING")
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={
+        resp = await client.post(url, json={
             "chat_id": chat_id,
             "text": text,
+            "disable_web_page_preview": True,
         })
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"BOT_SEND_FAILED_HTTP_{resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"BOT_SEND_FAILED: {data}")
+
 
 @app.post("/tg/bot/webhook")
 async def tg_bot_webhook(
