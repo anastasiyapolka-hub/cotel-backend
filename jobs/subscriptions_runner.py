@@ -46,7 +46,11 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
             # важно: блокируем state-строки
             .with_for_update(skip_locked=True)
             # чтобы сначала брались самые "просроченные"
-            .order_by(SubscriptionState.next_run_at.asc().nullsfirst(), SubscriptionState.id.asc())
+            .order_by(
+                SubscriptionState.next_run_at.asc().nullsfirst(),
+                SubscriptionState.subscription_id.asc(),
+            )
+
             .limit(BATCH_SIZE)
         )
 
