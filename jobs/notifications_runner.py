@@ -88,7 +88,7 @@ async def run_tick() -> int:
 
                     ok = await bot_send_message(dest_chat_id=dest_chat_id, text=text)
                     if ok:
-                        # помечаем все события группы sent
+                        # помечаем все событи я группы sent
                         ids = [int(e.id) for e in events]
                         await db.execute(
                             update(MatchEvent).where(MatchEvent.id.in_(ids)).values(notify_status="sent")

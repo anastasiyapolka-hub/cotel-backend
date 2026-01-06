@@ -103,7 +103,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         limit=EVENTS_READ_LIMIT,
     )
 
-    # 2) Обновим chat_id при необходимости (как в /subscriptions/run) :contentReference[oaicite:6]{index=6}
+    # 2) Обновим chat_id при необходимост и (как в /subscriptions/run) :contentReference[oaicite:6]{index=6}
     async with db.begin():
         if getattr(sub, "chat_id", None) is None:
             ent_id = getattr(entity, "id", None)
