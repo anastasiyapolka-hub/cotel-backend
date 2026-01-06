@@ -6,7 +6,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal  # :contentReference[oaicite:9]{index=9}
-from models import BotUserLink, MatchEvent, Subscription
+from db.models import BotUserLink, MatchEvent, Subscription
 from main import build_tg_message_link, bot_send_message  # предполагаю, что bot_send_message у тебя в main.py
 
 

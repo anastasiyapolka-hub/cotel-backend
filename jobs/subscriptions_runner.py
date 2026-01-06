@@ -8,12 +8,11 @@ from sqlalchemy import select, update, or_
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal  # см. db/session.py :contentReference[oaicite:4]{index=4}
-from models import Subscription, SubscriptionState  # предполагаю стандартный импорт моделей
+from db.models import Subscription, SubscriptionState, MatchEvent  # предполагаю стандартный импорт моделей
 from main import (
     fetch_chat_messages_for_subscription,
     call_openai_subscription_match,
 )
-from models import MatchEvent  # если MatchEvent в models.py
 
 
 BATCH_SIZE = 20
