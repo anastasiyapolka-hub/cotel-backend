@@ -446,6 +446,8 @@ async def logout_telegram(db: AsyncSession, owner_user_id: int):
         # на всякий случай рвём соединение, чтобы не держать sqlite-lock
         try:
             await client.disconnect()
+            global tg_client
+            tg_client = None
         except Exception:
             pass
 
@@ -600,3 +602,12 @@ async def qr_login_recreate(db: AsyncSession, owner_user_id: int):
     await _qr_login.recreate()
     expires = getattr(_qr_login, "expires", None)
     return {"url": _qr_login.url, "expires": expires.isoformat() if expires else None}
+
+async def disconnect_tg_client():
+    global tg_client
+    if tg_client is not None:
+        try:
+            await tg_client.disconnect()
+        except Exception:
+            pass
+        tg_client = None

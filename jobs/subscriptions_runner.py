@@ -13,7 +13,7 @@ from main import (
     fetch_chat_messages_for_subscription,
     call_openai_subscription_match,
 )
-
+from telegram_service import disconnect_tg_client
 
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
@@ -173,42 +173,54 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
 
 async def run_tick() -> int:
     now_utc = datetime.now(timezone.utc)
+    exit_code = 0
 
-    async with AsyncSessionLocal() as db:
-        try:
-            due_ids = await _reserve_due_subscriptions(db, now_utc)
-        except SQLAlchemyError as e:
-            print(f"[subscriptions_runner] RESERVE_FAILED: {e}")
-            return 2
-
-    if not due_ids:
-        print("[subscriptions_runner] No due subscriptions")
-        return 0
-
-    # Обрабатываем по одной, но ошибки не валят весь тик
-    async with AsyncSessionLocal() as db:
-        for sub_id in due_ids:
+    try:
+        async with AsyncSessionLocal() as db:
             try:
-                await _process_one_subscription(db, sub_id, now_utc)
-                print(f"[subscriptions_runner] OK sub_id={sub_id}")
-            except Exception as e:
-                print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
+                due_ids = await _reserve_due_subscriptions(db, now_utc)
+            except SQLAlchemyError as e:
+                print(f"[subscriptions_runner] RESERVE_FAILED: {e}")
+                return 2  # это можно вернуть сразу: это системная ошибка
 
-                # быстрый ретрай: не ждать frequency,  а попробовать снова через RETRY_MINUTES
+        if not due_ids:
+            print("[subscriptions_runner] No due subscriptions")
+            return 0
+
+        # Обрабатываем по одной, но ошибки не валят весь тик
+        async with AsyncSessionLocal() as db:
+            for sub_id in due_ids:
                 try:
-                    async with db.begin():
-                        st = (
-                            await db.execute(
-                                select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
-                            )
-                        ).scalar_one_or_none()
-                        if st:
-                            st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
-                except Exception as e2:
-                    print(f"[subscriptions_runner] FAILED to schedule retry sub_id={sub_id} err={e2}")
+                    await _process_one_subscription(db, sub_id, now_utc)
+                    print(f"[subscriptions_runner] OK sub_id={sub_id}")
 
+                except Exception as e:
+                    print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
+                    exit_code = 1  # фиксируем, что были ошибки, но продолжаем цикл
 
-    return 0
+                    # быстрый ретрай: не ждать frequency, а попробовать снова через RETRY_MINUTES
+                    try:
+                        async with db.begin():
+                            st = (
+                                await db.execute(
+                                    select(SubscriptionState).where(
+                                        SubscriptionState.subscription_id == sub_id
+                                    )
+                                )
+                            ).scalar_one_or_none()
+                            if st:
+                                st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+                    except Exception as e2:
+                        print(f"[subscriptions_runner] FAILED to schedule retry sub_id={sub_id} err={e2}")
+
+        return exit_code
+
+    finally:
+        # ВАЖНО: этот disconnect отработает всегда — и при return 0, и при return 2, и при исключениях
+        try:
+            await disconnect_tg_client()
+        except Exception as e:
+            print(f"[subscriptions_runner] disconnect_tg_client FAILED: {e}")
 
 
 def main():
