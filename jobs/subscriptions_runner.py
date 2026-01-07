@@ -194,7 +194,7 @@ async def run_tick() -> int:
             except Exception as e:
                 print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
 
-                # быстрый ретрай: не ждать frequency, а попробовать снова через RETRY_MINUTES
+                # быстрый ретрай: не ждать frequency,  а попробовать снова через RETRY_MINUTES
                 try:
                     async with db.begin():
                         st = (

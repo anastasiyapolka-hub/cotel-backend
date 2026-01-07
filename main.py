@@ -315,7 +315,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
     now = run_started_at
     owner_user_id = DEV_OWNER_USER_ID  # пока так, потом будет реальный пользователь
 
-    # 1) Берём активные подписки (MVP: без owner_user_id фильтра)
+    # 1) Берём активные  подписки (MVP: без owner_user_id фильтра)
     res = await db.execute(select(Subscription).where(Subscription.is_active == True))
     subs = list(res.scalars().all())
 

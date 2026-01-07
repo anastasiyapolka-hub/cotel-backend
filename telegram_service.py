@@ -56,7 +56,7 @@ async def get_tg_client(db: AsyncSession, owner_user_id: int) -> TelegramClient:
     return tg_client
 
 
-# ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------
+# ---- ВСПОМОГАТЕЛЬНЫЕ  ФУНКЦИИ ---------------------------------------
 
 import re
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
