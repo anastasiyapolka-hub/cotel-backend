@@ -10,6 +10,8 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+
+
 from sqlalchemy.dialects.postgresql import JSONB
 from .base import Base
 import sqlalchemy as sa
@@ -131,4 +133,55 @@ class BotUserLink(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    email = Column(String(320), nullable=True, unique=True, index=True)
+    phone = Column(String(32), nullable=True, unique=True, index=True)
+
+    password_hash = Column(String(255), nullable=True)
+
+    plan = Column(String(32), nullable=False, server_default="free")
+    is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class TelegramSession(Base):
+    __tablename__ = "telegram_sessions"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    owner_user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Зашифрованная StringSession (Fernet ciphertext)
+    session_ciphertext = Column(Text, nullable=False)
+
+    is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        # На MVP удобно иметь максимум одну активную сессию на пользователя.
+        # В Postgres "partial unique index" делается отдельно миграцией.
+        # Поэтому тут оставляем просто обычный индекс через owner_user_id.
+        {},
     )

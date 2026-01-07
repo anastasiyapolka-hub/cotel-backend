@@ -17,6 +17,8 @@ from main import (
 
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
+LEASE_MINUTES = 5      # сколько держим "замок" на время обработки
+RETRY_MINUTES = 2      # через сколько повторять при ошибке
 
 
 def _is_due(last_success_at, freq_min: int, now_utc: datetime) -> bool:
@@ -64,7 +66,7 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
 
             # Резервирование: сразу двигаем next_run_at вперёд, чтобы другие инстансы не взяли
             st.last_checked_at = now_utc
-            st.next_run_at = now_utc + timedelta(minutes=freq_min)
+            st.next_run_at = now_utc + timedelta(minutes=LEASE_MINUTES)
 
             due_ids.append(int(sub.id))
 
@@ -190,8 +192,21 @@ async def run_tick() -> int:
                 await _process_one_subscription(db, sub_id, now_utc)
                 print(f"[subscriptions_runner] OK sub_id={sub_id}")
             except Exception as e:
-                # Важно: не валим весь runner
                 print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
+
+                # быстрый ретрай: не ждать frequency, а попробовать снова через RETRY_MINUTES
+                try:
+                    async with db.begin():
+                        st = (
+                            await db.execute(
+                                select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
+                            )
+                        ).scalar_one_or_none()
+                        if st:
+                            st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+                except Exception as e2:
+                    print(f"[subscriptions_runner] FAILED to schedule retry sub_id={sub_id} err={e2}")
+
 
     return 0
 

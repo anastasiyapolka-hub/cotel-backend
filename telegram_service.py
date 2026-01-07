@@ -11,8 +11,15 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneNumberInvalidError,
 )
-from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.errors import InviteHashInvalidError, InviteHashExpiredError, UserAlreadyParticipantError
+
+from cryptography.fernet import Fernet, InvalidToken
+from telethon.sessions import StringSession
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+from db.models import TelegramSession
 
 _qr_login = None  # telethon.tl.custom.qrlogin.QRLogin | None
 _qr_wait_task = None  # asyncio.Task | None
@@ -22,7 +29,31 @@ api_id = int(os.environ["TELEGRAM_API_ID"])
 api_hash = os.environ["TELEGRAM_API_HASH"]
 
 # Создаём клиент сессии
-tg_client = TelegramClient("session_cotel", api_id, api_hash)
+#tg_client = TelegramClient("session_cotel", api_id, api_hash) - старый код
+tg_client: TelegramClient | None = None
+
+async def get_tg_client(db: AsyncSession, owner_user_id: int) -> TelegramClient:
+    """
+    Возвращает подключенный TelegramClient.
+    Если в БД есть сессия — поднимаем из неё.
+    Если нет — создаём пустую сессию (для шага send_code / login).
+    """
+    global tg_client
+
+    if tg_client is not None:
+        # Если уже поднят — просто убедимся, что соединение есть
+        if not tg_client.is_connected():
+            await tg_client.connect()
+        return tg_client
+
+    ss = await load_user_telegram_session(db, owner_user_id)
+    if ss:
+        tg_client = TelegramClient(StringSession(ss), api_id, api_hash)
+    else:
+        tg_client = TelegramClient(StringSession(), api_id, api_hash)
+
+    await tg_client.connect()
+    return tg_client
 
 
 # ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------
@@ -31,6 +62,62 @@ import re
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 
 INVITE_RE = re.compile(r"(?:t\.me\/\+|t\.me\/joinchat\/)([A-Za-z0-9_-]+)")
+
+def encrypt_session(plain: str) -> str:
+    key = os.getenv("TELEGRAM_SESSION_ENC_KEY")
+    if not key:
+        raise RuntimeError("TELEGRAM_SESSION_ENC_KEY is not set")
+    f = Fernet(key.encode())
+    return f.encrypt(plain.encode("utf-8")).decode("utf-8")
+
+def decrypt_session(ciphertext: str) -> str:
+    key = os.getenv("TELEGRAM_SESSION_ENC_KEY")
+    if not key:
+        raise RuntimeError("TELEGRAM_SESSION_ENC_KEY is not set")
+    f = Fernet(key.encode())
+    try:
+        return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except InvalidToken as e:
+        raise RuntimeError("Invalid TELEGRAM session ciphertext or key") from e
+
+async def save_user_telegram_session(db: AsyncSession, owner_user_id: int, plain_string_session: str) -> None:
+    cipher = encrypt_session(plain_string_session)
+
+    # На MVP делаем: "одна активная сессия на user" → перезаписываем.
+    res = await db.execute(
+        select(TelegramSession).where(
+            TelegramSession.owner_user_id == owner_user_id,
+            TelegramSession.is_active == True,  # noqa: E712
+        )
+    )
+    row = res.scalar_one_or_none()
+
+    if row:
+        row.session_ciphertext = cipher
+        row.revoked_at = None
+        row.last_used_at = func.now()
+    else:
+        db.add(
+            TelegramSession(
+                owner_user_id=owner_user_id,
+                session_ciphertext=cipher,
+                is_active=True,
+            )
+        )
+
+    await db.commit()
+
+async def load_user_telegram_session(db: AsyncSession, owner_user_id: int) -> str | None:
+    res = await db.execute(
+        select(TelegramSession.session_ciphertext).where(
+            TelegramSession.owner_user_id == owner_user_id,
+            TelegramSession.is_active == True,  # noqa: E712
+        )
+    )
+    cipher = res.scalar_one_or_none()
+    if not cipher:
+        return None
+    return decrypt_session(cipher)
 
 async def resolve_entity_with_invite(client, chat_link: str):
     link = (chat_link or "").strip()
@@ -65,62 +152,65 @@ async def resolve_entity_with_invite(client, chat_link: str):
 
     return await client.get_entity(link)
 
-async def ensure_connected():
-    """Подключаемся к Telegram, если соединение отсутствует."""
-    if not tg_client.is_connected():
-        await tg_client.connect()
+async def ensure_connected(db: AsyncSession, owner_user_id: int):
+    client = await get_tg_client(db, owner_user_id)
+    if not client.is_connected():
+        await client.connect()
+    return client
 
-async def send_login_code(phone: str):
+async def export_string_session(db: AsyncSession, owner_user_id: int) -> str:
+    client = await ensure_connected(db, owner_user_id)
+    return client.session.save()
+
+async def send_login_code(db: AsyncSession, owner_user_id: int, phone: str):
     """
     Отправить код на телефон.
     """
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
     try:
-        return await tg_client.send_code_request(phone)
+        return await client.send_code_request(phone)
     except PhoneNumberInvalidError:
         raise ValueError("PHONE_NUMBER_INVALID")
 
-async def confirm_login(phone: str, code: str):
+async def confirm_login(db: AsyncSession, owner_user_id: int, phone: str, code: str):
     """
     Подтвердить код и завершить авторизацию.
     """
-    await ensure_connected()
-
+    client = await ensure_connected(db, owner_user_id)
     try:
-        me = await tg_client.sign_in(phone=phone, code=code)
+        me = await client.sign_in(phone=phone, code=code)
         return me
 
     except PhoneCodeInvalidError:
         raise ValueError("PHONE_CODE_INVALID")
-
     except SessionPasswordNeededError:
         raise ValueError("PASSWORD_NEEDED")   # 2FA включена
 
-async def confirm_password(password: str):
-    await ensure_connected()
+async def confirm_password(db: AsyncSession, owner_user_id: int, password: str):
+    client = await ensure_connected(db, owner_user_id)
     # завершает вход при включённой 2FA
-    await tg_client.sign_in(password=password)
+    await client.sign_in(password=password)
 
-async def get_current_user():
+async def get_current_user(db: AsyncSession, owner_user_id: int):
     """
     Проверить, авторизованы ли мы в Telegram.
     """
-    await ensure_connected()
-    if not await tg_client.is_user_authorized():
+    client = await ensure_connected(db, owner_user_id)
+    if not await client.is_user_authorized():
         return None
 
-    return await tg_client.get_me()
+    return await client.get_me()
 
 
-async def fetch_chat_messages(chat_link: str, days: int = 7):
+async def fetch_chat_messages(db: AsyncSession, owner_user_id: int, chat_link: str, days: int = 7):
     """
     Возвращает:
       entity: объект чата/канала (Telethon entity)
       messages: список в формате [{date, from, text}, ...] для LLM
     """
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
-    if not await tg_client.is_user_authorized():
+    if not await client.is_user_authorized():
         raise ValueError("TELEGRAM_NOT_AUTHORIZED")
 
     if not chat_link:
@@ -149,7 +239,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
     if invite_hash:
         try:
-            invite = await tg_client(CheckChatInviteRequest(invite_hash))
+            invite = await client(CheckChatInviteRequest(invite_hash))
 
             # Если уже участник — Telethon вернёт объект с чатом
             if hasattr(invite, "chat") and invite.chat:
@@ -157,7 +247,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
             else:
                 # Иначе нужно вступить (для чтения приватной истории иначе доступа не будет)
                 try:
-                    upd = await tg_client(ImportChatInviteRequest(invite_hash))
+                    upd = await client(ImportChatInviteRequest(invite_hash))
                     # upd может содержать chats/users; удобнее просто резолвить снова по hash через get_entity не надо
                     # Берём первый чат из upd.chats, если есть
                     if getattr(upd, "chats", None):
@@ -193,7 +283,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
             try:
 
-                dialogs = await tg_client.get_dialogs(limit=500)
+                dialogs = await client.get_dialogs(limit=500)
 
                 for d in dialogs:
 
@@ -214,7 +304,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
                 try:
 
-                    entity = await tg_client.get_entity(target_id)
+                    entity = await client.get_entity(target_id)
 
                 except Exception as e:
 
@@ -227,7 +317,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
             try:
 
-                entity = await tg_client.get_entity(link)
+                entity = await client.get_entity(link)
 
             except Exception as e:
 
@@ -236,7 +326,7 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
     collected = []
     try:
         # Telethon iter_messages возвращает от новых к старым
-        async for msg in tg_client.iter_messages(entity, limit=5000):
+        async for msg in client.iter_messages(entity, limit=5000):
             if not isinstance(msg, Message):
                 continue
 
@@ -286,17 +376,17 @@ async def fetch_chat_messages(chat_link: str, days: int = 7):
 
 from telethon.tl.types import User, Chat, Channel
 
-async def list_user_chats(limit: int = 500):
+async def list_user_chats(db: AsyncSession, owner_user_id: int, limit: int = 500):
     """
     Возвращает список доступных диалогов пользователя для выбора на фронте.
     Отдаём минимум полей: id, title, type, username (если есть).
     """
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
-    if not await tg_client.is_user_authorized():
+    if not await client.is_user_authorized():
         raise ValueError("TELEGRAM_NOT_AUTHORIZED")
 
-    dialogs = await tg_client.get_dialogs(limit=limit)
+    dialogs = await client.get_dialogs(limit=limit)
 
     result = []
     for d in dialogs:
@@ -339,23 +429,23 @@ async def list_user_chats(limit: int = 500):
 import os
 from pathlib import Path
 
-async def logout_telegram():
+async def logout_telegram(db: AsyncSession, owner_user_id: int):
     """
     Корректно завершает сессию Telegram:
     1) log_out() -> чтобы Telegram убрал активную сессию из списка устройств
     2) disconnect()
     3) удаляем локальные файлы session_cotel.session (и journal если есть)
     """
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
     try:
         # если уже авторизованы — делаем log_out, чтобы сессия исчезла в Telegram
-        if await tg_client.is_user_authorized():
-            await tg_client.log_out()
+        if await client.is_user_authorized():
+            await client.log_out()
     finally:
         # на всякий случай рвём соединение, чтобы не держать sqlite-lock
         try:
-            await tg_client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
 
@@ -368,11 +458,11 @@ async def logout_telegram():
 
     return True
 
-async def qr_login_start():
+async def qr_login_start(db: AsyncSession, owner_user_id: int):
     global _qr_login, _qr_wait_task
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
-    _qr_login = await tg_client.qr_login()
+    _qr_login = await client.qr_login()
 
     # создаём ОДИН task ожидания подтверждения
     _qr_wait_task = asyncio.create_task(_qr_login.wait())
@@ -385,6 +475,8 @@ async def qr_login_start():
 
 
 async def fetch_chat_messages_for_subscription(
+    db: AsyncSession,
+    owner_user_id: int,
     chat_link: str,
     since_dt: datetime,
     min_id: Optional[int] = None,
@@ -395,9 +487,9 @@ async def fetch_chat_messages_for_subscription(
     since_dt: нижняя граница по времени (UTC).
     min_id: если задан — берём только сообщения с id > min_id (cursor).
     """
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
-    if not await tg_client.is_user_authorized():
+    if not await client.is_user_authorized():
         raise ValueError("TELEGRAM_NOT_AUTHORIZED")
 
     # нормализация, как в fetch_chat_messages
@@ -408,13 +500,13 @@ async def fetch_chat_messages_for_subscription(
         link = link[1:].strip()
 
     # ВАЖНО: вместо get_entity — invite-aware резолвер
-    entity = await resolve_entity_with_invite(tg_client, chat_link)
+    entity = await resolve_entity_with_invite(client, chat_link)
 
     if since_dt.tzinfo is None:
         since_dt = since_dt.replace(tzinfo=timezone.utc)
 
     out = []
-    async for msg in tg_client.iter_messages(entity, limit=limit, min_id=min_id or 0):
+    async for msg in client.iter_messages(entity, limit=limit, min_id=min_id or 0):
         if not msg or not getattr(msg, "date", None):
             continue
 
@@ -456,9 +548,9 @@ async def fetch_chat_messages_for_subscription(
     out.reverse()  # старые -> новые
     return entity, out
 
-async def qr_login_status():
+async def qr_login_status(db: AsyncSession, owner_user_id: int):
     global _qr_login, _qr_wait_task
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
 
     if _qr_login is None or _qr_wait_task is None:
         return {"status": "no_qr"}
@@ -481,7 +573,7 @@ async def qr_login_status():
     # 3) task завершился: либо успех, либо 2FA, либо ошибка
     try:
         _qr_wait_task.result()  # если тут исключение — упадём в except
-        me = await get_current_user()
+        me = await get_current_user(db, owner_user_id)
         if not me:
             return {"status": "authorized", "username": None}
 
@@ -499,11 +591,12 @@ async def qr_login_status():
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-async def qr_login_recreate():
+async def qr_login_recreate(db: AsyncSession, owner_user_id: int):
     global _qr_login
-    await ensure_connected()
+    client = await ensure_connected(db, owner_user_id)
+
     if _qr_login is None:
-        return await qr_login_start()
+        return await qr_login_start(db, owner_user_id)
     await _qr_login.recreate()
     expires = getattr(_qr_login, "expires", None)
     return {"url": _qr_login.url, "expires": expires.isoformat() if expires else None}

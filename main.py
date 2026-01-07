@@ -36,6 +36,8 @@ from telegram_service import (
     qr_login_start,
     qr_login_status,
     fetch_chat_messages_for_subscription,
+    export_string_session,
+    save_user_telegram_session,
 )
 
 app = FastAPI()
@@ -54,6 +56,7 @@ app.add_middleware(
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 
 
 @app.get("/health")
@@ -102,7 +105,6 @@ def extract_text_messages(messages, limit: int = 100000):
 
     # берём только последние limit сообщений
     return text_msgs[-limit:]
-
 
 async def call_openai_summary(user_query: str, chat_name: str, text_messages):
     """
@@ -311,6 +313,7 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
     t0 = time.perf_counter()
     run_started_at = datetime.now(timezone.utc)
     now = run_started_at
+    owner_user_id = DEV_OWNER_USER_ID  # пока так, потом будет реальный пользователь
 
     # 1) Берём активные подписки (MVP: без owner_user_id фильтра)
     res = await db.execute(select(Subscription).where(Subscription.is_active == True))
@@ -362,8 +365,11 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
             sub_report["subscription_type"] = sub_type
 
+
             # 4) Читаем сообщения из TG
             entity, msgs = await fetch_chat_messages_for_subscription(
+                db,
+                owner_user_id,
                 chat_link=sub.chat_ref,
                 since_dt=since_dt,
                 min_id=min_id,
@@ -670,18 +676,21 @@ async def analyze_chat(
     }
 
 @app.post("/tg/send_code")
-async def tg_send_code(payload: dict):
+async def tg_send_code(payload: dict, db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     phone = (payload.get("phone") or "").strip()
     if not phone:
         raise HTTPException(400, "PHONE_REQUIRED")
     try:
-        await send_login_code(phone)
+        await send_login_code(db, owner_user_id, phone)
     except Exception as e:
         raise HTTPException(400, f"TELEGRAM_ERROR: {e}")
     return {"status": "code_sent"}
 
 @app.post("/tg/confirm_code")
-async def tg_confirm_code(payload: dict):
+async def tg_confirm_code(payload: dict, db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
     try:
         phone = (payload.get("phone") or "").strip()
         code = (payload.get("code") or "").strip()
@@ -694,11 +703,14 @@ async def tg_confirm_code(payload: dict):
 
         try:
             # подтверждаем код
-            await confirm_login(phone, code)
+            await confirm_login(db, owner_user_id, phone, code)
+
+            # сохранить string session в БД
+            ss = await export_string_session(db, owner_user_id)
+            await save_user_telegram_session(db, owner_user_id, ss)
 
             # получаем текущего пользователя
-            me = await get_current_user()
-
+            me = await get_current_user(db, owner_user_id)
 
         except ValueError as ve:
 
@@ -732,7 +744,9 @@ async def tg_confirm_code(payload: dict):
         )
 
 @app.post("/tg/confirm_password")
-async def tg_confirm_password(payload: dict):
+async def tg_confirm_password(payload: dict, db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     try:
         password = (payload.get("password") or "").strip()
 
@@ -743,9 +757,12 @@ async def tg_confirm_password(payload: dict):
             )
 
         # завершаем 2FA-авторизацию
-        await confirm_password(password)
+        await confirm_password(db, owner_user_id, password)
 
-        me = await get_current_user()
+        ss = await export_string_session(db, owner_user_id)
+        await save_user_telegram_session(db, owner_user_id, ss)
+
+        me = await get_current_user(db, owner_user_id)
 
         return {
             "status": "authorized",
@@ -765,17 +782,20 @@ async def tg_confirm_password(payload: dict):
         )
 
 @app.post("/tg/analyze_chat")
-async def tg_analyze_chat(payload: dict):
+async def tg_analyze_chat(payload: dict, db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     chat_link = (payload.get("chat_link") or "").strip()
     user_query = (payload.get("user_query") or "").strip()
     days = int(payload.get("days") or 7)
 
-    me = await get_current_user()
+    me = await get_current_user(db, owner_user_id)
+
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
     try:
-        entity, messages = await fetch_chat_messages(chat_link, days)
+        entity, messages = await fetch_chat_messages(db, owner_user_id, chat_link, days)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
@@ -795,13 +815,15 @@ async def tg_analyze_chat(payload: dict):
     }
 
 @app.get("/tg/chats")
-async def tg_list_chats(limit: int = 200):
-    me = await get_current_user()
+async def tg_list_chats(limit: int = 200, db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
+    me = await get_current_user(db, owner_user_id)
     if not me:
         raise HTTPException(status_code=401, detail="TELEGRAM_NOT_AUTHORIZED")
 
     try:
-        chats = await list_user_chats(limit=limit)
+        chats = await list_user_chats(db, owner_user_id,limit=limit)
         return {
             "status": "ok",
             "count": len(chats),
@@ -813,27 +835,36 @@ async def tg_list_chats(limit: int = 200):
         raise HTTPException(status_code=400, detail=f"TG_CHATS_FAILED: {str(e)}")
 
 @app.post("/tg/logout")
-async def tg_logout():
+async def tg_logout(db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     try:
-        await logout_telegram()
+        await logout_telegram(db, owner_user_id)
         return {"status": "logged_out"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_LOGOUT_FAILED: {str(e)}")
 
 @app.post("/tg/qr/start")
-async def tg_qr_start():
+async def tg_qr_start(db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     try:
-        data = await qr_login_start()
+        data = await qr_login_start(db, owner_user_id)
         return {"status": "ok", **data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_START_FAILED: {str(e)}")
 
 @app.get("/tg/qr/status")
-async def tg_qr_status():
+async def tg_qr_status(db: AsyncSession = Depends(get_db)):
+    owner_user_id = DEV_OWNER_USER_ID
+
     try:
-        data = await qr_login_status()
-        # если авторизованы — это уже готовая сессия Telethon, ничего отдельно сохранять не надо:
-        # tg_client сам пишет session файл "session_cotel.session" как и раньше :contentReference[oaicite:4]{index=4}
+        data = await qr_login_status(db, owner_user_id)
+
+        if isinstance(data, dict) and data.get("status") == "authorized":
+            ss = await export_string_session(db, owner_user_id)
+            await save_user_telegram_session(db, owner_user_id, ss)
+
         return data
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")
@@ -1008,7 +1039,6 @@ async def delete_subscription(subscription_id: int, db: AsyncSession = Depends(g
 
     await db.commit()
     return {"status": "ok", "deleted_subscription_id": subscription_id}
-
 
 @app.post("/tg/bot/dispatch")
 async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
