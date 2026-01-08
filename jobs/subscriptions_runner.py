@@ -9,12 +9,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal  # см. db/session.py :contentReference[oaicite:4]{index=4}
 from db.models import Subscription, SubscriptionState, MatchEvent  # предполагаю стандартный импорт моделей
-from main import (
-    fetch_chat_messages_for_subscription,
-    call_openai_subscription_match,
-)
-from telegram_service import disconnect_tg_client
+import os
 
+from main import call_openai_subscription_match  # оставить можно, но лучше тоже вынести (не обязательно сейчас)
+from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
+
+DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
 LEASE_MINUTES = 5      # сколько держим "замок" на время обработки
@@ -101,7 +101,10 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         min_id = None
 
     # 1) Читаем TG
+    owner_user_id = sub.owner_user_id or DEV_OWNER_USER_ID  # временно, пока один юзер
     entity, msgs = await fetch_chat_messages_for_subscription(
+        db=db,
+        owner_user_id=owner_user_id,
         chat_link=sub.chat_ref,
         since_dt=since_dt,
         min_id=min_id,
@@ -194,22 +197,30 @@ async def run_tick() -> int:
                     await _process_one_subscription(db, sub_id, now_utc)
                     print(f"[subscriptions_runner] OK sub_id={sub_id}")
 
-                except Exception as e:
-                    print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
-                    exit_code = 1  # фиксируем, что были ошибки, но продолжаем цикл
 
-                    # быстрый ретрай: не ждать frequency, а попробовать снова через RETRY_MINUTES
+                except Exception as e:
+
+                    print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
+                    exit_code = 1
+
+                    # ВАЖНО: текущую сессию лучше явно откатить
                     try:
-                        async with db.begin():
-                            st = (
-                                await db.execute(
-                                    select(SubscriptionState).where(
-                                        SubscriptionState.subscription_id == sub_id
+                        await db.rollback()
+                    except Exception:
+                        pass
+
+                    # быстрый ретрай — в ОТДЕЛЬНОЙ сессии, чтобы не упереться в "transaction already begun"
+                    try:
+                        async with AsyncSessionLocal() as db2:
+                            async with db2.begin():
+                                st = (
+                                    await db2.execute(
+                                        select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
                                     )
-                                )
-                            ).scalar_one_or_none()
-                            if st:
-                                st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+                                ).scalar_one_or_none()
+                                if st:
+                                    st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+
                     except Exception as e2:
                         print(f"[subscriptions_runner] FAILED to schedule retry sub_id={sub_id} err={e2}")
 
