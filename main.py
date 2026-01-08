@@ -925,19 +925,19 @@ async def tg_bot_webhook(
 
     # 4) Upsert в bot_user_link по уникальному telegram_chat_id
     stmt = insert(BotUserLink).values(
-        owner_user_id=None,  # пока нет auth — оставляем пустым
+        owner_user_id=DEV_OWNER_USER_ID,  # <-- ВАЖНО: MVP-привязка
         telegram_chat_id=telegram_chat_id,
         telegram_user_id=telegram_user_id,
         is_blocked=False,
     ).on_conflict_do_update(
         index_elements=["telegram_chat_id"],
         set_={
+            "owner_user_id": DEV_OWNER_USER_ID,  # <-- тоже обновляем
             "telegram_user_id": telegram_user_id,
             "is_blocked": False,
             "updated_at": sa.text("now()"),
         },
     )
-
 
     await db.execute(stmt)
     await db.commit()
