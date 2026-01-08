@@ -125,6 +125,15 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             st.next_run_at = now_utc + timedelta(minutes=freq_min)
         return
 
+    msg_by_id = {}
+    for m in msgs:
+        try:
+            mid0 = m.get("message_id")
+            if mid0 is not None:
+                msg_by_id[int(mid0)] = m
+        except Exception:
+            continue
+
     # newest_id
     ids = [int(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("message_id") is not None]
     newest_id = max(ids) if ids else last_message_id
@@ -165,7 +174,14 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         if len(excerpt) > 300:
             excerpt = excerpt[:300].rstrip() + "…"
 
-        ts = parse_iso_ts(item.get("message_ts"))
+        ts = None
+        try:
+            if src and src.get("message_ts"):
+                ts = parse_iso_ts(src.get("message_ts"))
+            else:
+                ts = parse_iso_ts(item.get("message_ts"))
+        except Exception:
+            ts = None
 
         ev = MatchEvent(
             subscription_id=sub.id,
