@@ -85,11 +85,11 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     # Сейчас реализуем реально только events, summary/digest — заглушка (как ты просила)
     if sub_type != "events":
         # Заглушка: помечаем success, чтобы не крутить пустое
-        async with db.begin():
-            if st:
-                st.last_success_at = now_utc
-                st.last_checked_at = now_utc
-                st.next_run_at = now_utc + timedelta(minutes=freq_min)
+
+        if st:
+            st.last_success_at = now_utc
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=freq_min)
         return
 
     # cursor-first (как у тебя уже сделано в /subscriptions/run) :contentReference[oaicite:5]{index=5}
@@ -119,11 +119,10 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
                 sub.chat_id = int(ent_id)
 
     if not msgs:
-        async with db.begin():
-            if st:
-                st.last_success_at = now_utc
-                st.last_checked_at = now_utc
-                st.next_run_at = now_utc + timedelta(minutes=freq_min)
+        if st:
+            st.last_success_at = now_utc
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=freq_min)
         return
 
     # newest_id
@@ -142,15 +141,14 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     matches = (llm_json.get("matches") or []) if isinstance(llm_json, dict) else []
 
     # 4) Пишем match_events + обновляем state
-    async with db.begin():
-        # upsert-ish дедуп у тебя обеспечивается unique(subscription_id, message_id) на уровне БД
-        # (вставки, которые нарушают unique, должны отлавливаться в твоей вставке; если сейчас ловишь IntegrityError — ок)
-        for item in matches:
-            mid = item.get("message_id")
-            if mid is None:
-                continue
+    # upsert-ish дедуп у тебя обеспечивается unique(subscription_id, message_id) на уровне БД
+    # (вставки, которые нарушают unique, должны отлавливаться в твоей вставке; если сейчас ловишь IntegrityError — ок)
+    for item in matches:
+        mid = item.get("message_id")
+        if mid is None:
+            continue
 
-            ev = MatchEvent(
+        ev = MatchEvent(
                 subscription_id=sub.id,
                 message_id=int(mid),
                 message_ts=item.get("message_ts"),
@@ -160,18 +158,18 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
                 reason=item.get("reason"),
                 notify_status="queued",
                 llm_payload=None,  # если ты решила не сохранять payload
-            )
-            db.add(ev)
+        )
+        db.add(ev)
 
-        # state
-        if st is None:
-            st = SubscriptionState(subscription_id=sub.id)
-            db.add(st)
+    # state
+    if st is None:
+        st = SubscriptionState(subscription_id=sub.id)
+        db.add(st)
 
-        st.last_message_id = int(newest_id) if newest_id else st.last_message_id
-        st.last_success_at = now_utc
-        st.last_checked_at = now_utc
-        st.next_run_at = now_utc + timedelta(minutes=freq_min)
+    st.last_message_id = int(newest_id) if newest_id else st.last_message_id
+    st.last_success_at = now_utc
+    st.last_checked_at = now_utc
+    st.next_run_at = now_utc + timedelta(minutes=freq_min)
 
 
 async def run_tick() -> int:
@@ -179,55 +177,59 @@ async def run_tick() -> int:
     exit_code = 0
 
     try:
+        # 1) Резервируем due подписки (короткая транзакция внутри _reserve_due_subscriptions)
         async with AsyncSessionLocal() as db:
             try:
                 due_ids = await _reserve_due_subscriptions(db, now_utc)
             except SQLAlchemyError as e:
                 print(f"[subscriptions_runner] RESERVE_FAILED: {e}")
-                return 2  # это можно вернуть сразу: это системная ошибка
+                return 2  # системная ошибка
 
         if not due_ids:
             print("[subscriptions_runner] No due subscriptions")
             return 0
 
-        # Обрабатываем по одной, но ошибки не валят весь тик
+        # 2) Обрабатываем подписки по одной: commit/rollback ТОЛЬКО ЗДЕСЬ
         async with AsyncSessionLocal() as db:
             for sub_id in due_ids:
                 try:
+                    # ВАЖНО: _process_one_subscription НЕ должен открывать db.begin()
                     await _process_one_subscription(db, sub_id, now_utc)
+
+                    # Успех: фиксируем все изменения одним коммитом
+                    await db.commit()
                     print(f"[subscriptions_runner] OK sub_id={sub_id}")
 
-
                 except Exception as e:
-
                     print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
                     exit_code = 1
 
-                    # ВАЖНО: текущую сессию лучше явно откатить
+                    # ВАЖНО: сбрасываем текущую транзакцию, чтобы сессия была пригодна дальше
                     try:
                         await db.rollback()
-                    except Exception:
-                        pass
+                    except Exception as rb_e:
+                        print(f"[subscriptions_runner] ROLLBACK_FAILED sub_id={sub_id} err={rb_e}")
 
-                    # быстрый ретрай — в ОТДЕЛЬНОЙ сессии, чтобы не упереться в "transaction already begun"
+                    # Быстрый ретрай: выставляем next_run_at в ОТДЕЛЬНОЙ сессии/транзакции
                     try:
                         async with AsyncSessionLocal() as db2:
                             async with db2.begin():
                                 st = (
                                     await db2.execute(
-                                        select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
+                                        select(SubscriptionState).where(
+                                            SubscriptionState.subscription_id == sub_id
+                                        )
                                     )
                                 ).scalar_one_or_none()
                                 if st:
                                     st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
-
                     except Exception as e2:
                         print(f"[subscriptions_runner] FAILED to schedule retry sub_id={sub_id} err={e2}")
 
         return exit_code
 
     finally:
-        # ВАЖНО: этот disconnect отработает всегда — и при return 0, и при return 2, и при исключениях
+        # 3) Всегда закрываем Telethon соединение
         try:
             await disconnect_tg_client()
         except Exception as e:
