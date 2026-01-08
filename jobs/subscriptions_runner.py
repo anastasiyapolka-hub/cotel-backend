@@ -12,6 +12,7 @@ from db.models import Subscription, SubscriptionState, MatchEvent  # предп�
 import os
 
 from main import call_openai_subscription_match  # оставить можно, но лучше тоже вынести (не обязательно сейчас)
+from main import parse_iso_ts
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 
 DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
@@ -147,16 +148,35 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         if mid is None:
             continue
 
+        # источник истины — исходное сообщение из Telegram
+        src = msg_by_id.get(int(mid))
+
+        # 2) author: строго из Telegram msgs (LLM не доверяем)
+        author_id = src.get("author_id") if src else None
+        author_display = src.get("author_display") if src else None
+
+        # 3) excerpt: лучше из Telegram текста (чтобы LLM “не коверкала”)
+        excerpt = ""
+        if src:
+            excerpt = (src.get("text") or "").strip()
+        if not excerpt:
+            excerpt = (item.get("excerpt") or "").strip()
+
+        if len(excerpt) > 300:
+            excerpt = excerpt[:300].rstrip() + "…"
+
+        ts = parse_iso_ts(item.get("message_ts"))
+
         ev = MatchEvent(
-                subscription_id=sub.id,
-                message_id=int(mid),
-                message_ts=item.get("message_ts"),
-                author_id=item.get("author_id"),
-                author_display=item.get("author_display"),
-                excerpt=item.get("excerpt"),
-                reason=item.get("reason"),
-                notify_status="queued",
-                llm_payload=None,  # если ты решила не сохранять payload
+            subscription_id=sub.id,
+            message_id=int(mid),
+            message_ts=ts,  # <-- datetime или None
+            author_id=author_id,
+            author_display=author_display,
+            excerpt=excerpt,
+            reason=item.get("reason"),
+            notify_status="queued",
+            llm_payload=None,
         )
         db.add(ev)
 
