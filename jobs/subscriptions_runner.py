@@ -112,11 +112,10 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     )
 
     # 2) Обновим chat_id при необходимост и (как в /subscriptions/run) :contentReference[oaicite:6]{index=6}
-    async with db.begin():
-        if getattr(sub, "chat_id", None) is None:
-            ent_id = getattr(entity, "id", None)
-            if ent_id is not None:
-                sub.chat_id = int(ent_id)
+    if getattr(sub, "chat_id", None) is None:
+        ent_id = getattr(entity, "id", None)
+        if ent_id is not None:
+            sub.chat_id = int(ent_id)
 
     if not msgs:
         if st:
