@@ -539,12 +539,19 @@ async def fetch_chat_messages_for_subscription(
         except Exception:
             pass
 
+        reply_to = None
+        try:
+            reply_to = getattr(msg, "reply_to_msg_id", None)
+        except Exception:
+            reply_to = None
+
         out.append({
             "message_id": msg.id,
             "message_ts": msg_dt.isoformat(),
             "author_id": author_id,
             "author_display": author_display,
             "text": text,
+            "reply_to": int(reply_to) if reply_to else None,
         })
 
     out.reverse()  # старые -> новые

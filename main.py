@@ -251,6 +251,69 @@ async def call_openai_subscription_match(prompt: str, chat_title: str, messages:
             return json.loads(raw[start:end+1])
         raise
 
+async def call_openai_subscription_digest(prompt: str, chat_title: str, messages: list[dict]) -> dict:
+    """
+    Возвращает JSON:
+    {
+      "digest_text": "string",
+      "confidence": 0.0
+    }
+    """
+    # Собираем контекст (со связями reply)
+    lines = []
+    for m in messages:
+        mid = m.get("message_id")
+        ts = m.get("message_ts")
+        a = m.get("author_display") or "Unknown"
+        txt = m.get("text") or ""
+        r = m.get("reply_to")
+        reply_tag = f" reply_to={int(r)}" if r else ""
+        lines.append(f"[{mid}] [{ts}] {a}{reply_tag}: {txt}")
+
+    context = "\n".join(lines)
+    if not context:
+        return {"digest_text": "", "confidence": 0.0}
+
+    system_prompt = (
+        "Ты — аналитик Telegram-диалогов.\n"
+        "Тебе дан фрагмент чата (сообщения с reply_to=<id>, если это ответ) и запрос пользователя.\n"
+        "Сделай резюме строго по запросу пользователя, без домыслов.\n"
+        "Важно: не пересказывай весь чат подряд; выделяй только главное, группируй, делай выводы о почитанном.\n"
+        "Если данных недостаточно — так и скажи.\n"
+        "Ответ дай СТРОГО JSON без markdown.\n"
+    )
+
+    user_prompt = (
+        f"Название чата: {chat_title}\n\n"
+        f"Запрос пользователя для summary:\n{prompt}\n\n"
+        "Сообщения (каждая строка содержит message_id в квадратных скобках, reply_to если есть):\n"
+        f"{context}\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "digest_text": "строка 500..4096 символов, максимум 4096",\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+
+    raw = completion.choices[0].message.content.strip()
+    import json
+    try:
+        return json.loads(raw)
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(raw[start:end+1])
+        raise
 
 
 from datetime import datetime, timezone, timedelta

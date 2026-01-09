@@ -8,8 +8,13 @@ from sqlalchemy import select, update, or_
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal  # см. db/session.py :contentReference[oaicite:4]{index=4}
-from db.models import Subscription, SubscriptionState, MatchEvent  # предполагаю стандартный импорт моделей
+from db.models import Subscription, SubscriptionState, MatchEvent, DigestEvent
 import os
+from main import (
+    fetch_chat_messages_for_subscription,
+    call_openai_subscription_match,
+    call_openai_subscription_digest,
+)
 
 from main import call_openai_subscription_match  # оставить можно, но лучше тоже вынести (не обязательно сейчас)
 from main import parse_iso_ts
@@ -82,15 +87,92 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
 
     sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
+    if sub_type == "summary":
+        sub_type = "digest"
 
     # Сейчас реализуем реально только events, summary/digest — заглушка (как ты просила)
-    if sub_type != "events":
-        # Заглушка: помечаем success, чтобы не крутить пустое
+    if sub_type == "digest":
+        # окно чтения: для digest можно тоже использовать cursor-first, но обычно логичнее "окно времени"
+        since_dt = now_utc - timedelta(minutes=freq_min)
+        min_id = None  # digest читаем окном, а не курсором
 
-        if st:
+        owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
+
+        entity, msgs = await fetch_chat_messages_for_subscription(
+            db=db,
+            owner_user_id=owner_user_id,
+            chat_link=sub.chat_ref,
+            since_dt=since_dt,
+            min_id=min_id,
+            limit=EVENTS_READ_LIMIT,  # у тебя 1000
+        )
+
+        # обновим chat_id если нужно
+        async with db.begin():
+            if getattr(sub, "chat_id", None) is None:
+                ent_id = getattr(entity, "id", None)
+                if ent_id is not None:
+                    sub.chat_id = int(ent_id)
+
+        if not msgs:
+            async with db.begin():
+                if st is None:
+                    st = SubscriptionState(subscription_id=sub.id)
+                    db.add(st)
+                st.last_success_at = now_utc
+                st.last_checked_at = now_utc
+                st.next_run_at = now_utc + timedelta(minutes=freq_min)
+            return
+
+        # end_message_id — самый новый id в окне
+        ids = [int(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("message_id") is not None]
+        newest_id = max(ids) if ids else None
+        oldest_id = min(ids) if ids else None
+
+        chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
+
+        llm_json = await call_openai_subscription_digest(
+            prompt=sub.prompt,  # ВАЖНО: prompt пользователя обязателен, как ты и хотела
+            chat_title=chat_title,
+            messages=msgs,
+        )
+
+        digest_text = ""
+        confidence = None
+        if isinstance(llm_json, dict):
+            digest_text = (llm_json.get("digest_text") or "").strip()
+            confidence = llm_json.get("confidence")
+
+        # защита по длине
+        if len(digest_text) > 4096:
+            digest_text = digest_text[:4096].rstrip() + "…"
+
+        async with db.begin():
+            # пишем одну строку digest_events
+            ev = DigestEvent(
+                subscription_id=sub.id,
+                # рекомендую хранить границы окна:
+                window_start_at=since_dt,
+                window_end_at=now_utc,
+                start_message_id=int(oldest_id) if oldest_id else None,
+                end_message_id=int(newest_id) if newest_id else None,
+                digest_text=digest_text,
+                llm_payload={"confidence": confidence} if confidence is not None else None,
+                notify_status="queued",
+            )
+            db.add(ev)
+
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+
+            # для digest можно обновлять last_message_id как "newest_id" — чтобы в будущем перейти на cursor-mode
+            if newest_id:
+                st.last_message_id = int(newest_id)
             st.last_success_at = now_utc
             st.last_checked_at = now_utc
             st.next_run_at = now_utc + timedelta(minutes=freq_min)
+
         return
 
     # cursor-first (как у тебя уже сделано в /subscriptions/run) :contentReference[oaicite:5]{index=5}
