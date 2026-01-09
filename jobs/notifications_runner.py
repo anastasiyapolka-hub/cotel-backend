@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 import re
+import random
 from datetime import datetime, timezone
 
 import httpx
@@ -74,26 +75,65 @@ def build_tg_message_link(chat_ref: str | None, chat_id: int | None, message_id:
     return None
 
 
-async def bot_send_message(chat_id: int, text: str) -> None:
+import asyncio
+import random
+import httpx
+import os
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+async def bot_send_message(chat_id: int, text: str, *, max_retries: int = 5) -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN_MISSING")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+
+    # небольшой джиттер, чтобы при массовых отправках не биться в лимит синхронно
+    def _jitter():
+        return random.uniform(0.2, 0.8)
 
     async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(url, json=payload)
+        for attempt in range(1, max_retries + 1):
+            resp = await client.post(
+                url,
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+            )
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"BOT_SEND_FAILED_HTTP_{resp.status_code}: {resp.text}")
+            # OK
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    return
+                # иногда Telegram возвращает 200, но ok=false (редко)
+                err_code = data.get("error_code")
+                if err_code == 429:
+                    retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
+                    await asyncio.sleep(retry_after + _jitter())
+                    continue
+                raise RuntimeError(f"BOT_SEND_FAILED: {data}")
 
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"BOT_SEND_FAILED: {data}")
+            # НЕ 200
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+
+            # 429 Too Many Requests
+            if resp.status_code == 429 or (isinstance(data, dict) and data.get("error_code") == 429):
+                retry_after = 1
+                if isinstance(data, dict):
+                    retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
+                await asyncio.sleep(retry_after + _jitter())
+                continue
+
+            # прочие ошибки — не ретраим бесконечно
+            raise RuntimeError(f"BOT_SEND_FAILED_HTTP_{resp.status_code}: {resp.text}")
+
+    raise RuntimeError(f"BOT_SEND_FAILED: exceeded retries ({max_retries})")
 
 
 async def _reserve_queued_events(db, now_utc: datetime) -> list[int]:
@@ -220,7 +260,7 @@ async def run_tick() -> int:
     now_utc = _utc_now()
     exit_code = 0
 
-    # 1) Reserve
+    # 1) Reserve (отдельная сессия, короткая транзакция внутри _reserve_queued_events)
     async with AsyncSessionLocal() as db:
         try:
             event_ids = await _reserve_queued_events(db, now_utc)
@@ -232,18 +272,20 @@ async def run_tick() -> int:
         print("[notifications_runner] No queued events")
         return 0
 
-    # 2) Load reserved and send
+    # 2) Load reserved and send (вторая сессия)
     async with AsyncSessionLocal() as db:
-        rows = await _load_events_with_subscriptions(db, event_ids)
+        try:
+            rows = await _load_events_with_subscriptions(db, event_ids)
+        except SQLAlchemyError as e:
+            print(f"[notifications_runner] LOAD_FAILED: {e}")
+            return 2
 
         # Группировка: (owner_user_id, subscription_id) -> {sub, events[]}
         grouped: dict[tuple[int, int], dict] = {}
-
         for ev, sub in rows:
             owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
             sid = int(ev.subscription_id)
             key = (owner_user_id, sid)
-
             if key not in grouped:
                 grouped[key] = {"sub": sub, "events": []}
             grouped[key]["events"].append(ev)
@@ -254,23 +296,28 @@ async def run_tick() -> int:
         for (owner_user_id, sid), pack in grouped.items():
             sub: Subscription = pack["sub"]
             events: list[MatchEvent] = pack["events"]
+            ids = [int(e.id) for e in events]
 
-            # В будущем сюда добавишь:
-            # if sub.subscription_type == "digest": ... (таблица digest_events)
-            # сейчас реализуем только events -> match_events
+            # На будущее: разные таблицы под разные типы подписок.
             sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
             if sub_type != "events":
-                # Неизвестный тип: помечаем failed и идём дальше
-                async with db.begin():
+                # Неизвестный тип: помечаем failed (без db.begin)
+                try:
                     await db.execute(
                         update(MatchEvent)
-                        .where(MatchEvent.id.in_([int(e.id) for e in events]))
+                        .where(MatchEvent.id.in_(ids))
                         .values(notify_status=STATUS_FAILED)
                     )
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    print(f"[notifications_runner] FAILED to mark UNKNOWN_TYPE as failed sub_id={sid} err={e}")
+
                 failed_groups += 1
                 exit_code = 1
                 continue
 
+            # Отправка
             try:
                 dest_chat_id = await _get_dest_chat_id(db, owner_user_id)
                 if not dest_chat_id:
@@ -279,34 +326,46 @@ async def run_tick() -> int:
                 text = _format_events_message(sub, events)
                 await bot_send_message(dest_chat_id, text)
 
-                # success -> sent
-                async with db.begin():
-                    await db.execute(
-                        update(MatchEvent)
-                        .where(MatchEvent.id.in_([int(e.id) for e in events]))
-                        .values(notify_status=STATUS_SENT)
-                    )
+                # success -> sent (без db.begin)
+                await db.execute(
+                    update(MatchEvent)
+                    .where(MatchEvent.id.in_(ids))
+                    .values(notify_status=STATUS_SENT)
+                )
+                await db.commit()
 
                 sent_groups += 1
                 print(f"[notifications_runner] SENT owner_user_id={owner_user_id} sub_id={sid} events={len(events)}")
 
             except Exception as e:
-                # fail -> failed
-                async with db.begin():
+                # Любая ошибка отправки: rollback на всякий случай (если что-то успели сделать)
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+                # fail -> failed (без db.begin)
+                try:
                     await db.execute(
                         update(MatchEvent)
-                        .where(MatchEvent.id.in_([int(e.id) for e in events]))
+                        .where(MatchEvent.id.in_(ids))
                         .values(notify_status=STATUS_FAILED)
                     )
+                    await db.commit()
+                except Exception as e2:
+                    await db.rollback()
+                    print(f"[notifications_runner] FAILED to mark events as failed sub_id={sid} err={e2}")
 
                 failed_groups += 1
                 exit_code = 1
                 print(f"[notifications_runner] FAILED owner_user_id={owner_user_id} sub_id={sid} err={e}")
 
-        print(f"[notifications_runner] done groups_total={len(grouped)} sent_groups={sent_groups} failed_groups={failed_groups}")
+        print(
+            f"[notifications_runner] done groups_total={len(grouped)} "
+            f"sent_groups={sent_groups} failed_groups={failed_groups}"
+        )
 
     return exit_code
-
 
 def main():
     code = asyncio.run(run_tick())
