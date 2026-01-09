@@ -210,46 +210,81 @@ async def _get_dest_chat_id(db, owner_user_id: int) -> int | None:
 
 def _format_events_message(sub: Subscription, events: list[MatchEvent]) -> str:
     """
-    Формируем 1 сообщение на подписку (с ограничением по длине).
+    1 сообщение на подписку.
+    Правило:
+    - подробные пункты (excerpt) стараемся уместить в DETAIL_TEXT_LIMIT
+    - если не влезли все события — оставшиеся выводим отдельным блоком ссылок
+    - финально гарантируем TELEGRAM_TEXT_LIMIT
     """
     sid = int(sub.id)
     title = sub.name or f"#{sid}"
+
     header = (
         f"Найдены события по подписке: {title}\n"
         f"Совпадений: {len(events)}\n"
     )
 
-    shown = events[:MAX_ITEMS_PER_SUB]
-    rest = len(events) - len(shown)
-
-    lines = []
-    for i, ev in enumerate(shown, start=1):
-        author = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
-        ts = ev.message_ts.isoformat() if ev.message_ts else "—"
-
-        excerpt = _truncate(ev.excerpt or "", MAX_EXCERPT_LEN)
-        if not excerpt:
-            excerpt = "—"
-
-        url = build_tg_message_link(
+    # Утилита: строим ссылку на конкретное событие
+    def _event_link(ev: MatchEvent) -> str | None:
+        return build_tg_message_link(
             chat_ref=getattr(sub, "chat_ref", None),
             chat_id=getattr(sub, "chat_id", None),
             message_id=int(ev.message_id) if ev.message_id else None,
         )
+
+    # --- 1) Сначала собираем подробные пункты, пока влезает в DETAIL_TEXT_LIMIT ---
+    lines: list[str] = []
+    detailed_count = 0
+
+    # Мы оставляем запас под будущий блок ссылок и служебные строки
+    effective_detail_limit = max(0, DETAIL_TEXT_LIMIT - LINKS_RESERVE)
+
+    for ev in events:
+        if detailed_count >= MAX_ITEMS_PER_SUB:
+            break
+
+        author = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
+        ts = ev.message_ts.isoformat() if ev.message_ts else "—"
+        excerpt = _truncate(ev.excerpt or "", MAX_EXCERPT_LEN) or "—"
+        url = _event_link(ev)
         link_text = f"\n{url}" if url else ""
 
-        lines.append(
-            f"\n{i}) {author} • {ts}\n"
+        item = (
+            f"\n{detailed_count + 1}) {author} • {ts}\n"
             f"{excerpt}"
             f"{link_text}"
         )
 
-    if rest > 0:
-        lines.append(f"\n\n…и ещё {rest} совпадений (свернуто для компактности).")
+        candidate = header + "".join(lines) + item
+        if len(candidate) > effective_detail_limit:
+            break
 
-    text = header + "".join(lines)
+        lines.append(item)
+        detailed_count += 1
 
-    # Telegram лимит 4096. Если внезапно перелетели — режем хвост.
+    detailed_text = header + "".join(lines)
+
+    # --- 2) Если остались события, выводим их ссылками ---
+    remaining = events[detailed_count:]
+    if remaining:
+        # соберём ссылки только для тех, где реально есть url
+        link_lines: list[str] = []
+        for idx, ev in enumerate(remaining, start=detailed_count + 1):
+            url = _event_link(ev)
+            if not url:
+                continue
+            link_lines.append(f"{idx}) {url}")
+
+        if link_lines:
+            links_block = "\n\nОстальные совпадения (ссылками):\n" + "\n".join(link_lines)
+        else:
+            links_block = "\n\nОстальные совпадения: (ссылки недоступны для этого чата)."
+
+        text = detailed_text + links_block
+    else:
+        text = detailed_text
+
+    # --- 3) Финальная защита от 4096 ---
     if len(text) > TELEGRAM_TEXT_LIMIT:
         text = text[: (TELEGRAM_TEXT_LIMIT - 1)] + "…"
 
