@@ -11,13 +11,11 @@ from db.session import AsyncSessionLocal  # см. db/session.py :contentReferenc
 from db.models import Subscription, SubscriptionState, MatchEvent, DigestEvent
 import os
 from main import (
-    fetch_chat_messages_for_subscription,
+    parse_iso_ts,
     call_openai_subscription_match,
     call_openai_subscription_digest,
 )
 
-from main import call_openai_subscription_match  # оставить можно, но лучше тоже вынести (не обязательно сейчас)
-from main import parse_iso_ts
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 
 DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
@@ -78,25 +76,34 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
 
         return due_ids
 
+from sqlalchemy.dialects.postgresql import insert
+
 async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     # Берём sub + state
     sub = (await db.execute(select(Subscription).where(Subscription.id == sub_id))).scalar_one()
-    st = (await db.execute(select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id))).scalar_one_or_none()
+    st = (
+        await db.execute(
+            select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
+        )
+    ).scalar_one_or_none()
 
     last_message_id = getattr(st, "last_message_id", None) if st else None
     freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
 
     sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
+    # если у тебя на фронте summary, а в коде считаешь digest — оставим твой маппинг
     if sub_type == "summary":
         sub_type = "digest"
 
-    # Сейчас реализуем реально только events, summary/digest — заглушка (как ты просила)
-    if sub_type == "digest":
-        # окно чтения: для digest можно тоже использовать cursor-first, но обычно логичнее "окно времени"
-        since_dt = now_utc - timedelta(minutes=freq_min)
-        min_id = None  # digest читаем окном, а не курсором
+    owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
 
-        owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
+    # -------------------------
+    # DIGEST / SUMMARY
+    # -------------------------
+    if sub_type == "digest":
+        # digest читаем окном времени
+        since_dt = now_utc - timedelta(minutes=freq_min)
+        min_id = None
 
         entity, msgs = await fetch_chat_messages_for_subscription(
             db=db,
@@ -104,35 +111,39 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             chat_link=sub.chat_ref,
             since_dt=since_dt,
             min_id=min_id,
-            limit=EVENTS_READ_LIMIT,  # у тебя 1000
+            limit=EVENTS_READ_LIMIT,  # 1000
         )
 
-        # обновим chat_id если нужно
-        async with db.begin():
-            if getattr(sub, "chat_id", None) is None:
-                ent_id = getattr(entity, "id", None)
-                if ent_id is not None:
-                    sub.chat_id = int(ent_id)
+        # chat_id — просто обновим объект (без begin)
+        if getattr(sub, "chat_id", None) is None:
+            ent_id = getattr(entity, "id", None)
+            if ent_id is not None:
+                sub.chat_id = int(ent_id)
+
+        # state гарантируем
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
 
         if not msgs:
-            async with db.begin():
-                if st is None:
-                    st = SubscriptionState(subscription_id=sub.id)
-                    db.add(st)
-                st.last_success_at = now_utc
-                st.last_checked_at = now_utc
-                st.next_run_at = now_utc + timedelta(minutes=freq_min)
+            # ничего не нашли — просто двигаем state
+            st.last_success_at = now_utc
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=freq_min)
             return
 
-        # end_message_id — самый новый id в окне
-        ids = [int(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("message_id") is not None]
+        ids = [
+            int(m["message_id"])
+            for m in msgs
+            if isinstance(m, dict) and m.get("message_id") is not None
+        ]
         newest_id = max(ids) if ids else None
         oldest_id = min(ids) if ids else None
 
         chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
 
         llm_json = await call_openai_subscription_digest(
-            prompt=sub.prompt,  # ВАЖНО: prompt пользователя обязателен, как ты и хотела
+            prompt=sub.prompt,  # prompt пользователя обязателен
             chat_title=chat_title,
             messages=msgs,
         )
@@ -143,39 +154,40 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             digest_text = (llm_json.get("digest_text") or "").strip()
             confidence = llm_json.get("confidence")
 
-        # защита по длине
         if len(digest_text) > 4096:
             digest_text = digest_text[:4096].rstrip() + "…"
 
-        async with db.begin():
-            # пишем одну строку digest_events
-            ev = DigestEvent(
+        # ВАЖНО: вставка digest_event с ON CONFLICT DO NOTHING
+        # uq_digest_subscription_endmsg: (subscription_id, end_message_id)
+        stmt = (
+            insert(DigestEvent)
+            .values(
                 subscription_id=sub.id,
-                # рекомендую хранить границы окна:
-                window_start_at=since_dt,
-                window_end_at=now_utc,
+                window_start=since_dt,
+                window_end=now_utc,
                 start_message_id=int(oldest_id) if oldest_id else None,
                 end_message_id=int(newest_id) if newest_id else None,
+                messages_seen=len(msgs),
                 digest_text=digest_text,
                 llm_payload={"confidence": confidence} if confidence is not None else None,
                 notify_status="queued",
             )
-            db.add(ev)
+            .on_conflict_do_nothing(constraint="uq_digest_subscription_endmsg")
+        )
+        await db.execute(stmt)
 
-            if st is None:
-                st = SubscriptionState(subscription_id=sub.id)
-                db.add(st)
-
-            # для digest можно обновлять last_message_id как "newest_id" — чтобы в будущем перейти на cursor-mode
-            if newest_id:
-                st.last_message_id = int(newest_id)
-            st.last_success_at = now_utc
-            st.last_checked_at = now_utc
-            st.next_run_at = now_utc + timedelta(minutes=freq_min)
+        # state
+        if newest_id:
+            st.last_message_id = int(newest_id)
+        st.last_success_at = now_utc
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=freq_min)
 
         return
 
-    # cursor-first (как у тебя уже сделано в /subscriptions/run) :contentReference[oaicite:5]{index=5}
+    # -------------------------
+    # EVENTS
+    # -------------------------
     if last_message_id:
         since_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
         min_id = int(last_message_id)
@@ -183,8 +195,6 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         since_dt = now_utc - timedelta(minutes=freq_min)
         min_id = None
 
-    # 1) Читаем TG
-    owner_user_id = sub.owner_user_id or DEV_OWNER_USER_ID  # временно, пока один юзер
     entity, msgs = await fetch_chat_messages_for_subscription(
         db=db,
         owner_user_id=owner_user_id,
@@ -194,17 +204,19 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         limit=EVENTS_READ_LIMIT,
     )
 
-    # 2) Обновим chat_id при необходимост и (как в /subscriptions/run) :contentReference[oaicite:6]{index=6}
     if getattr(sub, "chat_id", None) is None:
         ent_id = getattr(entity, "id", None)
         if ent_id is not None:
             sub.chat_id = int(ent_id)
 
+    if st is None:
+        st = SubscriptionState(subscription_id=sub.id)
+        db.add(st)
+
     if not msgs:
-        if st:
-            st.last_success_at = now_utc
-            st.last_checked_at = now_utc
-            st.next_run_at = now_utc + timedelta(minutes=freq_min)
+        st.last_success_at = now_utc
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=freq_min)
         return
 
     msg_by_id = {}
@@ -216,43 +228,35 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         except Exception:
             continue
 
-    # newest_id
-    ids = [int(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("message_id") is not None]
+    ids = [
+        int(m["message_id"])
+        for m in msgs
+        if isinstance(m, dict) and m.get("message_id") is not None
+    ]
     newest_id = max(ids) if ids else last_message_id
 
-    # 3) LLM
-    chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
     llm_json = await call_openai_subscription_match(
         prompt=sub.prompt,
-        chat_title=chat_title,
+        chat_title=getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat",
         messages=msgs,
     )
 
-    found = bool(llm_json.get("found")) if isinstance(llm_json, dict) else False
     matches = (llm_json.get("matches") or []) if isinstance(llm_json, dict) else []
 
-    # 4) Пишем match_events + обновляем state
-    # upsert-ish дедуп у тебя обеспечивается unique(subscription_id, message_id) на уровне БД
-    # (вставки, которые нарушают unique, должны отлавливаться в твоей вставке; если сейчас ловишь IntegrityError — ок)
     for item in matches:
         mid = item.get("message_id")
         if mid is None:
             continue
 
-        # источник истины — исходное сообщение из Telegram
         src = msg_by_id.get(int(mid))
-
-        # 2) author: строго из Telegram msgs (LLM не доверяем)
         author_id = src.get("author_id") if src else None
         author_display = src.get("author_display") if src else None
 
-        # 3) excerpt: лучше из Telegram текста (чтобы LLM “не коверкала”)
         excerpt = ""
         if src:
             excerpt = (src.get("text") or "").strip()
         if not excerpt:
             excerpt = (item.get("excerpt") or "").strip()
-
         if len(excerpt) > 300:
             excerpt = excerpt[:300].rstrip() + "…"
 
@@ -265,55 +269,48 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         except Exception:
             ts = None
 
-        ev = MatchEvent(
-            subscription_id=sub.id,
-            message_id=int(mid),
-            message_ts=ts,  # <-- datetime или None
-            author_id=author_id,
-            author_display=author_display,
-            excerpt=excerpt,
-            reason=item.get("reason"),
-            notify_status="queued",
-            llm_payload=None,
+        db.add(
+            MatchEvent(
+                subscription_id=sub.id,
+                message_id=int(mid),
+                message_ts=ts,
+                author_id=author_id,
+                author_display=author_display,
+                excerpt=excerpt,
+                reason=item.get("reason"),
+                notify_status="queued",
+                llm_payload=None,
+            )
         )
-        db.add(ev)
-
-    # state
-    if st is None:
-        st = SubscriptionState(subscription_id=sub.id)
-        db.add(st)
 
     st.last_message_id = int(newest_id) if newest_id else st.last_message_id
     st.last_success_at = now_utc
     st.last_checked_at = now_utc
     st.next_run_at = now_utc + timedelta(minutes=freq_min)
 
-
 async def run_tick() -> int:
     now_utc = datetime.now(timezone.utc)
     exit_code = 0
 
     try:
-        # 1) Резервируем due подписки (короткая транзакция внутри _reserve_due_subscriptions)
+        # 1) Reserve (короткая сессия)
         async with AsyncSessionLocal() as db:
             try:
                 due_ids = await _reserve_due_subscriptions(db, now_utc)
             except SQLAlchemyError as e:
                 print(f"[subscriptions_runner] RESERVE_FAILED: {e}")
-                return 2  # системная ошибка
+                return 2
 
         if not due_ids:
             print("[subscriptions_runner] No due subscriptions")
             return 0
 
-        # 2) Обрабатываем подписки по одной: commit/rollback ТОЛЬКО ЗДЕСЬ
+        # 2) Process each subscription in one shared db session,
+        # commit/rollback only here (НЕ внутри _process_one_subscription)
         async with AsyncSessionLocal() as db:
             for sub_id in due_ids:
                 try:
-                    # ВАЖНО: _process_one_subscription НЕ должен открывать db.begin()
                     await _process_one_subscription(db, sub_id, now_utc)
-
-                    # Успех: фиксируем все изменения одним коммитом
                     await db.commit()
                     print(f"[subscriptions_runner] OK sub_id={sub_id}")
 
@@ -321,13 +318,13 @@ async def run_tick() -> int:
                     print(f"[subscriptions_runner] FAILED sub_id={sub_id} err={e}")
                     exit_code = 1
 
-                    # ВАЖНО: сбрасываем текущую транзакцию, чтобы сессия была пригодна дальше
+                    # сбрасываем транзакцию
                     try:
                         await db.rollback()
                     except Exception as rb_e:
                         print(f"[subscriptions_runner] ROLLBACK_FAILED sub_id={sub_id} err={rb_e}")
 
-                    # Быстрый ретрай: выставляем next_run_at в ОТДЕЛЬНОЙ сессии/транзакции
+                    # ретрай — в отдельной сессии
                     try:
                         async with AsyncSessionLocal() as db2:
                             async with db2.begin():
@@ -346,7 +343,6 @@ async def run_tick() -> int:
         return exit_code
 
     finally:
-        # 3) Всегда закрываем Telethon соединение
         try:
             await disconnect_tg_client()
         except Exception as e:

@@ -21,6 +21,7 @@ from main import build_tg_message_link, bot_send_message
 DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 
 BATCH_LIMIT = 200
+DETAIL_TEXT_LIMIT = 3800  # сколько максимум тратим на "подробную" часть; остальное оставляем под ссылки/хвост
 
 STATUS_QUEUED = "queued"
 STATUS_SENDING = "sending"
