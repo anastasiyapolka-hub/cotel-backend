@@ -101,19 +101,24 @@ async def _load_match_events_with_subscriptions(db, event_ids: list[int]):
 
 def _format_match_events_message(sub: Subscription, events: list[MatchEvent]) -> str:
     """
-    Один текст на подписку: группа match_events.
-    (Твоя текущая логика, слегка упорядоченная.)
+    Формат:
+      - подробная часть заполняется до DETAIL_TEXT_LIMIT
+      - остаток выводим ссылками (11), (12) ... пока не упремся в TG_MSG_HARD_LIMIT
     """
     sid = int(sub.id)
-    header = f"Найдены события по подписке: {sub.name or f'#{sid}'}\n" \
-             f"Совпадений: {len(events)}\n"
+    header = (
+        f"Найдены события по подписке: {sub.name or f'#{sid}'}\n"
+        f"Совпадений: {len(events)}\n"
+    )
 
-    max_items = 10
-    shown = events[:max_items]
-    rest = len(events) - len(shown)
+    text_parts: list[str] = [header]
+    used = len(header)
 
-    lines: list[str] = []
-    for i, ev in enumerate(shown, start=1):
+    detailed_indexes: list[int] = []
+    remaining_indexes: list[int] = []
+
+    # 1) Сначала пытаемся набить подробную часть
+    for idx, ev in enumerate(events, start=1):
         author = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
         ts = ev.message_ts.isoformat() if ev.message_ts else "—"
 
@@ -128,18 +133,46 @@ def _format_match_events_message(sub: Subscription, events: list[MatchEvent]) ->
         )
         link_text = f"\n{url}" if url else ""
 
-        lines.append(
-            f"\n{i}) {author} • {ts}\n"
-            f"{excerpt or '—'}"
-            f"{link_text}"
-        )
+        block = f"\n{idx}) {author} • {ts}\n{excerpt or '—'}{link_text}"
 
-    if rest > 0:
-        lines.append(f"\n\n…и ещё {rest} совпадений (свернуто для компактности).")
+        # ограничение на подробную часть (оставляем запас под секцию ссылок)
+        if used + len(block) <= DETAIL_TEXT_LIMIT:
+            text_parts.append(block)
+            used += len(block)
+            detailed_indexes.append(idx)
+        else:
+            remaining_indexes.append(idx)
 
-    text = header + "".join(lines)
+    # 2) Если осталось что-то — добавляем секцию ссылок
+    if remaining_indexes:
+        tail_header = "\n\nОстальные совпадения (ссылками):"
+        if used + len(tail_header) < TG_MSG_HARD_LIMIT:
+            text_parts.append(tail_header)
+            used += len(tail_header)
 
-    # грубая защита от перероста
+        for idx in remaining_indexes:
+            ev = events[idx - 1]
+            url = build_tg_message_link(
+                chat_ref=getattr(sub, "chat_ref", None),
+                chat_id=getattr(sub, "chat_id", None),
+                message_id=int(ev.message_id),
+            )
+            # если ссылку построить нельзя — хотя бы покажем message_id
+            line = f"\n{idx}) {url}" if url else f"\n{idx}) message_id={int(ev.message_id)}"
+
+            if used + len(line) <= TG_MSG_HARD_LIMIT:
+                text_parts.append(line)
+                used += len(line)
+            else:
+                # если даже ссылки уже не влезают — честно сообщаем
+                ell = "\n…(дальше не влезло по лимиту Telegram)"
+                if used + len(ell) <= TG_MSG_HARD_LIMIT:
+                    text_parts.append(ell)
+                break
+
+    text = "".join(text_parts)
+
+    # финальная страховка
     if len(text) > TG_MSG_HARD_LIMIT:
         text = text[: TG_MSG_HARD_LIMIT - 1] + "…"
 
@@ -197,15 +230,18 @@ async def _load_digest_events_with_subscriptions(db, event_ids: list[int]):
 
 def _format_digest_message(sub: Subscription, ev: DigestEvent) -> str:
     """
-    Формат как ты попросила:
+    Формат:
       заголовок: “Резюме по подписке: {name}”
-      период: {window_start_at} — {window_end_at}
+      период: {window_start} — {window_end}
       тело: digest_text
     """
     title = f"Резюме по подписке: {sub.name or f'#{sub.id}'}"
 
-    ws = ev.window_start_at.isoformat() if ev.window_start_at else "—"
-    we = ev.window_end_at.isoformat() if ev.window_end_at else "—"
+    ws_dt = getattr(ev, "window_start", None)
+    we_dt = getattr(ev, "window_end", None)
+
+    ws = ws_dt.isoformat() if ws_dt else "—"
+    we = we_dt.isoformat() if we_dt else "—"
     period = f"Период: {ws} — {we}"
 
     body = (ev.digest_text or "").strip() or "—"
