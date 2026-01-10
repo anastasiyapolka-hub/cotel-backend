@@ -501,8 +501,38 @@ async def fetch_chat_messages_for_subscription(
     if link.startswith("@"):
         link = link[1:].strip()
 
-    # ВАЖНО: вместо get_entity — invite-aware резолвер
-    entity = await resolve_entity_with_invite(client, chat_link)
+    # ---- entity resolve ----
+    entity = None
+    link = (chat_link or "").strip()
+
+    # 1) numeric chat_id (ID из dialogs)
+    if link.isdigit():
+        target_id = int(link)
+
+        try:
+            # сначала пробуем из dialogs
+            dialogs = await client.get_dialogs(limit=500)
+            for d in dialogs:
+                ent = d.entity
+                if getattr(ent, "id", None) == target_id:
+                    entity = ent
+                    break
+        except Exception:
+            pass
+
+        # fallback: прямой get_entity
+        if entity is None:
+            try:
+                entity = await client.get_entity(target_id)
+            except Exception as e:
+                raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
+
+    else:
+        # 2) invite / username
+        entity = await resolve_entity_with_invite(client, chat_link)
+
+    if not entity:
+        raise ValueError("CHAT_ENTITY_NOT_RESOLVED")
 
     if since_dt.tzinfo is None:
         since_dt = since_dt.replace(tzinfo=timezone.utc)
