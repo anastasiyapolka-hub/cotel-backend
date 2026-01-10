@@ -1066,6 +1066,42 @@ async def list_subscriptions(db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(Subscription).order_by(Subscription.id.desc()))
     return res.scalars().all()
 
+@app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
+async def get_subscription(subscription_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    sub = res.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    return sub
+
+@app.put("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
+async def update_subscription(subscription_id: int, payload: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    sub = res.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+
+    # Обновляем редактируемые поля (те же, что и при создании)
+    sub.name = payload.name
+    sub.source_mode = payload.source_mode
+    sub.subscription_type = payload.subscription_type
+
+    sub.chat_ref = payload.chat_ref
+    # chat_id не трогаем здесь (он резолвится позже при чтении/раннере)
+
+    sub.frequency_minutes = payload.frequency_minutes
+    sub.prompt = payload.prompt
+
+    sub.is_active = payload.is_active
+    sub.status = "active" if payload.is_active else "paused"
+    sub.last_error = None
+
+    # updated_at: лучше явно проставить (если хочешь)
+    sub.updated_at = sa.func.now()
+
+    await db.commit()
+    await db.refresh(sub)
+    return sub
 
 @app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
 async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: AsyncSession = Depends(get_db)):
@@ -1078,7 +1114,7 @@ async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: 
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
     # updated_at у тебя server_default now() — но  при update лучше руками:
-    sub.updated_at = sa.text("now()")  # или просто не трогать, если триггер/orm делает
+    sub.updated_at = sa.func.now()
 
     await db.commit()
     await db.refresh(sub)

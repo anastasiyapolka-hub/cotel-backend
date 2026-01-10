@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
 from sqlalchemy import select, update
@@ -55,6 +56,55 @@ async def _get_dest_chat_id(db, owner_user_id: int) -> int | None:
         .limit(1)
     )
     return (await db.execute(q)).scalar_one_or_none()
+
+RU_MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+RU_WEEKDAYS = [
+    "понедельник", "вторник", "среда", "четверг",
+    "пятница", "суббота", "воскресенье",
+]
+
+def _tz_gmt_label(tz: ZoneInfo, dt_utc: datetime) -> str:
+    # dt_utc ожидаем aware UTC
+    offset = tz.utcoffset(dt_utc)
+    if offset is None:
+        return "GMT"
+    total_min = int(offset.total_seconds() // 60)
+    sign = "+" if total_min >= 0 else "-"
+    total_min = abs(total_min)
+    hh = total_min // 60
+    mm = total_min % 60
+    return f"GMT{sign}{hh}" if mm == 0 else f"GMT{sign}{hh}:{mm:02d}"
+
+def _fmt_date_ru(dt_local: datetime) -> str:
+    # dt_local aware (уже в нужной TZ)
+    return f"{dt_local.day} {RU_MONTHS[dt_local.month - 1]} {dt_local.year} ({RU_WEEKDAYS[dt_local.weekday()]})"
+
+def format_period_variant_f(window_start_utc: datetime, window_end_utc: datetime, tz_name: str) -> str:
+    """
+    Вариант F:
+    - один день: "10 января 2026 (суббота), 04:00–10:00 (GMT+5)"
+    - разные дни: "9 января 2026 (пятница) 23:00 — 10 января 2026 (суббота) 11:00 (GMT+5)"
+    """
+    tz = ZoneInfo(tz_name)
+
+    # нормализуем: должны быть aware
+    if window_start_utc.tzinfo is None:
+        window_start_utc = window_start_utc.replace(tzinfo=timezone.utc)
+    if window_end_utc.tzinfo is None:
+        window_end_utc = window_end_utc.replace(tzinfo=timezone.utc)
+
+    s = window_start_utc.astimezone(tz)
+    e = window_end_utc.astimezone(tz)
+
+    gmt = _tz_gmt_label(tz, window_start_utc)
+
+    if s.date() == e.date():
+        return f"{_fmt_date_ru(s)}, {s:%H:%M}–{e:%H:%M} ({gmt})"
+
+    return f"{_fmt_date_ru(s)} {s:%H:%M} — {_fmt_date_ru(e)} {e:%H:%M} ({gmt})"
 
 
 # -----------------------------
@@ -240,9 +290,14 @@ def _format_digest_message(sub: Subscription, ev: DigestEvent) -> str:
     ws_dt = getattr(ev, "window_start", None)
     we_dt = getattr(ev, "window_end", None)
 
-    ws = ws_dt.isoformat() if ws_dt else "—"
-    we = we_dt.isoformat() if we_dt else "—"
-    period = f"Период: {ws} — {we}"
+    # MVP: TZ пока константой (позже возьмём из users.timezone)
+    tz_name = os.getenv("DEV_USER_TZ", "Asia/Almaty")  # UTC+5
+
+    if ws_dt and we_dt:
+        period_human = format_period_variant_f(ws_dt, we_dt, tz_name)
+        period = f"Период: {period_human}"
+    else:
+        period = "Период: —"
 
     body = (ev.digest_text or "").strip() or "—"
 
