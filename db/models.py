@@ -144,10 +144,12 @@ class User(Base):
     phone = Column(String(32), nullable=True, unique=True, index=True)
 
     password_hash = Column(String(255), nullable=True)
+    is_email_verified = Column(Boolean, nullable=False, server_default=sa.text("false"))
 
     plan = Column(String(32), nullable=False, server_default="free")
     is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
 
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True),
@@ -156,6 +158,56 @@ class User(Base):
         onupdate=func.now(),
     )
 
+class EmailVerificationCode(Base):
+    __tablename__ = "email_verification_codes"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        unique=True,  # 1 активная запись на пользователя (простая модель)
+    )
+
+    # храним НЕ код, а hash(код)
+    code_hash = Column(String(64), nullable=False)
+
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+
+    # (опционально, но полезно против перебора)
+    attempts = Column(Integer, nullable=False, server_default="0")
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # В cookie будет raw session_id, в БД храним hash(session_id)
+    session_hash = Column(String(64), nullable=False, unique=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    # опциональные поля для аналитики/безопасности
+    user_agent = Column(String(512), nullable=True)
+    ip = Column(String(64), nullable=True)
+
+    # полезно, но обновлять не чаще чем раз в N минут, чтобы не грузить БД
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
 class TelegramSession(Base):
     __tablename__ = "telegram_sessions"
