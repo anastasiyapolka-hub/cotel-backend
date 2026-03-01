@@ -206,7 +206,7 @@ class Session(Base):
     user_agent = Column(String(512), nullable=True)
     ip = Column(String(64), nullable=True)
 
-    # полезно, но обновлять не чаще чем раз в N минут, чтобы не грузить БД
+    # полезно, нно обновлять не чаще чем раз в N минут, чтобы не грузить БД
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
 class TelegramSession(Base):
