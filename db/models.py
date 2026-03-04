@@ -135,6 +135,19 @@ class BotUserLink(Base):
         nullable=False,
     )
 
+class BotLinkCode(Base):
+    __tablename__ = "bot_link_codes"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+
+    code_hash = Column(String(64), nullable=False, unique=True, index=True)
+
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 class User(Base):
     __tablename__ = "users"
 

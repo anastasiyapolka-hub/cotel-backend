@@ -13,7 +13,7 @@ class SubscriptionCreate(BaseModel):
     prompt: str = Field(min_length=1)
 
     subscription_type: Optional[SubscriptionType] = None
-    owner_user_id: Optional[int] = None  # пока можно не использовать
+
     is_active: bool = True
 
 class SubscriptionOut(BaseModel):

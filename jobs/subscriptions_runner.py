@@ -18,7 +18,6 @@ from main import (
 
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 
-DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
 LEASE_MINUTES = 5      # сколько держим "замок" на время обработки
@@ -95,7 +94,22 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     if sub_type == "summary":
         sub_type = "digest"
 
-    owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
+    owner_user_id = getattr(sub, "owner_user_id", None)
+    if not owner_user_id:
+        # Подписка без owner_user_id — это некорректное состояние для multi-user.
+        # Помечаем состояние как "ошибка" и отложим повтор.
+        print(f"[subscriptions_runner] SKIP sub_id={sub.id} reason=NO_OWNER_USER_ID")
+
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
+
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        sub.last_error = "NO_OWNER_USER_ID"
+        return
+
+    owner_user_id = int(owner_user_id)
 
     # -------------------------
     # DIGEST / SUMMARY

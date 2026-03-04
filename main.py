@@ -1,15 +1,20 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request, Depends
-
+from auth import router as auth_router
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 
 from openai import OpenAI
 import os
 import httpx
 import json
-import sqlalchemy as sa
+import hashlib
+import secrets
+
+from datetime import datetime, timezone, timedelta
 import time
+import sqlalchemy as sa
+import re
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,8 +23,9 @@ from sqlalchemy.exc import IntegrityError
 
 from db.models import Subscription, SubscriptionState, DigestEvent, MatchEvent, BotUserLink
 from db.session import get_db
-
-
+from auth import get_current_user as auth_get_current_user
+from db.models import User
+from db.models import BotLinkCode
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 
 from collections import defaultdict
@@ -29,7 +35,7 @@ from telegram_service import (
     send_login_code,
     confirm_login,
     confirm_password,
-    get_current_user,
+    get_current_user as tg_get_current_user,  # <-- переименовали
     fetch_chat_messages,
     list_user_chats,
     logout_telegram,
@@ -49,10 +55,11 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:5500",
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -63,6 +70,13 @@ DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 async def health():
     return {"status": "ok"}
 
+def sha256_hex(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def make_link_code() -> str:
+    # короткий, но достаточно случайный
+    return secrets.token_urlsafe(12)
 
 def extract_text_messages(messages, limit: int = 100000):
     """
@@ -315,15 +329,6 @@ async def call_openai_subscription_digest(prompt: str, chat_title: str, messages
             return json.loads(raw[start:end+1])
         raise
 
-
-from datetime import datetime, timezone, timedelta
-import time
-import sqlalchemy as sa
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
-
-import re
-
 def build_tg_message_link(chat_ref: str | None, chat_id: int | None, message_id: int | None) -> str | None:
     if not message_id:
         return None
@@ -353,6 +358,37 @@ def build_tg_message_link(chat_ref: str | None, chat_id: int | None, message_id:
 
     return None
 
+@app.post("/tg/bot/link/start")
+async def tg_bot_link_start(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # 1) генерим код
+    code = make_link_code()
+    code_hash = sha256_hex(code)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    # 2) сохраняем в bot_link_codes
+    db.add(BotLinkCode(
+        user_id=user.id,
+        code_hash=code_hash,
+        expires_at=expires_at,
+        used_at=None,
+    ))
+    await db.commit()
+
+    # 3) вернём код + deeplink (удобно для UI)
+    bot_username = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()  # например "CoTelBot"
+    deeplink = None
+    if bot_username:
+        deeplink = f"https://t.me/{bot_username}?start={code}"
+
+    return {
+        "status": "ok",
+        "code": code,
+        "expires_at": expires_at.isoformat(),
+        "deeplink": deeplink,
+    }
 
 def _serialize_match_event(ev) -> dict:
     # ev = MatchEvent ORM object
@@ -372,14 +408,23 @@ def _serialize_match_event(ev) -> dict:
 
 
 @app.post("/subscriptions/run")
-async def run_subscriptions(db: AsyncSession = Depends(get_db)):
+async def run_subscriptions(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     t0 = time.perf_counter()
     run_started_at = datetime.now(timezone.utc)
     now = run_started_at
-    owner_user_id = DEV_OWNER_USER_ID  # пока так, потом будет реальный пользователь
 
-    # 1) Берём активные  подписки (MVP: без owner_user_id фильтра)
-    res = await db.execute(select(Subscription).where(Subscription.is_active == True))
+    owner_user_id = user.id
+
+    # 1) Берём активные подписки ТОЛЬКО этого пользователя
+    res = await db.execute(
+        select(Subscription).where(
+            Subscription.is_active == True,
+            Subscription.owner_user_id == owner_user_id,
+        )
+    )
     subs = list(res.scalars().all())
 
     results = []
@@ -395,41 +440,34 @@ async def run_subscriptions(db: AsyncSession = Depends(get_db)):
             "checked": 0,
             "matches_written": 0,
             "error": None,
-            "llm_json": None,        # что вернула модель
+            "llm_json": None,
             "llm_found": None,
             "llm_confidence": None,
             "llm_summary_reason": None,
             "llm_matches_count": 0,
             "inserted_message_ids": [],
-            "match_events": [],      # что реально записалось в БД
+            "match_events": [],
         }
 
         try:
-            # 2) Берём state
             st_res = await db.execute(
                 select(SubscriptionState).where(SubscriptionState.subscription_id == sub.id)
             )
             st = st_res.scalar_one_or_none()
             last_message_id = getattr(st, "last_message_id", None) if st else None
 
-            # 3) Окно чтения (events): cursor-first
             freq_min = int(getattr(sub, "frequency_minutes", 60) or 60)
 
             if last_message_id:
-                # cursor-mode: берём всё после last_message_id, без временного окна
                 since_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
                 min_id = int(last_message_id)
             else:
-                # first run: ограничиваем чтение окном времени
                 since_dt = now - timedelta(minutes=freq_min)
                 min_id = None
 
-            # тип подписки
             sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
             sub_report["subscription_type"] = sub_type
 
-
-            # 4) Читаем сообщения из TG
             entity, msgs = await fetch_chat_messages_for_subscription(
                 db,
                 owner_user_id,
@@ -739,8 +777,8 @@ async def analyze_chat(
     }
 
 @app.post("/tg/send_code")
-async def tg_send_code(payload: dict, db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_send_code(payload: dict, user: User = Depends(auth_get_current_user), db: AsyncSession = Depends(get_db)):
+    owner_user_id = user.id
 
     phone = (payload.get("phone") or "").strip()
     if not phone:
@@ -752,8 +790,8 @@ async def tg_send_code(payload: dict, db: AsyncSession = Depends(get_db)):
     return {"status": "code_sent"}
 
 @app.post("/tg/confirm_code")
-async def tg_confirm_code(payload: dict, db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_confirm_code(payload: dict, user: User = Depends(auth_get_current_user), db: AsyncSession = Depends(get_db)):
+    owner_user_id = user.id
     try:
         phone = (payload.get("phone") or "").strip()
         code = (payload.get("code") or "").strip()
@@ -773,7 +811,7 @@ async def tg_confirm_code(payload: dict, db: AsyncSession = Depends(get_db)):
             await save_user_telegram_session(db, owner_user_id, ss)
 
             # получаем текущего пользователя
-            me = await get_current_user(db, owner_user_id)
+            me = await tg_get_current_user(db, owner_user_id)
 
         except ValueError as ve:
 
@@ -807,25 +845,24 @@ async def tg_confirm_code(payload: dict, db: AsyncSession = Depends(get_db)):
         )
 
 @app.post("/tg/confirm_password")
-async def tg_confirm_password(payload: dict, db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_confirm_password(
+    payload: dict,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
     try:
         password = (payload.get("password") or "").strip()
-
         if not password:
-            raise HTTPException(
-                status_code=400,
-                detail="PASSWORD_REQUIRED"
-            )
+            raise HTTPException(status_code=400, detail="PASSWORD_REQUIRED")
 
-        # завершаем 2FA-авторизацию
         await confirm_password(db, owner_user_id, password)
 
         ss = await export_string_session(db, owner_user_id)
         await save_user_telegram_session(db, owner_user_id, ss)
 
-        me = await get_current_user(db, owner_user_id)
+        me = await tg_get_current_user(db, owner_user_id)
 
         return {
             "status": "authorized",
@@ -837,23 +874,22 @@ async def tg_confirm_password(payload: dict, db: AsyncSession = Depends(get_db))
 
     except HTTPException:
         raise
-
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"TG_PASSWORD_CONFIRM_FAILED: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"TG_PASSWORD_CONFIRM_FAILED: {str(e)}")
 
 @app.post("/tg/analyze_chat")
-async def tg_analyze_chat(payload: dict, db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_analyze_chat(
+    payload: dict,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
     chat_link = (payload.get("chat_link") or "").strip()
     user_query = (payload.get("user_query") or "").strip()
     days = int(payload.get("days") or 7)
 
-    me = await get_current_user(db, owner_user_id)
-
+    me = await tg_get_current_user(db, owner_user_id)
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
@@ -878,28 +914,30 @@ async def tg_analyze_chat(payload: dict, db: AsyncSession = Depends(get_db)):
     }
 
 @app.get("/tg/chats")
-async def tg_list_chats(limit: int = 200, db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_list_chats(
+    limit: int = 200,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
-    me = await get_current_user(db, owner_user_id)
+    me = await tg_get_current_user(db, owner_user_id)
     if not me:
         raise HTTPException(status_code=401, detail="TELEGRAM_NOT_AUTHORIZED")
 
     try:
-        chats = await list_user_chats(db, owner_user_id,limit=limit)
-        return {
-            "status": "ok",
-            "count": len(chats),
-            "chats": chats,
-        }
+        chats = await list_user_chats(db, owner_user_id, limit=limit)
+        return {"status": "ok", "count": len(chats), "chats": chats}
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_CHATS_FAILED: {str(e)}")
-
 @app.post("/tg/logout")
-async def tg_logout(db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_logout(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
     try:
         await logout_telegram(db, owner_user_id)
@@ -908,8 +946,11 @@ async def tg_logout(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"TG_LOGOUT_FAILED: {str(e)}")
 
 @app.post("/tg/qr/start")
-async def tg_qr_start(db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+async def tg_qr_start(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
     try:
         data = await qr_login_start(db, owner_user_id)
@@ -917,9 +958,12 @@ async def tg_qr_start(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_START_FAILED: {str(e)}")
 
-@app.get("/tg/qr/status")
-async def tg_qr_status(db: AsyncSession = Depends(get_db)):
-    owner_user_id = DEV_OWNER_USER_ID
+
+async def tg_qr_status(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
 
     try:
         data = await qr_login_status(db, owner_user_id)
@@ -931,7 +975,6 @@ async def tg_qr_status(db: AsyncSession = Depends(get_db)):
         return data
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")
-
 
 async def bot_send_message(chat_id: int, text: str):
     if not BOT_TOKEN:
@@ -961,16 +1004,14 @@ async def tg_bot_webhook(
     # 1) Проверка секрета
     expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
     got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-
     if not expected or got != expected:
         raise HTTPException(status_code=401, detail="WEBHOOK_SECRET_INVALID")
 
     update = await request.json()
-
-    # 2) Извлечь message/chat/user/text
     message = update.get("message") or update.get("edited_message")
     if not message:
         return {"ok": True}
+
 
     chat = message.get("chat") or {}
     user = message.get("from") or {}
@@ -978,7 +1019,6 @@ async def tg_bot_webhook(
 
     telegram_chat_id = chat.get("id")
     telegram_user_id = user.get("id")
-
     if not telegram_chat_id:
         return {"ok": True}
 
@@ -986,16 +1026,48 @@ async def tg_bot_webhook(
     if not text.startswith("/start"):
         return {"ok": True}
 
+        # ожидаем: "/start <code>"
+    parts = text.split(maxsplit=1)
+    code = parts[1].strip() if len(parts) > 1 else None
+    if not code:
+        # можно ответить подсказкой
+        await bot_send_message(
+            telegram_chat_id,
+            "Привет! Чтобы привязать бота, открой CoTel → Профиль → Подключить бота и отправь мне /start <код>."
+        )
+        return {"ok": True}
+
+    code_hash = sha256_hex(code)
+
+    # 1) найти активный код
+    now = datetime.now(timezone.utc)
+    res = await db.execute(
+        select(BotLinkCode).where(
+            BotLinkCode.code_hash == code_hash,
+            BotLinkCode.used_at.is_(None),
+            BotLinkCode.expires_at > now,
+        )
+    )
+    rec = res.scalar_one_or_none()
+    if not rec:
+        await bot_send_message(telegram_chat_id, "Код недействителен или истёк. Сгенерируй новый в CoTel.")
+        return {"ok": True}
+
+    owner_user_id = rec.user_id
+
+    # 2) отметить код использованным
+    rec.used_at = now
+
     # 4) Upsert в bot_user_link по уникальному telegram_chat_id
     stmt = insert(BotUserLink).values(
-        owner_user_id=DEV_OWNER_USER_ID,  # <-- ВАЖНО: MVP-привязка
+        owner_user_id=owner_user_id,
         telegram_chat_id=telegram_chat_id,
         telegram_user_id=telegram_user_id,
         is_blocked=False,
     ).on_conflict_do_update(
         index_elements=["telegram_chat_id"],
         set_={
-            "owner_user_id": DEV_OWNER_USER_ID,  # <-- тоже обновляем
+            "owner_user_id": owner_user_id,
             "telegram_user_id": telegram_user_id,
             "is_blocked": False,
             "updated_at": sa.text("now()"),
@@ -1015,20 +1087,32 @@ async def tg_bot_webhook(
     return {"ok": True}
 
 @app.get("/tg/bot/link/status")
-async def tg_bot_link_status(db: AsyncSession = Depends(get_db)):
-    q = select(sa.func.count()).select_from(BotUserLink).where(BotUserLink.is_blocked == False)  # noqa: E712
+async def tg_bot_link_status(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    q = (
+        select(sa.func.count())
+        .select_from(BotUserLink)
+        .where(
+            BotUserLink.owner_user_id == user.id,
+            BotUserLink.is_blocked == False,  # noqa: E712
+        )
+    )
     count = (await db.execute(q)).scalar_one()
     return {"connected": count > 0}
-
 @app.post("/subscriptions", response_model=SubscriptionOut)
-async def create_subscription(payload: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
-    # 1) создаём подписку
+async def create_subscription(
+    payload: SubscriptionCreate,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     sub = Subscription(
-        owner_user_id=payload.owner_user_id,
+        owner_user_id=user.id,     # <-- ВАЖНО
         name=payload.name,
         source_mode=payload.source_mode,
         chat_ref=payload.chat_ref,
-        chat_id=None,  # пока не резолвим в числовой id
+        chat_id=None,
         frequency_minutes=payload.frequency_minutes,
         prompt=payload.prompt,
         subscription_type=payload.subscription_type,
@@ -1036,6 +1120,8 @@ async def create_subscription(payload: SubscriptionCreate, db: AsyncSession = De
         status="active" if payload.is_active else "paused",
         last_error=None,
     )
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
     db.add(sub)
 
@@ -1061,42 +1147,54 @@ async def create_subscription(payload: SubscriptionCreate, db: AsyncSession = De
 
 
 @app.get("/subscriptions", response_model=list[SubscriptionOut])
-async def list_subscriptions(db: AsyncSession = Depends(get_db)):
-    # пока без фильтра по owner_user_id — так как один пользователь
-    res = await db.execute(select(Subscription).order_by(Subscription.id.desc()))
+async def list_subscriptions(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(Subscription)
+        .where(Subscription.owner_user_id == user.id)
+        .order_by(Subscription.id.desc())
+    )
     return res.scalars().all()
 
 @app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
-async def get_subscription(subscription_id: int, db: AsyncSession = Depends(get_db)):
+async def get_subscription(
+    subscription_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
     sub = res.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
     return sub
 
 @app.put("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
-async def update_subscription(subscription_id: int, payload: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
+async def update_subscription(
+    subscription_id: int,
+    payload: SubscriptionCreate,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
     sub = res.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
-    # Обновляем редактируемые поля (те же, что и при создании)
     sub.name = payload.name
     sub.source_mode = payload.source_mode
     sub.subscription_type = payload.subscription_type
-
     sub.chat_ref = payload.chat_ref
-    # chat_id не трогаем здесь (он резолвится позже при чтении/раннере)
-
     sub.frequency_minutes = payload.frequency_minutes
     sub.prompt = payload.prompt
-
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
-
-    # updated_at: лучше явно проставить (если хочешь)
     sub.updated_at = sa.func.now()
 
     await db.commit()
@@ -1104,16 +1202,22 @@ async def update_subscription(subscription_id: int, payload: SubscriptionCreate,
     return sub
 
 @app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
-async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: AsyncSession = Depends(get_db)):
+async def toggle_subscription(
+    subscription_id: int,
+    payload: ToggleRequest,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
     sub = res.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
-    # updated_at у тебя server_default now() — но  при update лучше руками:
     sub.updated_at = sa.func.now()
 
     await db.commit()
@@ -1121,24 +1225,25 @@ async def toggle_subscription(subscription_id: int, payload: ToggleRequest, db: 
     return sub
 
 @app.delete("/subscriptions/{subscription_id}")
-async def delete_subscription(subscription_id: int, db: AsyncSession = Depends(get_db)):
-    # 1) проверим, что подписка существует
+async def delete_subscription(
+    subscription_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
     sub = res.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
-    # 2) удаляем зависимые записи (в правильном порядке)
     await db.execute(delete(MatchEvent).where(MatchEvent.subscription_id == subscription_id))
     await db.execute(delete(DigestEvent).where(DigestEvent.subscription_id == subscription_id))
     await db.execute(delete(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id))
-
-    # 3) удаляем саму подписку
     await db.execute(delete(Subscription).where(Subscription.id == subscription_id))
 
     await db.commit()
     return {"status": "ok", "deleted_subscription_id": subscription_id}
-
 @app.post("/tg/bot/dispatch")
 async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
     t0 = time.perf_counter()

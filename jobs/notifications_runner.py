@@ -19,7 +19,6 @@ from main import build_tg_message_link, bot_send_message
 # -----------------------------
 # Config / constants
 # -----------------------------
-DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 
 BATCH_LIMIT = 200
 DETAIL_TEXT_LIMIT = 3800  # сколько максимум тратим на "подробную" часть; остальное оставляем под ссылки/хвост
@@ -351,7 +350,14 @@ async def run_tick() -> int:
             # группировка: (owner_user_id, subscription_id) -> {sub, events[]}
             grouped: dict[tuple[int, int], dict] = {}
             for ev, sub in rows:
-                owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
+                owner_user_id = getattr(sub, "owner_user_id", None)
+                if not owner_user_id:
+                    # Некорректная подписка — нельзя понять, кому слать.
+                    print(f"[notifications_runner] MATCH_SKIP sub_id={sub.id} reason=NO_OWNER_USER_ID")
+                    # Помечаем события failed, чтобы не зациклились
+                    await _mark_match_events(db, [int(ev.id)], STATUS_FAILED)
+                    continue
+                owner_user_id = int(owner_user_id)
                 sid = int(ev.subscription_id)
                 key = (owner_user_id, sid)
                 grouped.setdefault(key, {"sub": sub, "events": []})
@@ -404,7 +410,12 @@ async def run_tick() -> int:
 
             # Здесь можно отправлять 1 сообщение на DigestEvent (как ты и сказала — проще)
             for ev, sub in rows:
-                owner_user_id = int(getattr(sub, "owner_user_id", None) or DEV_OWNER_USER_ID)
+                owner_user_id = getattr(sub, "owner_user_id", None)
+                if not owner_user_id:
+                    print(f"[notifications_runner] DIGEST_SKIP sub_id={sub.id} ev_id={ev.id} reason=NO_OWNER_USER_ID")
+                    await _mark_digest_events(db, [int(ev.id)], STATUS_FAILED)
+                    continue
+                owner_user_id = int(owner_user_id)
                 sid = int(ev.subscription_id)
 
                 sub_type = (getattr(sub, "subscription_type", None) or "").lower()
