@@ -10,3 +10,4 @@ psycopg[binary]
 psycopg2-binary
 cryptography>=41.0.0
 passlib[bcrypt]==1.7.4
+email-validator
