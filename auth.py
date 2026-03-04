@@ -21,7 +21,10 @@ from db.models import User, EmailVerificationCode, Session
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],  # поддержим старые хэши, если уже есть
+    deprecated="auto",
+)
 
 COOKIE_NAME = "cotel_session"
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
