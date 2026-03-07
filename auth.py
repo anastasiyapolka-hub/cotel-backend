@@ -62,7 +62,12 @@ class MeOut(BaseModel):
     is_active: bool
     last_login_at: Optional[datetime] = None
 
+class CheckEmailIn(BaseModel):
+    email: EmailStr
 
+
+class CheckEmailOut(BaseModel):
+    exists: bool
 # -------------------------
 # Helpers
 # -------------------------
@@ -341,5 +346,14 @@ async def me(user: User = Depends(get_current_user_from_cookie)):
         is_active=user.is_active,
         last_login_at=user.last_login_at,
     )
+
+@router.post("/check-email", response_model=CheckEmailOut)
+async def check_email(payload: CheckEmailIn, db: AsyncSession = Depends(get_db)):
+    email = payload.email.strip().lower()
+
+    r = await db.execute(select(User.id).where(User.email == email))
+    user_id = r.scalar_one_or_none()
+
+    return CheckEmailOut(exists=bool(user_id))
 
 get_current_user = get_current_user_from_cookie
