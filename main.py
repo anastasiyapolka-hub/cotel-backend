@@ -1244,13 +1244,22 @@ async def delete_subscription(
 
     await db.commit()
     return {"status": "ok", "deleted_subscription_id": subscription_id}
+
 @app.post("/tg/bot/dispatch")
-async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
+async def tg_bot_dispatch(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     t0 = time.perf_counter()
 
-    # 1) куда слать (MVP: первый живой линк)
+    # 1) куда слать — только для текущего пользователя
     r = await db.execute(
-        select(BotUserLink).where(BotUserLink.is_blocked == False).order_by(BotUserLink.id.desc())
+        select(BotUserLink)
+        .where(
+            BotUserLink.owner_user_id == user.id,
+            BotUserLink.is_blocked == False
+        )
+        .order_by(BotUserLink.id.desc())
     )
     link = r.scalars().first()
     if not link:
@@ -1258,23 +1267,31 @@ async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
 
     dest_chat_id = link.telegram_chat_id
 
-    # 2) queued события + сразу подтягиваем Subscription, чтобы знать name/chat_ref/chat_id
+    # 2) queued события — только подписки текущего пользователя
     r2 = await db.execute(
         select(MatchEvent, Subscription)
         .join(Subscription, Subscription.id == MatchEvent.subscription_id)
-        .where(MatchEvent.notify_status == "queued")
+        .where(
+            MatchEvent.notify_status == "queued",
+            Subscription.owner_user_id == user.id,
+        )
         .order_by(MatchEvent.subscription_id.asc(), MatchEvent.id.asc())
         .limit(200)
     )
 
-    rows = list(r2.all())  # [(MatchEvent, Subscription), ...]
+    rows = list(r2.all())
 
     if not rows:
         elapsed = round(time.perf_counter() - t0, 2)
-        return {"status": "ok", "events_total": 0, "sent_groups": 0, "failed_groups": 0, "elapsed_seconds": elapsed}
+        return {
+            "status": "ok",
+            "events_total": 0,
+            "sent_groups": 0,
+            "failed_groups": 0,
+            "elapsed_seconds": elapsed
+        }
 
-    # 3) группировка по subscription_id
-    grouped: dict[int, dict] = {}
+    grouped = {}
     for ev, sub in rows:
         sid = int(ev.subscription_id)
         if sid not in grouped:
@@ -1285,20 +1302,19 @@ async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
     failed_groups = 0
     events_total = len(rows)
 
-    # 4) одна отправка на подписку
     for sid, pack in grouped.items():
-        sub: Subscription = pack["sub"]
-        events: list[MatchEvent] = pack["events"]
+        sub = pack["sub"]
+        events = pack["events"]
 
         try:
-            # ограничим, чтобы не упереться в лимит Telegram (4096)
-            # покажем первые 10, остальное свернём
             max_items = 10
             shown = events[:max_items]
             rest = len(events) - len(shown)
 
-            header = f"Найдены события по подписке: {sub.name or f'#{sid}'}\n" \
-                     f"Совпадений: {len(events)}\n"
+            header = (
+                f"Найдены события по подписке: {sub.name or f'#{sid}'}\n"
+                f"Совпадений: {len(events)}\n"
+            )
 
             lines = []
             for i, ev in enumerate(shown, start=1):
@@ -1323,13 +1339,12 @@ async def tg_bot_dispatch(db: AsyncSession = Depends(get_db)):
                 )
 
             if rest > 0:
-                lines.append(f"\n\n…и ещё {rest} совпадений (свернуто для компактности).")
+                lines.append(f"\n\n…и ещё {rest} совпадений.")
 
             text = header + "".join(lines)
 
-            await bot_send_message(dest_chat_id, text)  # sendMessage один раз
+            await bot_send_message(dest_chat_id, text)
 
-            # помечаем все события группы как sent
             for ev in events:
                 ev.notify_status = "sent"
                 db.add(ev)
