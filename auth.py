@@ -104,7 +104,7 @@ def _set_session_cookie(response: Response, raw_session_id: str) -> None:
         value=raw_session_id,
         httponly=True,
         secure=secure,
-        samesite="lax",
+        samesite="none",
         max_age=SESSION_TTL_DAYS * 24 * 3600,
         path="/",
     )
