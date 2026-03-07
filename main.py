@@ -958,7 +958,7 @@ async def tg_qr_start(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_START_FAILED: {str(e)}")
 
-
+@app.get("/tg/qr/status")
 async def tg_qr_status(
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
