@@ -42,7 +42,9 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str
     password_confirm: str
-
+    country_code: Optional[str] = None
+    language: Optional[str] = None
+    language_source: Optional[str] = None
 
 class VerifyEmailIn(BaseModel):
     email: EmailStr
@@ -60,14 +62,21 @@ class MeOut(BaseModel):
     plan: str
     is_email_verified: bool
     is_active: bool
+    country_code: Optional[str] = None
+    language: Optional[str] = None
+    language_source: Optional[str] = None
     last_login_at: Optional[datetime] = None
 
 class CheckEmailIn(BaseModel):
     email: EmailStr
 
-
 class CheckEmailOut(BaseModel):
     exists: bool
+
+class UpdatePreferencesIn(BaseModel):
+    language: str
+    language_source: Optional[str] = "manual"
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -95,6 +104,23 @@ def _validate_password_policy(password: str) -> None:
     classes = sum([has_lower or has_upper, has_digit, has_symbol])  # буквы/цифры/символы
     if classes < 2:
         raise HTTPException(status_code=400, detail="PASSWORD_TOO_WEAK")
+
+def _normalize_language(value: Optional[str]) -> str:
+    return "ru" if str(value or "").lower().startswith("ru") else "en"
+
+def _normalize_language_source(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower()
+    return "manual" if normalized == "manual" else "auto"
+
+def _normalize_country_code(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    code = str(value).strip().upper()
+    if not code:
+        return None
+    if len(code) != 2 or not code.isalpha():
+        raise HTTPException(status_code=400, detail="COUNTRY_CODE_INVALID")
+    return code
 
 def _set_session_cookie(response: Response, raw_session_id: str) -> None:
     # Secure=True будет работать на https; локально можно DEV-условием выключить при необходимости
@@ -181,6 +207,9 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
 
     _validate_password_policy(payload.password)
     password_hash = pwd_context.hash(payload.password)
+    country_code = _normalize_country_code(payload.country_code)
+    language = _normalize_language(payload.language)
+    language_source = _normalize_language_source(payload.language_source)
 
     user = User(
         email=email,
@@ -188,6 +217,9 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
         is_email_verified=False,
         is_active=False,  # до verify
         plan="free",
+        country_code=country_code,
+        language=language,
+        language_source=language_source,
     )
 
     try:
@@ -279,6 +311,9 @@ async def verify_email(payload: VerifyEmailIn, request: Request, response: Respo
         plan=user.plan,
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
+        country_code=user.country_code,
+        language=user.language,
+        language_source=user.language_source,
         last_login_at=user.last_login_at,
     )
 
@@ -316,6 +351,9 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
         plan=user.plan,
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
+        country_code=user.country_code,
+        language=user.language,
+        language_source=user.language_source,
         last_login_at=user.last_login_at,
     )
 
@@ -344,6 +382,9 @@ async def me(user: User = Depends(get_current_user_from_cookie)):
         plan=user.plan,
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
+        country_code=user.country_code,
+        language=user.language,
+        language_source=user.language_source,
         last_login_at=user.last_login_at,
     )
 
@@ -355,5 +396,29 @@ async def check_email(payload: CheckEmailIn, db: AsyncSession = Depends(get_db))
     user_id = r.scalar_one_or_none()
 
     return CheckEmailOut(exists=bool(user_id))
+
+@router.patch("/preferences", response_model=MeOut)
+async def update_preferences(
+    payload: UpdatePreferencesIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user_from_cookie),
+):
+    user.language = _normalize_language(payload.language)
+    user.language_source = _normalize_language_source(payload.language_source)
+
+    await db.commit()
+    await db.refresh(user)
+
+    return MeOut(
+        id=user.id,
+        email=user.email,
+        plan=user.plan,
+        is_email_verified=user.is_email_verified,
+        is_active=user.is_active,
+        country_code=user.country_code,
+        language=user.language,
+        language_source=user.language_source,
+        last_login_at=user.last_login_at,
+    )
 
 get_current_user = get_current_user_from_cookie
