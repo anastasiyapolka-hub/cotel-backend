@@ -162,6 +162,10 @@ class User(Base):
     plan = Column(String(32), nullable=False, server_default="free")
     is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
 
+    country_code = Column(String(2), nullable=True, index=True)
+    language = Column(String(5), nullable=True, server_default="en")
+    language_source = Column(String(10), nullable=True, server_default="auto")
+
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
