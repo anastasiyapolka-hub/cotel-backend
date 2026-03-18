@@ -19,10 +19,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
-    pass
+    op.add_column("users", sa.Column("country_code", sa.String(length=2), nullable=True))
+    op.add_column("users", sa.Column("language", sa.String(length=5), nullable=True, server_default="en"))
+    op.add_column("users", sa.Column("language_source", sa.String(length=10), nullable=True, server_default="auto"))
 
+    op.create_index("ix_users_country_code", "users", ["country_code"], unique=False)
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    pass
+    op.drop_index("ix_users_country_code", table_name="users")
+
+    op.drop_column("users", "language_source")
+    op.drop_column("users", "language")
+    op.drop_column("users", "country_code")
