@@ -1,4 +1,4 @@
-"""actually add user country language columns1
+"""actually add user country language columns2
 
 Revision ID: 5c8273706650
 Revises: 6b924e38a896
