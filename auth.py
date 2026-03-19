@@ -29,7 +29,7 @@ pwd_context = CryptContext(
 COOKIE_NAME = "cotel_session"
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 EMAIL_CODE_TTL_MIN = int(os.getenv("EMAIL_CODE_TTL_MIN", "15"))
-DEV_RETURN_EMAIL_CODE = os.getenv("DEV_RETURN_EMAIL_CODE", "0") == "1"  # на время без email-провайдера
+DEV_RETURN_EMAIL_CODE = False
 
 EMAIL_RE = re.compile(r"^.{1,320}$")
 
