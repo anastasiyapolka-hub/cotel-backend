@@ -17,7 +17,7 @@ from passlib.context import CryptContext
 
 from db.session import get_db
 from db.models import User, EmailVerificationCode, Session
-
+from email_service import send_verification_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -72,6 +72,9 @@ class CheckEmailIn(BaseModel):
 
 class CheckEmailOut(BaseModel):
     exists: bool
+
+class ResendVerifyCodeIn(BaseModel):
+    email: EmailStr
 
 class UpdatePreferencesIn(BaseModel):
     language: str
@@ -255,12 +258,67 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
 
     await db.commit()
 
-    # TODO: здесь будет отправка email через провайдера
+    try:
+        await send_verification_email(user.email, code, EMAIL_CODE_TTL_MIN)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
+
     out = {"status": "ok"}
     if DEV_RETURN_EMAIL_CODE:
         out["dev_code"] = code  # только на деве
     return out
 
+@router.post("/resend-verification-code")
+async def resend_verification_code(
+    payload: ResendVerifyCodeIn,
+    db: AsyncSession = Depends(get_db),
+):
+    email = payload.email.strip().lower()
+
+    r = await db.execute(select(User).where(User.email == email))
+    user = r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+
+    if user.is_email_verified:
+        raise HTTPException(status_code=400, detail="EMAIL_ALREADY_VERIFIED")
+
+    code = _make_email_code()
+    code_hash = _sha256_hex(code)
+    expires_at = _now() + timedelta(minutes=EMAIL_CODE_TTL_MIN)
+
+    r = await db.execute(
+        select(EmailVerificationCode).where(EmailVerificationCode.user_id == user.id)
+    )
+    rec = r.scalar_one_or_none()
+
+    if rec:
+        rec.code_hash = code_hash
+        rec.expires_at = expires_at
+        rec.used_at = None
+        rec.attempts = 0
+    else:
+        db.add(
+            EmailVerificationCode(
+                user_id=user.id,
+                code_hash=code_hash,
+                expires_at=expires_at,
+                used_at=None,
+                attempts=0,
+            )
+        )
+
+    await db.commit()
+
+    try:
+        await send_verification_email(user.email, code, EMAIL_CODE_TTL_MIN)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
+
+    out = {"status": "ok"}
+    if DEV_RETURN_EMAIL_CODE:
+        out["dev_code"] = code
+    return out
 
 @router.post("/verify-email", response_model=MeOut)
 async def verify_email(payload: VerifyEmailIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
