@@ -28,7 +28,8 @@ pwd_context = CryptContext(
 
 COOKIE_NAME = "cotel_session"
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
-EMAIL_CODE_TTL_MIN = int(os.getenv("EMAIL_CODE_TTL_MIN", "15"))
+EMAIL_CODE_TTL_MIN = int(os.getenv("EMAIL_CODE_TTL_MIN", "5"))
+EMAIL_RESEND_COOLDOWN_SEC = int(os.getenv("EMAIL_RESEND_COOLDOWN_SEC", "60"))
 DEV_RETURN_EMAIL_CODE = False
 
 EMAIL_RE = re.compile(r"^.{1,320}$")
@@ -283,14 +284,30 @@ async def resend_verification_code(
     if user.is_email_verified:
         raise HTTPException(status_code=400, detail="EMAIL_ALREADY_VERIFIED")
 
-    code = _make_email_code()
-    code_hash = _sha256_hex(code)
-    expires_at = _now() + timedelta(minutes=EMAIL_CODE_TTL_MIN)
-
     r = await db.execute(
         select(EmailVerificationCode).where(EmailVerificationCode.user_id == user.id)
     )
     rec = r.scalar_one_or_none()
+
+    now = _now()
+
+    if rec and rec.expires_at:
+        last_sent_at = rec.expires_at - timedelta(minutes=EMAIL_CODE_TTL_MIN)
+        retry_at = last_sent_at + timedelta(seconds=EMAIL_RESEND_COOLDOWN_SEC)
+
+        if now < retry_at:
+            retry_after = int((retry_at - now).total_seconds())
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "RESEND_COOLDOWN",
+                    "retry_after_sec": retry_after,
+                },
+            )
+
+    code = _make_email_code()
+    code_hash = _sha256_hex(code)
+    expires_at = now + timedelta(minutes=EMAIL_CODE_TTL_MIN)
 
     if rec:
         rec.code_hash = code_hash
@@ -319,6 +336,7 @@ async def resend_verification_code(
     if DEV_RETURN_EMAIL_CODE:
         out["dev_code"] = code
     return out
+
 
 @router.post("/verify-email", response_model=MeOut)
 async def verify_email(payload: VerifyEmailIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
