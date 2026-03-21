@@ -781,7 +781,6 @@ async def analyze_chat(
 async def tg_send_code(payload: dict, user: User = Depends(auth_get_current_user), db: AsyncSession = Depends(get_db)):
     owner_user_id = user.id
 
-    print(f"[TG SEND CODE] phone received by frontend: {phone!r}")
     phone = (payload.get("phone") or "").strip()
     print(f"[TG SEND CODE] phone received by backend: {phone!r}")
     if not phone:
