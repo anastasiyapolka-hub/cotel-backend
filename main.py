@@ -781,13 +781,17 @@ async def analyze_chat(
 async def tg_send_code(payload: dict, user: User = Depends(auth_get_current_user), db: AsyncSession = Depends(get_db)):
     owner_user_id = user.id
 
+    print(f"[TG SEND CODE] phone received by frontend: {phone!r}")
     phone = (payload.get("phone") or "").strip()
+    print(f"[TG SEND CODE] phone received by backend: {phone!r}")
     if not phone:
         raise HTTPException(400, "PHONE_REQUIRED")
     try:
+        print(f"[TG SEND CODE] calling Telethon send_code_request with phone: {phone!r}")
         await send_login_code(db, owner_user_id, phone)
     except Exception as e:
-        raise HTTPException(400, f"TELEGRAM_ERROR: {e}")
+        print(f"[TG SEND CODE] ERROR type={type(e).__name__} repr={e!r} phone={phone!r}")
+        raise HTTPException(status_code=400, detail=f"TELEGRAM_ERROR: {e}")
     return {"status": "code_sent"}
 
 @app.post("/tg/confirm_code")
