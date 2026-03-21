@@ -67,6 +67,7 @@ class MeOut(BaseModel):
     language: Optional[str] = None
     language_source: Optional[str] = None
     last_login_at: Optional[datetime] = None
+    phone: Optional[str] = None
 
 class CheckEmailIn(BaseModel):
     email: EmailStr
@@ -80,6 +81,7 @@ class ResendVerifyCodeIn(BaseModel):
 class UpdatePreferencesIn(BaseModel):
     language: str
     language_source: Optional[str] = "manual"
+    phone: Optional[str] = None
 
 # -------------------------
 # Helpers
@@ -125,6 +127,24 @@ def _normalize_country_code(value: Optional[str]) -> Optional[str]:
     if len(code) != 2 or not code.isalpha():
         raise HTTPException(status_code=400, detail="COUNTRY_CODE_INVALID")
     return code
+
+def _normalize_phone(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    phone = str(value).strip()
+    if not phone:
+        return None
+
+    phone = re.sub(r"[^\d+]", "", phone)
+
+    if not phone.startswith("+"):
+        raise HTTPException(status_code=400, detail="PHONE_INVALID")
+
+    if not re.fullmatch(r"\+\d{8,20}", phone):
+        raise HTTPException(status_code=400, detail="PHONE_INVALID")
+
+    return phone
 
 def _set_session_cookie(response: Response, raw_session_id: str) -> None:
     # Secure=True будет работать на https; локально можно DEV-условием выключить при необходимости
@@ -391,6 +411,7 @@ async def verify_email(payload: VerifyEmailIn, request: Request, response: Respo
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
+        phone=user.phone,
     )
 
 
@@ -431,6 +452,7 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
+        phone=user.phone,
     )
 
 
@@ -462,6 +484,7 @@ async def me(user: User = Depends(get_current_user_from_cookie)):
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
+        phone=user.phone,
     )
 
 @router.post("/check-email", response_model=CheckEmailOut)
@@ -481,13 +504,20 @@ async def update_preferences(
 ):
     user.language = _normalize_language(payload.language)
     user.language_source = _normalize_language_source(payload.language_source)
+    user.phone = _normalize_phone(payload.phone)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="PHONE_ALREADY_USED")
+
     await db.refresh(user)
 
     return MeOut(
         id=user.id,
         email=user.email,
+        phone=user.phone,
         plan=user.plan,
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
