@@ -28,6 +28,7 @@ from db.models import User
 from db.models import BotLinkCode
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 from service_account_routes import router as service_account_router
+from service_account_admin_routes import router as service_account_admin_router
 
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -63,6 +64,7 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.include_router(service_account_router)
+app.include_router(service_account_admin_router)
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
