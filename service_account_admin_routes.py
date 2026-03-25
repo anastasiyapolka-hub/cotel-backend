@@ -34,6 +34,23 @@ _admin_auth_clients: dict[int, TelegramClient] = {}
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+def session_status_payload(s: ServiceTelegramSession) -> dict:
+    status = "active" if s.is_active and s.revoked_at is None else "inactive"
+    status_label = "Активна" if status == "active" else "Неактивна"
+
+    return {
+        "id": s.id,
+        "service_account_id": s.service_account_id,
+        "session_version": s.session_version,
+        "is_active": s.is_active,
+        "status": status,
+        "status_label": status_label,
+        "revoked_at": s.revoked_at.isoformat() if s.revoked_at else None,
+        "revoked_reason": s.revoked_reason,
+        "last_used_at": s.last_used_at.isoformat() if s.last_used_at else None,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
 
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if value is None:
@@ -346,3 +363,28 @@ async def service_account_admin_confirm_password(payload: ServiceAccountAuthPass
         return {"status": "ok", "auth_status": "authorized", "service_account_id": account.id, "telegram_username": getattr(me, "username", None), "message": "Сессия создана.", "state": await _serialize_state(db)}
     except Exception as e:
         raise HTTPException(status_code=400, detail={"code": "CONFIRM_PASSWORD_FAILED", "message": str(e)})
+
+@router.get("/admin/service-accounts/sessions/{account_id}")
+async def service_account_sessions(
+    account_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    account_res = await db.execute(
+        select(ServiceTelegramAccount).where(ServiceTelegramAccount.id == account_id)
+    )
+    account = account_res.scalar_one_or_none()
+
+    if not account:
+        return {"sessions": []}
+
+    sessions_res = await db.execute(
+        select(ServiceTelegramSession)
+        .where(ServiceTelegramSession.service_account_id == account_id)
+        .order_by(ServiceTelegramSession.id.desc())
+    )
+    sessions = list(sessions_res.scalars().all())
+
+    return {
+        "sessions": [session_status_payload(s) for s in sessions]
+    }
