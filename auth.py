@@ -51,11 +51,9 @@ class VerifyEmailIn(BaseModel):
     email: EmailStr
     code: str
 
-
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
-
 
 class MeOut(BaseModel):
     id: int
@@ -68,6 +66,9 @@ class MeOut(BaseModel):
     language_source: Optional[str] = None
     last_login_at: Optional[datetime] = None
     phone: Optional[str] = None
+
+class AuthSessionOut(MeOut):
+    session_id: Optional[str] = None
 
 class CheckEmailIn(BaseModel):
     email: EmailStr
@@ -162,6 +163,25 @@ def _set_session_cookie(response: Response, raw_session_id: str) -> None:
 def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path="/")
 
+def _extract_raw_session_id(request: Request) -> Optional[str]:
+    # 1) основной канал — cookie
+    raw = request.cookies.get(COOKIE_NAME)
+    if raw:
+        return raw
+
+    # 2) fallback — Authorization: Bearer <session_id>
+    auth_header = (request.headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+
+    # 3) запасной вариант — X-Session-Id
+    x_session_id = (request.headers.get("x-session-id") or "").strip()
+    if x_session_id:
+        return x_session_id
+
+    return None
 
 async def _create_session(db: AsyncSession, user_id: int, request: Request) -> str:
     raw_session_id = secrets.token_urlsafe(32)
@@ -188,7 +208,7 @@ async def get_current_user_from_cookie(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    raw = request.cookies.get(COOKIE_NAME)
+    raw = _extract_raw_session_id(request)
     if not raw:
         raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
 
@@ -358,7 +378,7 @@ async def resend_verification_code(
     return out
 
 
-@router.post("/verify-email", response_model=MeOut)
+@router.post("/verify-email", response_model=AuthSessionOut)
 async def verify_email(payload: VerifyEmailIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     email = payload.email.strip().lower()
     code = (payload.code or "").strip()
@@ -401,7 +421,7 @@ async def verify_email(payload: VerifyEmailIn, request: Request, response: Respo
     raw_session_id = await _create_session(db, user.id, request)
     _set_session_cookie(response, raw_session_id)
 
-    return MeOut(
+    return AuthSessionOut(
         id=user.id,
         email=user.email,
         plan=user.plan,
@@ -412,10 +432,11 @@ async def verify_email(payload: VerifyEmailIn, request: Request, response: Respo
         language_source=user.language_source,
         last_login_at=user.last_login_at,
         phone=user.phone,
+        session_id=raw_session_id,
     )
 
 
-@router.post("/login", response_model=MeOut)
+@router.post("/login", response_model=AuthSessionOut)
 async def login(payload: LoginIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     email = payload.email.strip().lower()
     password = payload.password or ""
@@ -442,7 +463,7 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
     raw_session_id = await _create_session(db, user.id, request)
     _set_session_cookie(response, raw_session_id)
 
-    return MeOut(
+    return AuthSessionOut(
         id=user.id,
         email=user.email,
         plan=user.plan,
@@ -453,12 +474,13 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
         language_source=user.language_source,
         last_login_at=user.last_login_at,
         phone=user.phone,
+        session_id=raw_session_id,
     )
 
 
 @router.post("/logout")
 async def logout(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
-    raw = request.cookies.get(COOKIE_NAME)
+    raw = _extract_raw_session_id(request)
     if raw:
         session_hash = _sha256_hex(raw)
         await db.execute(
