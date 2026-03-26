@@ -10,7 +10,9 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.tl.types import Message
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import Message, Channel, Chat
 
 from db.models import (
     ServicePhoneNumber,
@@ -73,33 +75,45 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)")
+
+def extract_invite_hash(chat_ref: str) -> Optional[str]:
+    ref = (chat_ref or "").strip()
+    if not ref:
+        return None
+
+    m = INVITE_RE.search(ref)
+    if m:
+        return m.group(1)
+
+    if ref.startswith("+") and len(ref) > 1:
+        return ref[1:]
+
+    if ref.startswith("joinchat/"):
+        return ref.split("joinchat/", 1)[1].strip("/")
+
+    return None
+
 def normalize_public_chat_ref(chat_ref: str) -> str:
     """
-    Разрешаем только:
+    Теперь разрешаем:
     - @username
     - username
     - https://t.me/username
-    - http://t.me/username
-
-    Не разрешаем:
-    - invite links (+HASH / joinchat)
-    - приватные ссылки
-    - пустые значения
+    - numeric chat id
+    - invite links вида t.me/+HASH и t.me/joinchat/HASH
     """
     ref = (chat_ref or "").strip()
     if not ref:
         raise ServiceAccountError(
             code="CHAT_LINK_REQUIRED",
-            user_message="Укажите публичный username или ссылку на публичный чат/канал.",
+            user_message="Укажите username, ссылку на чат/канал или числовой chat id.",
             http_status=400,
         )
 
-    if "t.me/+" in ref or "joinchat/" in ref:
-        raise ServiceAccountError(
-            code="SERVICE_PUBLIC_ONLY",
-            user_message="Служебный режим работает только с публичными чатами и каналами.",
-            http_status=400,
-        )
+    invite_hash = extract_invite_hash(ref)
+    if invite_hash:
+        return f"+{invite_hash}"
 
     ref = ref.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
     ref = ref.strip("/")
@@ -109,21 +123,229 @@ def normalize_public_chat_ref(chat_ref: str) -> str:
     if not ref:
         raise ServiceAccountError(
             code="CHAT_LINK_REQUIRED",
-            user_message="Укажите публичный username или ссылку на публичный чат/канал.",
-            http_status=400,
-        )
-
-    # На MVP в service-режиме поддерживаем именно публичные username.
-    # numeric chat id пока не поддерживаем — он не даёт надёжно понять публичность.
-    if ref.isdigit():
-        raise ServiceAccountError(
-            code="SERVICE_USERNAME_ONLY",
-            user_message="В служебном режиме пока поддерживаются только публичные username и публичные t.me ссылки.",
+            user_message="Укажите username, ссылку на чат/канал или числовой chat id.",
             http_status=400,
         )
 
     return ref
 
+def map_telethon_exception_to_service_error(exc: Exception) -> ServiceAccountError:
+    name = exc.__class__.__name__
+
+    if name in {"UsernameInvalidError", "UsernameNotOccupiedError"}:
+        return ServiceAccountError(
+            code="PUBLIC_CHAT_NOT_FOUND",
+            user_message="Чат или канал не найден. Проверьте username, ссылку или chat id.",
+            http_status=404,
+        )
+
+    if name in {"InviteHashInvalidError", "InviteHashExpiredError"}:
+        return ServiceAccountError(
+            code="INVITE_LINK_INVALID_OR_EXPIRED",
+            user_message="Ссылка-приглашение недействительна или уже истекла.",
+            http_status=400,
+        )
+
+    if name in {"InviteRequestSentError"}:
+        return ServiceAccountError(
+            code="JOIN_REQUEST_SENT",
+            user_message="Заявка на вступление отправлена. Читать этот чат можно будет только после одобрения.",
+            http_status=403,
+        )
+
+    if name in {"ChannelPrivateError"}:
+        return ServiceAccountError(
+            code="CHAT_PRIVATE_OR_NO_ACCESS",
+            user_message="Чат приватный или у служебного аккаунта нет доступа к нему.",
+            http_status=403,
+        )
+
+    if name in {"ChatAdminRequiredError"}:
+        return ServiceAccountError(
+            code="CHAT_ADMIN_REQUIRED",
+            user_message="Для чтения этого чата или канала у служебного аккаунта недостаточно прав.",
+            http_status=403,
+        )
+
+    if name in {"ChannelsTooMuchError"}:
+        return ServiceAccountError(
+            code="SERVICE_ACCOUNT_CHANNEL_LIMIT",
+            user_message="Служебный аккаунт достиг лимита по вступлению в каналы. Попробуйте позже.",
+            http_status=503,
+        )
+
+    if name in {"UsersTooMuchError"}:
+        return ServiceAccountError(
+            code="CHAT_IS_FULL",
+            user_message="В этот чат сейчас нельзя вступить: достигнут лимит участников или есть ограничение Telegram.",
+            http_status=400,
+        )
+
+    if name in {"AuthKeyUnregisteredError", "SessionRevokedError"}:
+        return ServiceAccountError(
+            code="SERVICE_ACCOUNT_REAUTH_REQUIRED",
+            user_message="Служебный аккаунт требует повторной авторизации.",
+            http_status=503,
+        )
+
+    return ServiceAccountError(
+        code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+        user_message="Не удалось обработать запрос через служебный аккаунт. Попробуйте чуть позже.",
+        http_status=503,
+    )
+
+async def resolve_service_entity(client: TelegramClient, chat_ref: str):
+    ref = normalize_public_chat_ref(chat_ref)
+    invite_hash = extract_invite_hash(ref)
+
+    # 1) invite-link
+    if invite_hash:
+        try:
+            info = await client(CheckChatInviteRequest(invite_hash))
+            chat = getattr(info, "chat", None)
+            if chat is not None:
+                return chat
+        except Exception as e:
+            raise map_telethon_exception_to_service_error(e) from e
+
+        try:
+            updates = await client(ImportChatInviteRequest(invite_hash))
+            chats = getattr(updates, "chats", None) or []
+            if chats:
+                return chats[0]
+
+            info2 = await client(CheckChatInviteRequest(invite_hash))
+            chat2 = getattr(info2, "chat", None)
+            if chat2 is not None:
+                return chat2
+
+            raise ServiceAccountError(
+                code="INVITE_RESOLVE_FAILED",
+                user_message="Не удалось открыть чат по ссылке-приглашению.",
+                http_status=400,
+            )
+        except ServiceAccountError:
+            raise
+        except Exception as e:
+            name = e.__class__.__name__
+            if name == "UserAlreadyParticipantError":
+                info3 = await client(CheckChatInviteRequest(invite_hash))
+                chat3 = getattr(info3, "chat", None)
+                if chat3 is not None:
+                    return chat3
+
+            raise map_telethon_exception_to_service_error(e) from e
+
+    # 2) numeric chat id
+    if ref.isdigit():
+        target_id = int(ref)
+
+        try:
+            dialogs = await client.get_dialogs(limit=500)
+            for d in dialogs:
+                ent = d.entity
+                if getattr(ent, "id", None) == target_id:
+                    return ent
+        except Exception:
+            pass
+
+        try:
+            return await client.get_entity(target_id)
+        except Exception as e:
+            raise ServiceAccountError(
+                code="NUMERIC_CHAT_ID_NOT_RESOLVED",
+                user_message="Не удалось открыть чат по числовому id. Для неизвестного чата попробуйте username, публичную ссылку или invite-link.",
+                http_status=400,
+            ) from e
+
+    # 3) username / публичная ссылка
+    try:
+        return await client.get_entity(ref)
+    except Exception as e:
+        raise map_telethon_exception_to_service_error(e) from e
+
+async def ensure_join_and_access(client: TelegramClient, chat_ref: str, entity):
+    ref = normalize_public_chat_ref(chat_ref)
+    invite_hash = extract_invite_hash(ref)
+
+    # invite already imported / can be imported again safely
+    if invite_hash:
+        try:
+            updates = await client(ImportChatInviteRequest(invite_hash))
+            chats = getattr(updates, "chats", None) or []
+            if chats:
+                return chats[0]
+            return entity
+        except Exception as e:
+            name = e.__class__.__name__
+            if name == "UserAlreadyParticipantError":
+                return entity
+            raise map_telethon_exception_to_service_error(e) from e
+
+    # для channel/supergroup пробуем join, чтобы потом читать
+    if isinstance(entity, Channel):
+        try:
+            await client(JoinChannelRequest(entity))
+        except Exception as e:
+            name = e.__class__.__name__
+            if name == "UserAlreadyParticipantError":
+                return entity
+            raise map_telethon_exception_to_service_error(e) from e
+
+        # после join стараемся получить свежую entity
+        try:
+            return await resolve_service_entity(client, ref)
+        except Exception:
+            return entity
+
+    # обычный Chat / уже известный dialog
+    return entity
+
+async def read_messages_from_entity(client: TelegramClient, entity, days: int) -> list[dict]:
+    since_dt = utcnow() - timedelta(days=int(days))
+    collected: list[dict] = []
+
+    async for msg in client.iter_messages(entity, limit=SERVICE_ACCOUNT_MAX_FETCH_MESSAGES):
+        if not isinstance(msg, Message):
+            continue
+
+        if not msg.date:
+            continue
+
+        msg_dt = msg.date
+        if msg_dt.tzinfo is None:
+            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+
+        if msg_dt < since_dt:
+            break
+
+        text = (msg.message or "").strip()
+        if not text:
+            continue
+
+        sender_name = "Unknown"
+        try:
+            sender = await msg.get_sender()
+            if sender is not None:
+                if getattr(sender, "username", None):
+                    sender_name = "@" + sender.username
+                else:
+                    first = (getattr(sender, "first_name", "") or "").strip()
+                    last = (getattr(sender, "last_name", "") or "").strip()
+                    sender_name = (first + " " + last).strip() or "Unknown"
+        except Exception:
+            pass
+
+        collected.append(
+            {
+                "date": msg_dt.isoformat(),
+                "from": sender_name,
+                "text": text,
+            }
+        )
+
+    collected.reverse()
+    return collected
 
 async def log_event(
     db: AsyncSession,
@@ -429,57 +651,23 @@ async def fetch_public_chat_messages(
     client = await get_service_tg_client(db, service_account_id)
 
     if not await client.is_user_authorized():
-        raise errors.AuthKeyUnregisteredError(request=None)  # искусственно приводим к общему flow
+        raise errors.AuthKeyUnregisteredError(request=None)
 
-    username = normalize_public_chat_ref(chat_ref)
+    normalized_ref = normalize_public_chat_ref(chat_ref)
 
-    entity = await client.get_entity(username)
+    try:
+        entity = await resolve_service_entity(client, normalized_ref)
 
-    since_dt = utcnow() - timedelta(days=int(days))
-    collected: list[dict] = []
+        # новая логика: пробуем вступить / подписаться, если это нужно для чтения
+        entity = await ensure_join_and_access(client, normalized_ref, entity)
 
-    async for msg in client.iter_messages(entity, limit=SERVICE_ACCOUNT_MAX_FETCH_MESSAGES):
-        if not isinstance(msg, Message):
-            continue
+        messages = await read_messages_from_entity(client, entity, days)
+        return entity, messages
 
-        if not msg.date:
-            continue
-
-        msg_dt = msg.date
-        if msg_dt.tzinfo is None:
-            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-
-        if msg_dt < since_dt:
-            break
-
-        text = (msg.message or "").strip()
-        if not text:
-            continue
-
-        sender_name = "Unknown"
-        try:
-            sender = await msg.get_sender()
-            if sender is not None:
-                if getattr(sender, "username", None):
-                    sender_name = "@" + sender.username
-                else:
-                    first = (getattr(sender, "first_name", "") or "").strip()
-                    last = (getattr(sender, "last_name", "") or "").strip()
-                    sender_name = (first + " " + last).strip() or "Unknown"
-        except Exception:
-            pass
-
-        collected.append(
-            {
-                "date": msg_dt.isoformat(),
-                "from": sender_name,
-                "text": text,
-            }
-        )
-
-    collected.reverse()
-    return entity, collected
-
+    except ServiceAccountError:
+        raise
+    except Exception as e:
+        raise map_telethon_exception_to_service_error(e) from e
 
 # =========================
 # LLM summary
