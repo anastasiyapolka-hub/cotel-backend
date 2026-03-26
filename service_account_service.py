@@ -612,6 +612,27 @@ async def load_service_session_string(db: AsyncSession, service_account_id: int)
             http_status=500,
         ) from e
 
+async def touch_active_service_session(
+    db: AsyncSession,
+    service_account_id: int,
+) -> None:
+    stmt = (
+        select(ServiceTelegramSession)
+        .where(
+            ServiceTelegramSession.service_account_id == service_account_id,
+            ServiceTelegramSession.is_active.is_(True),
+            ServiceTelegramSession.revoked_at.is_(None),
+        )
+        .order_by(ServiceTelegramSession.id.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    session_row = result.scalar_one_or_none()
+
+    if session_row is not None:
+        session_row.last_used_at = utcnow()
+        session_row.updated_at = utcnow()
+        await db.flush()
 
 async def get_service_tg_client(db: AsyncSession, service_account_id: int) -> TelegramClient:
     client = _service_clients.get(service_account_id)
@@ -756,11 +777,15 @@ async def analyze_chat_via_service_account(
                 text_messages=messages,
             )
 
-            account.last_used_at = utcnow()
+            now = utcnow()
+
+            account.last_used_at = now
             account.last_error = None
             account.last_error_at = None
             account.consecutive_fail_count = 0
-            account.updated_at = utcnow()
+            account.updated_at = now
+
+            await touch_active_service_session(db, account.id)
 
             await log_event(
                 db,
