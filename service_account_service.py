@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import sqlalchemy as sa
-from openai import OpenAI
+from openai import AsyncOpenAI
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import TelegramClient, errors
@@ -36,7 +36,7 @@ SERVICE_ACCOUNT_MAX_ATTEMPTS = 2
 
 SERVICE_ACCOUNT_ALLOWED_STATUS = "active"
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 api_id = int(os.environ["TELEGRAM_API_ID"])
 api_hash = os.environ["TELEGRAM_API_HASH"]
@@ -727,7 +727,7 @@ async def summarize_chat(
         "Сделай ответ именно по запросу выше. Структурируй ответ в 3–6 абзацев или списком."
     )
 
-    completion = openai_client.chat.completions.create(
+    completion = await openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},
