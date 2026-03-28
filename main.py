@@ -4,7 +4,7 @@ from fastapi import Request, Depends
 from auth import router as auth_router
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 import os
 import httpx
 import json
@@ -66,7 +66,7 @@ app.include_router(auth_router)
 app.include_router(service_account_router)
 app.include_router(service_account_admin_router)
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 
@@ -158,7 +158,7 @@ async def call_openai_summary(user_query: str, chat_name: str, text_messages):
         "Сделай ответ именно по запросу выше. Структурируй ответ в 3–6 абзацев или списком."
     )
 
-    completion = openai_client.chat.completions.create(
+    completion = await openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -247,7 +247,7 @@ async def call_openai_subscription_match(prompt: str, chat_title: str, messages:
         "}\n"
     )
 
-    completion = openai_client.chat.completions.create(
+    completion = await openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -314,7 +314,7 @@ async def call_openai_subscription_digest(prompt: str, chat_title: str, messages
         "}\n"
     )
 
-    completion = openai_client.chat.completions.create(
+    completion = await openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},
