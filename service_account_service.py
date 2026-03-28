@@ -74,6 +74,11 @@ _service_clients: dict[int, TelegramClient] = {}
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+async def safe_rollback(db: AsyncSession) -> None:
+    try:
+        await db.rollback()
+    except Exception:
+        pass
 
 INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)")
 
@@ -742,7 +747,6 @@ async def summarize_chat(
 # =========================
 # Основной orchestration-flow
 # =========================
-
 async def analyze_chat_via_service_account(
     db: AsyncSession,
     *,
@@ -756,6 +760,9 @@ async def analyze_chat_via_service_account(
     for _attempt in range(SERVICE_ACCOUNT_MAX_ATTEMPTS):
         allocated = await allocate_service_account(db, target_ref=normalized_ref)
         account = allocated.account
+
+        # ВАЖНО: сразу фиксируем reserve, чтобы не держать длинную транзакцию
+        await db.commit()
 
         try:
             entity, messages = await fetch_public_chat_messages(
@@ -793,7 +800,7 @@ async def analyze_chat_via_service_account(
                 event_type="operation_finished",
                 target_ref=normalized_ref,
                 is_success=True,
-                event_at=utcnow(),
+                event_at=now,
             )
 
             await release_service_account(
@@ -814,7 +821,12 @@ async def analyze_chat_via_service_account(
             }
 
         except ServiceAccountError as e:
-            # это уже user-facing ошибка валидации / конфигурации
+            await safe_rollback(db)
+
+            account.last_error = e.code
+            account.last_error_at = utcnow()
+            account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
             await release_service_account(
                 db,
                 account=account,
@@ -823,10 +835,6 @@ async def analyze_chat_via_service_account(
                 error_code=e.code,
                 error_message=e.user_message,
             )
-
-            account.last_error = e.code
-            account.last_error_at = utcnow()
-            account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
 
             await log_event(
                 db,
@@ -843,6 +851,8 @@ async def analyze_chat_via_service_account(
             raise
 
         except errors.FloodWaitError as e:
+            await safe_rollback(db)
+
             account.last_error = "FLOOD_WAIT"
             account.last_error_at = utcnow()
             account.cooldown_until = utcnow() + timedelta(seconds=int(e.seconds))
@@ -899,6 +909,8 @@ async def analyze_chat_via_service_account(
             errors.AuthKeyUnregisteredError,
             errors.SessionRevokedError,
         ) as e:
+            await safe_rollback(db)
+
             account.last_error = type(e).__name__
             account.last_error_at = utcnow()
             account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
@@ -944,6 +956,8 @@ async def analyze_chat_via_service_account(
             errors.UsernameInvalidError,
             errors.UsernameNotOccupiedError,
         ):
+            await safe_rollback(db)
+
             await release_service_account(
                 db,
                 account=account,
@@ -976,6 +990,8 @@ async def analyze_chat_via_service_account(
             errors.ChannelPrivateError,
             errors.ChatAdminRequiredError,
         ):
+            await safe_rollback(db)
+
             await release_service_account(
                 db,
                 account=account,
@@ -1005,12 +1021,13 @@ async def analyze_chat_via_service_account(
             )
 
         except Exception as e:
+            await safe_rollback(db)
+
             account.last_error = type(e).__name__
             account.last_error_at = utcnow()
             account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
-
-            # мягкий cooldown на неожиданные ошибки
             account.cooldown_until = utcnow() + timedelta(minutes=10)
+
             await set_account_status(
                 db,
                 account=account,
