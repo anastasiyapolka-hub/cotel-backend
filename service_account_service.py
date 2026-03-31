@@ -818,6 +818,9 @@ async def analyze_chat_via_service_account(
                 "chat_name": chat_name,
                 "messages_count": len(messages),
                 "source_mode": "service",
+                "chat_ref_normalized": normalized_ref,
+                "chat_id": getattr(entity, "id", None),
+                "chat_username": getattr(entity, "username", None),
             }
 
         except ServiceAccountError as e:

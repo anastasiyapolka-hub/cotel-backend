@@ -21,11 +21,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
 
-from db.models import Subscription, SubscriptionState, DigestEvent, MatchEvent, BotUserLink
+from db.models import (
+    User,
+    Subscription,
+    SubscriptionState,
+    DigestEvent,
+    MatchEvent,
+    BotUserLink,
+    UserChatHistory,
+    BotLinkCode,
+)
+
 from db.session import get_db
 from auth import get_current_user as auth_get_current_user
-from db.models import User
-from db.models import BotLinkCode
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 from service_account_routes import router as service_account_router
 from service_account_admin_routes import router as service_account_admin_router
@@ -82,6 +90,81 @@ def sha256_hex(s: str) -> str:
 def make_link_code() -> str:
     # короткий, но достаточно случайный
     return secrets.token_urlsafe(12)
+
+def normalize_chat_ref_for_history(chat_ref: str) -> str:
+    ref = (chat_ref or "").strip()
+    if not ref:
+        return ""
+
+    ref = ref.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+    ref = ref.strip("/")
+
+    if ref.startswith("@"):
+        ref = ref[1:].strip()
+
+    return ref.lower()
+
+
+async def upsert_user_chat_history(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    source_mode: str,
+    chat_ref: str,
+    chat_title: str | None = None,
+    chat_username: str | None = None,
+    chat_id: int | None = None,
+) -> None:
+    normalized_ref = normalize_chat_ref_for_history(chat_ref)
+    if not normalized_ref:
+        return
+
+    display_ref = (chat_ref or "").strip()
+
+    stmt = (
+        insert(UserChatHistory)
+        .values(
+            owner_user_id=owner_user_id,
+            source_mode=source_mode,
+            chat_ref=display_ref,
+            chat_ref_normalized=normalized_ref,
+            chat_title=(chat_title or "").strip() or None,
+            chat_username=(chat_username or "").strip() or None,
+            chat_id=chat_id,
+            last_accessed_at=sa.func.now(),
+        )
+        .on_conflict_do_update(
+            constraint="uq_user_chat_history_owner_source_ref",
+            set_={
+                "chat_ref": display_ref,
+                "chat_title": (chat_title or "").strip() or None,
+                "chat_username": (chat_username or "").strip() or None,
+                "chat_id": chat_id,
+                "last_accessed_at": sa.func.now(),
+                "updated_at": sa.func.now(),
+            },
+        )
+    )
+
+    await db.execute(stmt)
+    await db.commit()
+
+
+def serialize_chat_history_row(row: UserChatHistory) -> dict:
+    return {
+        "id": row.id,
+        "owner_user_id": row.owner_user_id,
+        "source_mode": row.source_mode,
+        "chat_ref": row.chat_ref,
+        "chat_ref_normalized": row.chat_ref_normalized,
+        "chat_title": row.chat_title,
+        "chat_username": row.chat_username,
+        "chat_id": row.chat_id,
+        "last_accessed_at": row.last_accessed_at.isoformat() if row.last_accessed_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
 
 def extract_text_messages(messages, limit: int = 100000):
     """
@@ -914,11 +997,22 @@ async def tg_analyze_chat(
         text_messages=messages,
     )
 
+    await upsert_user_chat_history(
+        db,
+        owner_user_id=owner_user_id,
+        source_mode="personal",
+        chat_ref=chat_link,
+        chat_title=chat_name,
+        chat_username=getattr(entity, "username", None),
+        chat_id=getattr(entity, "id", None),
+    )
+
     return {
         "status": "ok",
         "summary": summary,
         "chat_name": chat_name,
         "messages_count": len(messages),
+        "source_mode": "personal",
     }
 
 @app.get("/tg/chats")
@@ -1109,6 +1203,80 @@ async def tg_bot_link_status(
     )
     count = (await db.execute(q)).scalar_one()
     return {"connected": count > 0}
+
+@app.get("/chat-history")
+async def list_chat_history(
+    source_mode: str = "personal",
+    limit: int = 30,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    limit = max(1, min(int(limit or 30), 30))
+    source_mode = (source_mode or "personal").strip().lower()
+
+    if source_mode not in {"personal", "service"}:
+        raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
+
+    # personal-mode: показываем personal + service, но без дублей по normalized ref
+    if source_mode == "personal":
+        res = await db.execute(
+            select(UserChatHistory)
+            .where(
+                UserChatHistory.owner_user_id == user.id,
+                UserChatHistory.source_mode.in_(["personal", "service"]),
+            )
+            .order_by(UserChatHistory.last_accessed_at.desc(), UserChatHistory.id.desc())
+        )
+        rows = list(res.scalars().all())
+
+        dedup: list[UserChatHistory] = []
+        seen: set[str] = set()
+
+        for row in rows:
+            key = row.chat_ref_normalized or ""
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            dedup.append(row)
+            if len(dedup) >= limit:
+                break
+
+        items = [serialize_chat_history_row(row) for row in dedup]
+        return {"items": items, "count": len(items)}
+
+    # service-mode: только service history
+    res = await db.execute(
+        select(UserChatHistory)
+        .where(
+            UserChatHistory.owner_user_id == user.id,
+            UserChatHistory.source_mode == "service",
+        )
+        .order_by(UserChatHistory.last_accessed_at.desc(), UserChatHistory.id.desc())
+        .limit(limit)
+    )
+    rows = list(res.scalars().all())
+    items = [serialize_chat_history_row(row) for row in rows]
+    return {"items": items, "count": len(items)}
+
+
+@app.delete("/chat-history/{history_id}")
+async def delete_chat_history_item(
+    history_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(UserChatHistory, history_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="CHAT_HISTORY_NOT_FOUND")
+
+    if row.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    await db.delete(row)
+    await db.commit()
+
+    return {"status": "ok", "deleted_id": history_id}
+
 @app.post("/subscriptions", response_model=SubscriptionOut)
 async def create_subscription(
     payload: SubscriptionCreate,

@@ -1,13 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+import sqlalchemy as sa
 
 from auth import get_current_user as auth_get_current_user
-from db.models import User
+from db.models import User, UserChatHistory
 from db.session import get_db
 from service_account_service import (
     ServiceAccountError,
     analyze_chat_via_service_account,
+    normalize_public_chat_ref,
 )
 
 router = APIRouter()
@@ -36,6 +39,40 @@ async def tg_service_analyze_chat(
             user_query=payload.user_query.strip(),
             days=payload.days,
         )
+
+        normalized_ref = result.get("chat_ref_normalized") or normalize_public_chat_ref(payload.chat_link)
+        chat_title = (result.get("chat_name") or "").strip() or None
+        chat_username = (result.get("chat_username") or "").strip() or None
+        chat_id = result.get("chat_id")
+
+        stmt = (
+            insert(UserChatHistory)
+            .values(
+                owner_user_id=user.id,
+                source_mode="service",
+                chat_ref=(payload.chat_link or "").strip(),
+                chat_ref_normalized=normalized_ref,
+                chat_title=chat_title,
+                chat_username=chat_username,
+                chat_id=chat_id,
+                last_accessed_at=sa.func.now(),
+            )
+            .on_conflict_do_update(
+                constraint="uq_user_chat_history_owner_source_ref",
+                set_={
+                    "chat_ref": (payload.chat_link or "").strip(),
+                    "chat_title": chat_title,
+                    "chat_username": chat_username,
+                    "chat_id": chat_id,
+                    "last_accessed_at": sa.func.now(),
+                    "updated_at": sa.func.now(),
+                },
+            )
+        )
+
+        await db.execute(stmt)
+        await db.commit()
+
         return result
 
     except ServiceAccountError as e:
