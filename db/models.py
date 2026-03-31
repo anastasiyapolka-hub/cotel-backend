@@ -255,6 +255,51 @@ class TelegramSession(Base):
         {},
     )
 
+class UserChatHistory(Base):
+    __tablename__ = "user_chat_history"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    owner_user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    source_mode = Column(String(20), nullable=False, index=True)  # personal / service
+
+    chat_ref = Column(Text, nullable=False)  # как пользователь вводил / что подставляем обратно в поле
+    chat_ref_normalized = Column(Text, nullable=False)
+
+    chat_title = Column(String(255), nullable=True)
+    chat_username = Column(String(128), nullable=True, index=True)
+    chat_id = Column(BigInteger, nullable=True)
+
+    last_accessed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "source_mode",
+            "chat_ref_normalized",
+            name="uq_user_chat_history_owner_source_ref",
+        ),
+        sa.Index(
+            "ix_user_chat_history_owner_source_last",
+            "owner_user_id",
+            "source_mode",
+            "last_accessed_at",
+        ),
+    )
 
 class ServicePhoneNumber(Base):
     __tablename__ = "service_phone_numbers"
