@@ -56,6 +56,12 @@ from telegram_service import (
     save_user_telegram_session,
 )
 
+from service_account_service import (
+    ServiceAccountError,
+    validate_service_subscription_target,
+    fetch_service_chat_messages_for_subscription,
+)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -165,6 +171,72 @@ def serialize_chat_history_row(row: UserChatHistory) -> dict:
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
+async def prepare_subscription_target(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    source_mode: str,
+    chat_ref: str,
+) -> tuple[str, int | None, str | None, str | None]:
+    """
+    Возвращает:
+      normalized_chat_ref_for_save,
+      chat_id,
+      chat_title,
+      chat_username
+    """
+    source_mode = (source_mode or "personal").strip().lower()
+    chat_ref = (chat_ref or "").strip()
+
+    if source_mode not in {"personal", "service"}:
+        raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
+
+    if not chat_ref:
+        raise HTTPException(status_code=400, detail="CHAT_REF_REQUIRED")
+
+    if source_mode == "personal":
+        try:
+            entity, _ = await fetch_chat_messages_for_subscription(
+                db=db,
+                owner_user_id=owner_user_id,
+                chat_link=chat_ref,
+                since_dt=datetime.now(timezone.utc) - timedelta(days=1),
+                min_id=None,
+                limit=1,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"CHAT_VALIDATE_FAILED: {str(e)}")
+
+        chat_title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Без названия"
+        )
+        chat_username = getattr(entity, "username", None)
+        chat_id = getattr(entity, "id", None)
+
+        return chat_ref, int(chat_id) if chat_id is not None else None, chat_title, chat_username
+
+    # service
+    try:
+        meta = await validate_service_subscription_target(db, chat_link=chat_ref)
+    except ServiceAccountError as e:
+        raise HTTPException(
+            status_code=e.http_status,
+            detail={
+                "code": e.code,
+                "message": e.user_message,
+            },
+        )
+
+    normalized_ref = (meta.get("chat_ref_normalized") or chat_ref).strip()
+    chat_id = meta.get("chat_id")
+    chat_title = meta.get("chat_name")
+    chat_username = meta.get("chat_username")
+
+    return normalized_ref, int(chat_id) if chat_id is not None else None, chat_title, chat_username
 
 def extract_text_messages(messages, limit: int = 100000):
     """
@@ -556,14 +628,25 @@ async def run_subscriptions(
             sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
             sub_report["subscription_type"] = sub_type
 
-            entity, msgs = await fetch_chat_messages_for_subscription(
-                db,
-                owner_user_id,
-                chat_link=sub.chat_ref,
-                since_dt=since_dt,
-                min_id=min_id,
-                limit=1000,
-            )
+            source_mode = (getattr(sub, "source_mode", None) or "personal").lower()
+
+            if source_mode == "service":
+                entity, msgs = await fetch_service_chat_messages_for_subscription(
+                    db=db,
+                    chat_link=sub.chat_ref,
+                    since_dt=since_dt,
+                    min_id=min_id,
+                    limit=1000,
+                )
+            else:
+                entity, msgs = await fetch_chat_messages_for_subscription(
+                    db,
+                    owner_user_id,
+                    chat_link=sub.chat_ref,
+                    since_dt=since_dt,
+                    min_id=min_id,
+                    limit=1000,
+                )
 
             # map для восстановления автора/времени по message_id
             msg_by_id = {}
@@ -1324,15 +1407,22 @@ async def create_subscription(
 
 @app.get("/subscriptions", response_model=list[SubscriptionOut])
 async def list_subscriptions(
+    source_mode: str | None = None,
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(
-        select(Subscription)
-        .where(Subscription.owner_user_id == user.id)
-        .order_by(Subscription.id.desc())
-    )
-    return res.scalars().all()
+    stmt = select(Subscription).where(Subscription.owner_user_id == user.id)
+
+    if source_mode:
+      normalized_mode = source_mode.strip().lower()
+      if normalized_mode not in {"personal", "service"}:
+          raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
+      stmt = stmt.where(Subscription.source_mode == normalized_mode)
+
+    stmt = stmt.order_by(Subscription.id.desc())
+
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
 
 @app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
 async def get_subscription(
@@ -1362,10 +1452,21 @@ async def update_subscription(
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
 
+    old_chat_ref = (sub.chat_ref or "").strip()
+    old_source_mode = (sub.source_mode or "").strip().lower()
+
+    normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
+        db,
+        owner_user_id=user.id,
+        source_mode=payload.source_mode,
+        chat_ref=payload.chat_ref,
+    )
+
     sub.name = payload.name
     sub.source_mode = payload.source_mode
-    sub.subscription_type = payload.subscription_type
-    sub.chat_ref = payload.chat_ref
+    sub.subscription_type = payload.subscription_type or "events"
+    sub.chat_ref = normalized_chat_ref
+    sub.chat_id = chat_id
     sub.frequency_minutes = payload.frequency_minutes
     sub.prompt = payload.prompt
     sub.is_active = payload.is_active
@@ -1373,28 +1474,79 @@ async def update_subscription(
     sub.last_error = None
     sub.updated_at = sa.func.now()
 
+    # если чат или режим изменились — сбрасываем state
+    state_res = await db.execute(
+        select(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id)
+    )
+    st = state_res.scalar_one_or_none()
+    if st and (old_chat_ref != normalized_chat_ref or old_source_mode != payload.source_mode):
+        st.last_message_id = None
+        st.last_checked_at = None
+        st.last_success_at = None
+        st.next_run_at = None
+
+    await upsert_user_chat_history(
+        db,
+        owner_user_id=user.id,
+        source_mode=payload.source_mode,
+        chat_ref=normalized_chat_ref,
+        chat_title=chat_title,
+        chat_username=chat_username,
+        chat_id=chat_id,
+    )
+
     await db.commit()
     await db.refresh(sub)
     return sub
 
-@app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
-async def toggle_subscription(
-    subscription_id: int,
-    payload: ToggleRequest,
+
+@app.post("/subscriptions", response_model=SubscriptionOut)
+async def create_subscription(
+    payload: SubscriptionCreate,
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
-    sub = res.scalar_one_or_none()
-    if not sub:
-        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
-    if sub.owner_user_id != user.id:
-        raise HTTPException(status_code=403, detail="FORBIDDEN")
+    normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
+        db,
+        owner_user_id=user.id,
+        source_mode=payload.source_mode,
+        chat_ref=payload.chat_ref,
+    )
 
-    sub.is_active = payload.is_active
-    sub.status = "active" if payload.is_active else "paused"
-    sub.last_error = None
-    sub.updated_at = sa.func.now()
+    sub = Subscription(
+        owner_user_id=user.id,
+        name=payload.name,
+        source_mode=payload.source_mode,
+        subscription_type=payload.subscription_type or "events",
+        chat_ref=normalized_chat_ref,
+        chat_id=chat_id,
+        frequency_minutes=payload.frequency_minutes,
+        prompt=payload.prompt,
+        is_active=payload.is_active,
+        status="active" if payload.is_active else "paused",
+        last_error=None,
+    )
+    db.add(sub)
+    await db.flush()
+
+    st = SubscriptionState(
+        subscription_id=sub.id,
+        last_message_id=None,
+        last_checked_at=None,
+        last_success_at=None,
+        next_run_at=None,
+    )
+    db.add(st)
+
+    await upsert_user_chat_history(
+        db,
+        owner_user_id=user.id,
+        source_mode=payload.source_mode,
+        chat_ref=normalized_chat_ref,
+        chat_title=chat_title,
+        chat_username=chat_username,
+        chat_id=chat_id,
+    )
 
     await db.commit()
     await db.refresh(sub)

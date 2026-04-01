@@ -17,6 +17,7 @@ from main import (
 )
 
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
+from service_account_service import fetch_service_chat_messages_for_subscription
 
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
@@ -119,14 +120,25 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         since_dt = now_utc - timedelta(minutes=freq_min)
         min_id = None
 
-        entity, msgs = await fetch_chat_messages_for_subscription(
-            db=db,
-            owner_user_id=owner_user_id,
-            chat_link=sub.chat_ref,
-            since_dt=since_dt,
-            min_id=min_id,
-            limit=EVENTS_READ_LIMIT,  # 1000
-        )
+        source_mode = (getattr(sub, "source_mode", None) or "personal").lower()
+
+        if source_mode == "service":
+            entity, msgs = await fetch_service_chat_messages_for_subscription(
+                db=db,
+                chat_link=sub.chat_ref,
+                since_dt=since_dt,
+                min_id=min_id,
+                limit=EVENTS_READ_LIMIT,
+            )
+        else:
+            entity, msgs = await fetch_chat_messages_for_subscription(
+                db=db,
+                owner_user_id=owner_user_id,
+                chat_link=sub.chat_ref,
+                since_dt=since_dt,
+                min_id=min_id,
+                limit=EVENTS_READ_LIMIT,
+            )
 
         # chat_id — просто обновим объект (без begin)
         if getattr(sub, "chat_id", None) is None:
@@ -209,14 +221,25 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         since_dt = now_utc - timedelta(minutes=freq_min)
         min_id = None
 
-    entity, msgs = await fetch_chat_messages_for_subscription(
-        db=db,
-        owner_user_id=owner_user_id,
-        chat_link=sub.chat_ref,
-        since_dt=since_dt,
-        min_id=min_id,
-        limit=EVENTS_READ_LIMIT,
-    )
+    source_mode = (getattr(sub, "source_mode", None) or "personal").lower()
+
+    if source_mode == "service":
+        entity, msgs = await fetch_service_chat_messages_for_subscription(
+            db=db,
+            chat_link=sub.chat_ref,
+            since_dt=since_dt,
+            min_id=min_id,
+            limit=EVENTS_READ_LIMIT,
+        )
+    else:
+        entity, msgs = await fetch_chat_messages_for_subscription(
+            db=db,
+            owner_user_id=owner_user_id,
+            chat_link=sub.chat_ref,
+            since_dt=since_dt,
+            min_id=min_id,
+            limit=EVENTS_READ_LIMIT,
+        )
 
     if getattr(sub, "chat_id", None) is None:
         ent_id = getattr(entity, "id", None)

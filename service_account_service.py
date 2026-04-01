@@ -744,6 +744,403 @@ async def summarize_chat(
     return completion.choices[0].message.content.strip()
 
 
+async def validate_service_subscription_target(
+    db: AsyncSession,
+    *,
+    chat_link: str,
+) -> dict:
+    """
+    Лёгкая проверка чата для service-subscription.
+    Ничего не анализирует через LLM, только:
+    - нормализует ссылку
+    - через service account проверяет доступ
+    - возвращает метаданные чата
+    """
+    normalized_ref = normalize_public_chat_ref(chat_link)
+    allocated = await allocate_service_account(db, target_ref=normalized_ref)
+    account = allocated.account
+
+    # фиксируем reserve сразу
+    await db.commit()
+
+    try:
+        client = await get_service_client(db, service_account_id=account.id)
+        entity = await resolve_service_entity(client, normalized_ref)
+        entity = await ensure_join_and_access(client, normalized_ref, entity)
+
+        now = utcnow()
+        account.last_used_at = now
+        account.last_error = None
+        account.last_error_at = None
+        account.consecutive_fail_count = 0
+        account.updated_at = now
+
+        await touch_active_service_session(db, account.id)
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_finished",
+            target_ref=normalized_ref,
+            is_success=True,
+            event_at=now,
+        )
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=True,
+        )
+        await db.commit()
+
+        chat_title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Без названия"
+        )
+
+        return {
+            "status": "ok",
+            "source_mode": "service",
+            "chat_ref_normalized": normalized_ref,
+            "chat_id": getattr(entity, "id", None),
+            "chat_username": getattr(entity, "username", None),
+            "chat_name": chat_title,
+        }
+
+    except ServiceAccountError as e:
+        await safe_rollback(db)
+
+        account.last_error = e.code
+        account.last_error_at = utcnow()
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code=e.code,
+            error_message=e.user_message,
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_failed",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code=e.code,
+            error_message=e.user_message,
+            event_at=utcnow(),
+        )
+        await db.commit()
+        raise
+
+    except errors.FloodWaitError as e:
+        await safe_rollback(db)
+
+        account.last_error = "FLOOD_WAIT"
+        account.last_error_at = utcnow()
+        account.cooldown_until = utcnow() + timedelta(seconds=int(e.seconds))
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await set_account_status(
+            db,
+            account=account,
+            new_status="cooldown",
+            reason=f"FLOOD_WAIT_{int(e.seconds)}",
+        )
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code="FLOOD_WAIT",
+            error_message=f"Flood wait {int(e.seconds)} sec",
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="telegram_error",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code="FLOOD_WAIT",
+            error_message=f"Flood wait {int(e.seconds)} sec",
+            event_at=utcnow(),
+        )
+
+        await db.commit()
+
+        raise ServiceAccountError(
+            code="FLOOD_WAIT",
+            user_message="Служебный аккаунт временно ограничен Telegram. Попробуйте позже.",
+            http_status=503,
+        )
+
+    except Exception as e:
+        await safe_rollback(db)
+
+        account.last_error = "SERVICE_ACCOUNT_INTERNAL_ERROR"
+        account.last_error_at = utcnow()
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            error_message=str(e),
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_failed",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            error_message=str(e),
+            event_at=utcnow(),
+        )
+
+        await db.commit()
+
+        raise ServiceAccountError(
+            code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            user_message="Не удалось проверить чат через служебный аккаунт.",
+            http_status=503,
+        )
+
+
+async def fetch_service_chat_messages_for_subscription(
+    db: AsyncSession,
+    *,
+    chat_link: str,
+    since_dt: datetime,
+    min_id: int | None = None,
+    limit: int = 1000,
+) -> tuple[object, list[dict]]:
+    """
+    Service-mode аналог fetch_chat_messages_for_subscription(...).
+    Возвращает entity + сообщения в формате:
+    {
+      message_id,
+      message_ts,
+      author_id,
+      author_display,
+      text,
+      reply_to
+    }
+    """
+    normalized_ref = normalize_public_chat_ref(chat_link)
+    allocated = await allocate_service_account(db, target_ref=normalized_ref)
+    account = allocated.account
+
+    # фиксируем reserve сразу
+    await db.commit()
+
+    try:
+        client = await get_service_client(db, service_account_id=account.id)
+        entity = await resolve_service_entity(client, normalized_ref)
+        entity = await ensure_join_and_access(client, normalized_ref, entity)
+
+        rows: list[dict] = []
+        async for msg in client.iter_messages(entity, limit=limit):
+            if not isinstance(msg, Message):
+                continue
+
+            if msg.id is None:
+                continue
+
+            if min_id is not None and int(msg.id) <= int(min_id):
+                continue
+
+            msg_dt = msg.date
+            if msg_dt is None:
+                continue
+            if msg_dt.tzinfo is None:
+                msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+
+            if msg_dt < since_dt:
+                break
+
+            text = (msg.message or "").strip()
+            if not text:
+                continue
+
+            author_id = None
+            author_display = "Unknown"
+            try:
+                sender = await msg.get_sender()
+                if sender is not None:
+                    author_id = getattr(sender, "id", None)
+                    if getattr(sender, "username", None):
+                        author_display = "@" + sender.username
+                    else:
+                        first = (getattr(sender, "first_name", "") or "").strip()
+                        last = (getattr(sender, "last_name", "") or "").strip()
+                        author_display = (first + " " + last).strip() or "Unknown"
+            except Exception:
+                pass
+
+            reply_to = getattr(msg, "reply_to_msg_id", None)
+            if reply_to is None:
+                reply_obj = getattr(msg, "reply_to", None)
+                reply_to = getattr(reply_obj, "reply_to_msg_id", None) if reply_obj else None
+
+            rows.append(
+                {
+                    "message_id": int(msg.id),
+                    "message_ts": msg_dt.isoformat(),
+                    "author_id": author_id,
+                    "author_display": author_display,
+                    "text": text,
+                    "reply_to": int(reply_to) if reply_to is not None else None,
+                }
+            )
+
+        rows.reverse()
+
+        now = utcnow()
+        account.last_used_at = now
+        account.last_error = None
+        account.last_error_at = None
+        account.consecutive_fail_count = 0
+        account.updated_at = now
+
+        await touch_active_service_session(db, account.id)
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_finished",
+            target_ref=normalized_ref,
+            is_success=True,
+            event_at=now,
+        )
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=True,
+        )
+        await db.commit()
+
+        return entity, rows
+
+    except ServiceAccountError as e:
+        await safe_rollback(db)
+
+        account.last_error = e.code
+        account.last_error_at = utcnow()
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code=e.code,
+            error_message=e.user_message,
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_failed",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code=e.code,
+            error_message=e.user_message,
+            event_at=utcnow(),
+        )
+        await db.commit()
+        raise
+
+    except errors.FloodWaitError as e:
+        await safe_rollback(db)
+
+        account.last_error = "FLOOD_WAIT"
+        account.last_error_at = utcnow()
+        account.cooldown_until = utcnow() + timedelta(seconds=int(e.seconds))
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await set_account_status(
+            db,
+            account=account,
+            new_status="cooldown",
+            reason=f"FLOOD_WAIT_{int(e.seconds)}",
+        )
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code="FLOOD_WAIT",
+            error_message=f"Flood wait {int(e.seconds)} sec",
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="telegram_error",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code="FLOOD_WAIT",
+            error_message=f"Flood wait {int(e.seconds)} sec",
+            event_at=utcnow(),
+        )
+
+        await db.commit()
+
+        raise ServiceAccountError(
+            code="FLOOD_WAIT",
+            user_message="Служебный аккаунт временно ограничен Telegram. Попробуйте позже.",
+            http_status=503,
+        )
+
+    except Exception as e:
+        await safe_rollback(db)
+
+        account.last_error = "SERVICE_ACCOUNT_INTERNAL_ERROR"
+        account.last_error_at = utcnow()
+        account.consecutive_fail_count = (account.consecutive_fail_count or 0) + 1
+
+        await release_service_account(
+            db,
+            account=account,
+            busy_log_id=allocated.busy_log_id,
+            success=False,
+            error_code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            error_message=str(e),
+        )
+
+        await log_event(
+            db,
+            service_account_id=account.id,
+            event_type="operation_failed",
+            target_ref=normalized_ref,
+            is_success=False,
+            error_code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            error_message=str(e),
+            event_at=utcnow(),
+        )
+
+        await db.commit()
+
+        raise ServiceAccountError(
+            code="SERVICE_ACCOUNT_INTERNAL_ERROR",
+            user_message="Не удалось прочитать сообщения через служебный аккаунт.",
+            http_status=503,
+        )
+
 # =========================
 # Основной orchestration-flow
 # =========================
