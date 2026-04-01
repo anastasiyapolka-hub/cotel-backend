@@ -35,6 +35,8 @@ from db.models import (
 from db.session import get_db
 from auth import get_current_user as auth_get_current_user
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
+from pydantic import BaseModel
+from typing import Literal
 from service_account_routes import router as service_account_router
 from service_account_admin_routes import router as service_account_admin_router
 
@@ -171,6 +173,9 @@ def serialize_chat_history_row(row: UserChatHistory) -> dict:
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
+class SubscriptionSwitchModeRequest(BaseModel):
+    target_source_mode: Literal["personal", "service"]
+
 async def prepare_subscription_target(
     db: AsyncSession,
     *,
@@ -237,6 +242,25 @@ async def prepare_subscription_target(
     chat_username = meta.get("chat_username")
 
     return normalized_ref, int(chat_id) if chat_id is not None else None, chat_title, chat_username
+
+async def reset_subscription_state(
+    db: AsyncSession,
+    *,
+    subscription_id: int,
+) -> None:
+    res = await db.execute(
+        select(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id)
+    )
+    st = res.scalar_one_or_none()
+
+    if st is None:
+        st = SubscriptionState(subscription_id=subscription_id)
+        db.add(st)
+
+    st.last_message_id = None
+    st.last_checked_at = None
+    st.last_success_at = None
+    st.next_run_at = None
 
 def extract_text_messages(messages, limit: int = 100000):
     """
@@ -1572,6 +1596,64 @@ async def delete_subscription(
 
     await db.commit()
     return {"status": "ok", "deleted_subscription_id": subscription_id}
+
+@app.post("/subscriptions/{subscription_id}/switch-mode", response_model=SubscriptionOut)
+async def switch_subscription_mode(
+    subscription_id: int,
+    payload: SubscriptionSwitchModeRequest,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )
+    sub = res.scalar_one_or_none()
+
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    target_mode = (payload.target_source_mode or "").strip().lower()
+    current_mode = (sub.source_mode or "personal").strip().lower()
+
+    if target_mode not in {"personal", "service"}:
+        raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
+
+    if current_mode == target_mode:
+        return sub
+
+    normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
+        db,
+        owner_user_id=user.id,
+        source_mode=target_mode,
+        chat_ref=sub.chat_ref,
+    )
+
+    sub.source_mode = target_mode
+    sub.chat_ref = normalized_chat_ref
+    sub.chat_id = chat_id
+    sub.last_error = None
+    sub.status = "active" if sub.is_active else "paused"
+    sub.updated_at = sa.func.now()
+
+    await reset_subscription_state(db, subscription_id=sub.id)
+
+    await upsert_user_chat_history(
+        db,
+        owner_user_id=user.id,
+        source_mode=target_mode,
+        chat_ref=normalized_chat_ref,
+        chat_title=chat_title,
+        chat_username=chat_username,
+        chat_id=chat_id,
+    )
+
+    await db.commit()
+    await db.refresh(sub)
+    return sub
+
 
 @app.post("/tg/bot/dispatch")
 async def tg_bot_dispatch(
