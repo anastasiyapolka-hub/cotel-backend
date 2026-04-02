@@ -36,6 +36,27 @@ SERVICE_ACCOUNT_MAX_ATTEMPTS = 2
 
 SERVICE_ACCOUNT_ALLOWED_STATUS = "active"
 
+SERVICE_USAGE_ROLE_ANALYSIS = "analysis"
+SERVICE_USAGE_ROLE_SUBSCRIPTIONS = "subscriptions"
+SERVICE_USAGE_ROLE_SHARED = "shared"
+
+
+def get_usage_role_chain(operation_kind: str) -> list[str]:
+    kind = (operation_kind or "analysis").strip().lower()
+
+    if kind == "subscription":
+        return [
+            SERVICE_USAGE_ROLE_SUBSCRIPTIONS,
+            SERVICE_USAGE_ROLE_SHARED,
+        ]
+
+    # analysis / validate / interactive
+    return [
+        SERVICE_USAGE_ROLE_ANALYSIS,
+        SERVICE_USAGE_ROLE_SHARED,
+        SERVICE_USAGE_ROLE_SUBSCRIPTIONS,
+    ]
+
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 api_id = int(os.environ["TELEGRAM_API_ID"])
@@ -465,76 +486,89 @@ def account_is_within_limits(account: ServiceTelegramAccount) -> bool:
 # =========================
 # Выбор и блокировка аккаунта
 # =========================
-
 async def allocate_service_account(
     db: AsyncSession,
     *,
     target_ref: str,
+    operation_kind: str = "analysis",
 ) -> AllocatedAccount:
     """
-    На MVP делаем блокировку через PostgreSQL:
-    - выбираем кандидатов
-    - берём SELECT ... FOR UPDATE SKIP LOCKED
-    - помечаем аккаунт как busy
+    operation_kind:
+      - analysis
+      - subscription
+
+    analysis:      analysis -> shared -> subscriptions
+    subscription:  subscriptions -> shared
     """
     now = utcnow()
+    role_chain = get_usage_role_chain(operation_kind)
 
-    stmt = (
-        select(ServiceTelegramAccount)
-        .join(ServicePhoneNumber, ServicePhoneNumber.id == ServiceTelegramAccount.phone_number_id)
-        .where(
-            ServiceTelegramAccount.status == SERVICE_ACCOUNT_ALLOWED_STATUS,
-            ServiceTelegramAccount.is_enabled.is_(True),
-            ServiceTelegramAccount.is_busy.is_(False),
-            sa.or_(
-                ServiceTelegramAccount.cooldown_until.is_(None),
-                ServiceTelegramAccount.cooldown_until <= now,
-            ),
-            ServicePhoneNumber.is_active.is_(True),
-        )
-        .order_by(
-            ServiceTelegramAccount.requests_last_hour.asc(),
-            ServiceTelegramAccount.requests_last_minute.asc(),
-            ServiceTelegramAccount.last_used_at.asc().nullsfirst(),
-            ServiceTelegramAccount.id.asc(),
-        )
-        .limit(10)
-        .with_for_update(skip_locked=True)
-    )
-
-    result = await db.execute(stmt)
-    candidates = list(result.scalars().all())
-
-    for account in candidates:
-        await recount_request_counters(db, account)
-
-        if not account_is_within_limits(account):
-            continue
-
-        account.is_busy = True
-        account.busy_started_at = now
-        account.updated_at = now
-
-        await log_event(
-            db,
-            service_account_id=account.id,
-            event_type="account_taken",
-            target_ref=target_ref,
-            is_success=True,
-            event_at=now,
+    for usage_role in role_chain:
+        stmt = (
+            select(ServiceTelegramAccount)
+            .join(ServicePhoneNumber, ServicePhoneNumber.id == ServiceTelegramAccount.phone_number_id)
+            .where(
+                ServiceTelegramAccount.usage_role == usage_role,
+                ServiceTelegramAccount.status == SERVICE_ACCOUNT_ALLOWED_STATUS,
+                ServiceTelegramAccount.is_enabled.is_(True),
+                ServiceTelegramAccount.is_busy.is_(False),
+                sa.or_(
+                    ServiceTelegramAccount.cooldown_until.is_(None),
+                    ServiceTelegramAccount.cooldown_until <= now,
+                ),
+                ServicePhoneNumber.is_active.is_(True),
+            )
+            .order_by(
+                ServiceTelegramAccount.requests_last_hour.asc(),
+                ServiceTelegramAccount.requests_last_minute.asc(),
+                ServiceTelegramAccount.last_used_at.asc().nullsfirst(),
+                ServiceTelegramAccount.id.asc(),
+            )
+            .limit(10)
+            .with_for_update(skip_locked=True)
         )
 
-        busy_log = await log_event(
-            db,
-            service_account_id=account.id,
-            event_type="account_busy_window",
-            target_ref=target_ref,
-            started_at=now,
-            is_success=None,
-        )
+        result = await db.execute(stmt)
+        candidates = list(result.scalars().all())
 
-        await db.flush()
-        return AllocatedAccount(account=account, busy_log_id=busy_log.id)
+        for account in candidates:
+            await recount_request_counters(db, account)
+
+            if not account_is_within_limits(account):
+                continue
+
+            account.is_busy = True
+            account.busy_started_at = now
+            account.updated_at = now
+
+            await log_event(
+                db,
+                service_account_id=account.id,
+                event_type="account_taken",
+                target_ref=target_ref,
+                is_success=True,
+                event_at=now,
+                meta_json={
+                    "operation_kind": operation_kind,
+                    "usage_role": usage_role,
+                },
+            )
+
+            busy_log = await log_event(
+                db,
+                service_account_id=account.id,
+                event_type="account_busy_window",
+                target_ref=target_ref,
+                started_at=now,
+                is_success=None,
+                meta_json={
+                    "operation_kind": operation_kind,
+                    "usage_role": usage_role,
+                },
+            )
+
+            await db.flush()
+            return AllocatedAccount(account=account, busy_log_id=busy_log.id)
 
     await log_event(
         db,
@@ -545,6 +579,10 @@ async def allocate_service_account(
         error_code="NO_FREE_ACCOUNT",
         error_message="Не найден свободный служебный аккаунт.",
         event_at=now,
+        meta_json={
+            "operation_kind": operation_kind,
+            "role_chain": role_chain,
+        },
     )
     await db.flush()
 
@@ -553,7 +591,6 @@ async def allocate_service_account(
         user_message="Сейчас все служебные аккаунты заняты. Попробуйте чуть позже.",
         http_status=503,
     )
-
 
 async def release_service_account(
     db: AsyncSession,
@@ -757,7 +794,11 @@ async def validate_service_subscription_target(
     - возвращает метаданные чата
     """
     normalized_ref = normalize_public_chat_ref(chat_link)
-    allocated = await allocate_service_account(db, target_ref=normalized_ref)
+    allocated = await allocate_service_account(
+        db,
+        target_ref=normalized_ref,
+        operation_kind="subscription",
+    )
     account = allocated.account
 
     # фиксируем reserve сразу
@@ -938,7 +979,11 @@ async def fetch_service_chat_messages_for_subscription(
     }
     """
     normalized_ref = normalize_public_chat_ref(chat_link)
-    allocated = await allocate_service_account(db, target_ref=normalized_ref)
+    allocated = await allocate_service_account(
+        db,
+        target_ref=normalized_ref,
+        operation_kind="subscription",
+    )
     account = allocated.account
 
     # фиксируем reserve сразу
@@ -1155,7 +1200,11 @@ async def analyze_chat_via_service_account(
     normalized_ref = normalize_public_chat_ref(chat_link)
 
     for _attempt in range(SERVICE_ACCOUNT_MAX_ATTEMPTS):
-        allocated = await allocate_service_account(db, target_ref=normalized_ref)
+        allocated = await allocate_service_account(
+            db,
+            target_ref=normalized_ref,
+            operation_kind="analysis",
+        )
         account = allocated.account
 
         # ВАЖНО: сразу фиксируем reserve, чтобы не держать длинную транзакцию

@@ -345,6 +345,8 @@ class ServiceTelegramAccount(Base):
     telegram_user_id = Column(BigInteger, nullable=True, unique=True, index=True)
     telegram_username = Column(String(128), nullable=True, index=True)
 
+    usage_role = Column(String(20), nullable=False, server_default="analysis", index=True)
+
     status = Column(String(32), nullable=False, server_default="active", index=True)
     is_enabled = Column(Boolean, nullable=False, server_default=sa.text("true"), index=True)
     is_busy = Column(Boolean, nullable=False, server_default=sa.text("false"), index=True)
@@ -375,6 +377,7 @@ class ServiceTelegramAccount(Base):
     __table_args__ = (
         sa.Index(
             "ix_service_telegram_accounts_select",
+            "usage_role",
             "status",
             "is_enabled",
             "is_busy",

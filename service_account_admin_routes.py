@@ -97,6 +97,7 @@ class AccountSaveRow(BaseModel):
     phone_number_id: int
     telegram_user_id: Optional[int] = None
     telegram_username: Optional[str] = None
+    usage_role: str = "analysis"
     status: str = "active"
     is_enabled: bool = True
     is_busy: bool = False
@@ -165,7 +166,31 @@ async def _serialize_state(db: AsyncSession) -> dict:
     no_free_count = int(no_free_res.scalar() or 0)
     return {
         "phone_numbers": [{"id": p.id, "phone_e164": p.phone_e164, "provider_code": p.provider_code, "country_code": p.country_code, "monthly_cost": float(p.monthly_cost) if p.monthly_cost is not None else None, "currency": p.currency, "total_spent": float(p.total_spent) if p.total_spent is not None else 0, "last_paid_at": p.last_paid_at.isoformat() if p.last_paid_at else None, "is_active": p.is_active, "created_at": p.created_at.isoformat() if p.created_at else None, "updated_at": p.updated_at.isoformat() if p.updated_at else None} for p in phones],
-        "accounts": [{"id": a.id, "phone_number_id": a.phone_number_id, "phone_e164": phone_e164, "telegram_user_id": a.telegram_user_id, "telegram_username": a.telegram_username, "status": a.status, "is_enabled": a.is_enabled, "is_busy": a.is_busy, "busy_started_at": a.busy_started_at.isoformat() if a.busy_started_at else None, "cooldown_until": a.cooldown_until.isoformat() if a.cooldown_until else None, "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None, "last_auth_at": a.last_auth_at.isoformat() if a.last_auth_at else None, "last_error": a.last_error, "last_error_at": a.last_error_at.isoformat() if a.last_error_at else None, "consecutive_fail_count": a.consecutive_fail_count, "requests_last_minute": a.requests_last_minute, "requests_last_hour": a.requests_last_hour, "requests_last_day": a.requests_last_day, "created_at": a.created_at.isoformat() if a.created_at else None, "updated_at": a.updated_at.isoformat() if a.updated_at else None} for a, phone_e164 in account_rows],
+
+        "accounts": [{
+                "id": a.id,
+                "phone_number_id": a.phone_number_id,
+                "phone_e164": phone_e164,
+                "telegram_user_id": a.telegram_user_id,
+                "telegram_username": a.telegram_username,
+                "usage_role": a.usage_role,
+                "status": a.status,
+                "is_enabled": a.is_enabled,
+                "is_busy": a.is_busy,
+                "busy_started_at": a.busy_started_at.isoformat() if a.busy_started_at else None,
+                "cooldown_until": a.cooldown_until.isoformat() if a.cooldown_until else None,
+                "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None,
+                "last_auth_at": a.last_auth_at.isoformat() if a.last_auth_at else None,
+                "last_error": a.last_error,
+                "last_error_at": a.last_error_at.isoformat() if a.last_error_at else None,
+                "consecutive_fail_count": a.consecutive_fail_count,
+                "requests_last_minute": a.requests_last_minute,
+                "requests_last_hour": a.requests_last_hour,
+                "requests_last_day": a.requests_last_day,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "updated_at": a.updated_at.isoformat() if a.updated_at else None
+            } for a, phone_e164 in account_rows],
+
         "logs": [{"id": l.id, "service_account_id": l.service_account_id, "event_type": l.event_type, "target_ref": l.target_ref, "is_success": l.is_success, "error_code": l.error_code, "error_message": l.error_message, "event_at": l.event_at.isoformat() if l.event_at else None, "started_at": l.started_at.isoformat() if l.started_at else None, "finished_at": l.finished_at.isoformat() if l.finished_at else None} for l in logs],
         "stats": {"active_accounts": sum(1 for a, _ in account_rows if a.status == "active"), "cooldown_accounts": sum(1 for a, _ in account_rows if a.status == "cooldown"), "needs_reauth_accounts": sum(1 for a, _ in account_rows if a.status == "needs_reauth"), "busy_accounts": sum(1 for a, _ in account_rows if a.is_busy), "no_free_account_last_hour": no_free_count, "total_logs": len(logs)}
     }
@@ -238,11 +263,20 @@ async def service_accounts_admin_save_phones(payload: PhonesSaveRequest, user: U
 @router.post("/admin/service-accounts/accounts/save")
 async def service_accounts_admin_save_accounts(payload: AccountsSaveRequest, user: User = Depends(auth_get_current_user), db: AsyncSession = Depends(get_db)):
     allowed_statuses = {"active", "cooldown", "needs_reauth", "disabled", "banned"}
+    allowed_usage_roles = {"analysis", "subscriptions", "shared"}
     try:
         for row in payload.rows:
             phone = await _get_phone_or_404(db, row.phone_number_id)
             if row.status not in allowed_statuses:
                 raise HTTPException(status_code=400, detail={"code": "INVALID_STATUS", "message": f"Недопустимый статус: {row.status}"})
+
+            usage_role = (row.usage_role or "analysis").strip().lower()
+            if usage_role not in allowed_usage_roles:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_USAGE_ROLE", "message": f"Недопустимое назначение: {row.usage_role}"},
+                )
+
             same_tg = None
             if row.telegram_user_id is not None:
                 dup_res = await db.execute(select(ServiceTelegramAccount).where(ServiceTelegramAccount.telegram_user_id == row.telegram_user_id))
@@ -250,7 +284,7 @@ async def service_accounts_admin_save_accounts(payload: AccountsSaveRequest, use
             if row.id is None:
                 if same_tg is not None:
                     raise HTTPException(status_code=409, detail={"code": "TELEGRAM_USER_ALREADY_EXISTS", "message": f"Telegram user id {row.telegram_user_id} уже используется."})
-                db.add(ServiceTelegramAccount(phone_number_id=phone.id, telegram_user_id=row.telegram_user_id, telegram_username=(row.telegram_username or "").strip() or None, status=row.status, is_enabled=row.is_enabled, is_busy=row.is_busy, busy_started_at=parse_dt(row.busy_started_at), cooldown_until=parse_dt(row.cooldown_until), last_used_at=parse_dt(row.last_used_at), last_auth_at=parse_dt(row.last_auth_at), last_error=(row.last_error or "").strip() or None, last_error_at=parse_dt(row.last_error_at), consecutive_fail_count=row.consecutive_fail_count, requests_last_minute=row.requests_last_minute, requests_last_hour=row.requests_last_hour, requests_last_day=row.requests_last_day))
+                db.add(ServiceTelegramAccount(phone_number_id=phone.id, telegram_user_id=row.telegram_user_id, telegram_username=(row.telegram_username or "").strip() or None, usage_role=usage_role, status=row.status, is_enabled=row.is_enabled, is_busy=row.is_busy, busy_started_at=parse_dt(row.busy_started_at), cooldown_until=parse_dt(row.cooldown_until), last_used_at=parse_dt(row.last_used_at), last_auth_at=parse_dt(row.last_auth_at), last_error=(row.last_error or "").strip() or None, last_error_at=parse_dt(row.last_error_at), consecutive_fail_count=row.consecutive_fail_count, requests_last_minute=row.requests_last_minute, requests_last_hour=row.requests_last_hour, requests_last_day=row.requests_last_day))
                 await db.flush()
             else:
                 account = await _get_account_or_404(db, row.id)
@@ -260,6 +294,7 @@ async def service_accounts_admin_save_accounts(payload: AccountsSaveRequest, use
                 account.phone_number_id = phone.id
                 account.telegram_user_id = row.telegram_user_id
                 account.telegram_username = (row.telegram_username or "").strip() or None
+                account.usage_role = usage_role
                 account.status = row.status
                 account.is_enabled = row.is_enabled
                 account.is_busy = row.is_busy
