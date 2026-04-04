@@ -805,7 +805,7 @@ async def validate_service_subscription_target(
     await db.commit()
 
     try:
-        client = await get_service_client(db, service_account_id=account.id)
+        client = await get_service_tg_client(db, service_account_id=account.id)
         entity = await resolve_service_entity(client, normalized_ref)
         entity = await ensure_join_and_access(client, normalized_ref, entity)
 
@@ -990,7 +990,7 @@ async def fetch_service_chat_messages_for_subscription(
     await db.commit()
 
     try:
-        client = await get_service_client(db, service_account_id=account.id)
+        client = await get_service_tg_client(db, service_account_id=account.id)
         entity = await resolve_service_entity(client, normalized_ref)
         entity = await ensure_join_and_access(client, normalized_ref, entity)
 
