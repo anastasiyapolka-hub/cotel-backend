@@ -28,9 +28,9 @@ from telegram_service import decrypt_session
 # Константы MVP
 # =========================
 
-SERVICE_ACCOUNT_LIMIT_PER_MINUTE = 2
-SERVICE_ACCOUNT_LIMIT_PER_HOUR = 20
-SERVICE_ACCOUNT_LIMIT_PER_DAY = 100
+SERVICE_ACCOUNT_LIMIT_PER_MINUTE = 10
+SERVICE_ACCOUNT_LIMIT_PER_HOUR = 100
+SERVICE_ACCOUNT_LIMIT_PER_DAY = 300
 SERVICE_ACCOUNT_MAX_FETCH_MESSAGES = 1000
 SERVICE_ACCOUNT_MAX_ATTEMPTS = 2
 
@@ -531,10 +531,45 @@ async def allocate_service_account(
         result = await db.execute(stmt)
         candidates = list(result.scalars().all())
 
+        await log_event(
+            db,
+            service_account_id=None,
+            event_type="allocator_candidates_checked",
+            target_ref=target_ref,
+            is_success=True,
+            event_at=now,
+            meta_json={
+                "operation_kind": operation_kind,
+                "usage_role": usage_role,
+                "candidate_ids": [int(a.id) for a in candidates],
+                "candidate_count": len(candidates),
+            },
+        )
+
         for account in candidates:
             await recount_request_counters(db, account)
 
             if not account_is_within_limits(account):
+                await log_event(
+                    db,
+                    service_account_id=account.id,
+                    event_type="account_skipped_limits",
+                    target_ref=target_ref,
+                    is_success=False,
+                    error_code="ACCOUNT_OVER_LIMIT",
+                    error_message="Аккаунт пропущен из-за лимитов нагрузки.",
+                    event_at=now,
+                    meta_json={
+                        "operation_kind": operation_kind,
+                        "usage_role": usage_role,
+                        "requests_last_minute": account.requests_last_minute,
+                        "requests_last_hour": account.requests_last_hour,
+                        "requests_last_day": account.requests_last_day,
+                        "limit_per_minute": SERVICE_ACCOUNT_LIMIT_PER_MINUTE,
+                        "limit_per_hour": SERVICE_ACCOUNT_LIMIT_PER_HOUR,
+                        "limit_per_day": SERVICE_ACCOUNT_LIMIT_PER_DAY,
+                    },
+                )
                 continue
 
             account.is_busy = True
@@ -584,7 +619,7 @@ async def allocate_service_account(
             "role_chain": role_chain,
         },
     )
-    await db.flush()
+    await db.commit()
 
     raise ServiceAccountError(
         code="NO_FREE_ACCOUNT",
