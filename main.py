@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request, Depends
 from auth import router as auth_router
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
+from diagnostics import router as diagnostics_router
 
 from openai import AsyncOpenAI
 import os
@@ -81,6 +82,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(service_account_router)
 app.include_router(service_account_admin_router)
+app.include_router(diagnostics_router)
 
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
