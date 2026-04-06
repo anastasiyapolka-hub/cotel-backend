@@ -3,12 +3,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
-
+import random
 import sqlalchemy as sa
 from openai import AsyncOpenAI
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
@@ -1103,6 +1103,37 @@ async def fetch_service_chat_messages_for_subscription(
             is_success=True,
             event_at=now,
         )
+
+        # <<< ++ВСТАВКА РЕАКЦИИ >>>
+        # =========================================================
+        count = random.randint(1, 5)
+        if count == 3:
+            try:
+                if rows:
+                    target_row = rows[-1]
+                    target_message_id = target_row.get("message_id")
+
+                    if target_message_id is not None:
+                        await client(
+                            functions.messages.SendReactionRequest(
+                                peer=entity,
+                                msg_id=int(target_message_id),
+                                big=False,
+                                add_to_recent=False,
+                                reaction=[
+                                    types.ReactionEmoji(emoticon="🔥")
+                                ],
+                            )
+                        )
+            except Exception as e:
+                # Для тестового блока не валим всю подписку,
+                # просто логируем в консоль.
+                print(
+                    f"[service_account_service] REACTION_TEST_FAILED "
+                    f"service_account_id={account.id} chat_ref={normalized_ref} err={e}"
+                )
+        # =========================================================
+        # <<< --ВСТАВКА РЕАКЦИИ >>>
 
         await release_service_account(
             db,
