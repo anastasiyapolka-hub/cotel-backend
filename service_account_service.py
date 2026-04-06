@@ -1104,7 +1104,7 @@ async def fetch_service_chat_messages_for_subscription(
             event_at=now,
         )
 
-        # <<< ++ВСТАВКА РЕАКЦИИ >>>
+        # <<< ++ВСТАВКА РЕАКЦИИ для служебного аккаунта>>>
         # =========================================================
         count = random.randint(1, 5)
         if count == 3:
