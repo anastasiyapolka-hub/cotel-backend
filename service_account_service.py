@@ -1125,13 +1125,13 @@ async def fetch_service_chat_messages_for_subscription(
                                 ],
                             )
                         )
+                        #
             except Exception as e:
-                # Для тестового блока не валим всю подписку,
-                # просто логируем в консоль.
-                print(
-                    f"[service_account_service] REACTION_TEST_FAILED "
-                    f"service_account_id={account.id} chat_ref={normalized_ref} err={e}"
-                )
+                x=1
+                #                 print(
+                #                 f"[service_account_service] REACTION_TEST_FAILED "
+                #                 f"service_account_id={account.id} chat_ref={normalized_ref} err={e}"
+                #                 )
         # =========================================================
         # <<< --ВСТАВКА РЕАКЦИИ >>>
 
