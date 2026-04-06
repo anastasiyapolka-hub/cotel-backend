@@ -81,26 +81,12 @@ def _format_diag_report(payload: dict) -> str:
     lines.append(f"me.phone: {auth.get('me', {}).get('phone')}")
     lines.append("")
 
-    sess = payload.get("session", {})
-    lines.append("[2] Сессия")
-    lines.append(f"loaded: {sess.get('loaded')}")
-    lines.append(f"length: {sess.get('length')}")
-    lines.append(f"preview: {sess.get('preview')}")
-    lines.append("")
 
     resolve = payload.get("resolve", {})
     lines.append("[3] Resolve entity")
     lines.append(f"success: {resolve.get('success')}")
     if resolve.get("error"):
         lines.append(f"error: {resolve.get('error')}")
-    if resolve.get("entity"):
-        entity = resolve["entity"]
-        lines.append(f"entity_type: {entity.get('entity_type')}")
-        lines.append(f"id: {entity.get('id')}")
-        lines.append(f"title: {entity.get('title')}")
-        lines.append(f"username: {entity.get('username')}")
-        lines.append(f"broadcast: {entity.get('broadcast')}")
-        lines.append(f"megagroup: {entity.get('megagroup')}")
     lines.append("")
 
     before_dialog = payload.get("dialog_before", {})
@@ -116,24 +102,13 @@ def _format_diag_report(payload: dict) -> str:
     if before_read.get("error"):
         lines.append(f"error: {before_read.get('error')}")
     lines.append(f"messages_count: {before_read.get('messages_count')}")
-    for row in before_read.get("messages", []) or []:
-        lines.append(f"- {row.get('message_id')} | {row.get('date')} | {row.get('text')}")
     lines.append("")
 
     join_step = payload.get("join", {})
-    lines.append("[6] Join / ensure access")
+    lines.append("[6] Вступление в чат")
     lines.append(f"success: {join_step.get('success')}")
     if join_step.get("error"):
         lines.append(f"error: {join_step.get('error')}")
-    if join_step.get("entity"):
-        lines.append(f"entity_after_join: {join_step.get('entity')}")
-    lines.append("")
-
-    after_dialog = payload.get("dialog_after", {})
-    lines.append("[7] Чат в dialogs после join")
-    lines.append(f"present: {after_dialog.get('present')}")
-    if after_dialog.get("dialog"):
-        lines.append(f"dialog: {after_dialog.get('dialog')}")
     lines.append("")
 
     after_read = payload.get("read_after_join", {})
@@ -142,8 +117,6 @@ def _format_diag_report(payload: dict) -> str:
     if after_read.get("error"):
         lines.append(f"error: {after_read.get('error')}")
     lines.append(f"messages_count: {after_read.get('messages_count')}")
-    for row in after_read.get("messages", []) or []:
-        lines.append(f"- {row.get('message_id')} | {row.get('date')} | {row.get('text')}")
 
     reaction_test = payload.get("reaction_test", {})
     lines.append("")
