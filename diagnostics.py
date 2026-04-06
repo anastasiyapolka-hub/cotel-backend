@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from telethon import functions, types
 from telethon.tl.types import Message
 
 from db.session import get_db
@@ -21,6 +22,10 @@ class ServiceAccountChatDiagnosticIn(BaseModel):
     chat_ref: str = Field(min_length=1)
     sample_limit: int = Field(default=5, ge=1, le=20)
 
+    # --- TESTING BLOCK: reaction test ---
+    reaction_emoji: str = Field(default="🔥", min_length=1, max_length=16)
+    react_to_last_read: bool = Field(default=True)
+    # --- /TESTING BLOCK: reaction test ---
 
 async def _diag_read_sample(client, entity, limit: int = 5) -> list[dict]:
     rows: list[dict] = []
@@ -140,6 +145,16 @@ def _format_diag_report(payload: dict) -> str:
     for row in after_read.get("messages", []) or []:
         lines.append(f"- {row.get('message_id')} | {row.get('date')} | {row.get('text')}")
 
+    reaction_test = payload.get("reaction_test", {})
+    lines.append("")
+    lines.append("[9] Тест реакции")
+    lines.append(f"attempted: {reaction_test.get('attempted')}")
+    lines.append(f"success: {reaction_test.get('success')}")
+    lines.append(f"emoji: {reaction_test.get('emoji')}")
+    lines.append(f"target_message_id: {reaction_test.get('target_message_id')}")
+    if reaction_test.get("error"):
+        lines.append(f"error: {reaction_test.get('error')}")
+
     return "\n".join(lines)
 
 
@@ -160,6 +175,7 @@ async def diagnose_service_account_chat(
         "join": {},
         "dialog_after": {},
         "read_after_join": {},
+        "reaction_test": {},  # --- TESTING BLOCK: reaction test ---
     }
 
     try:
@@ -275,6 +291,66 @@ async def diagnose_service_account_chat(
                 "messages_count": 0,
                 "messages": [],
             }
+
+
+        # =========================================================
+        # --- TESTING BLOCK: send reaction to one of read messages ---
+        # ВАЖНО:
+        # _diag_read_sample читает через iter_messages(limit=N),
+        # а Telethon отдаёт сообщения от новых к старым.
+        # Поэтому:
+        #   msgs_after[0]  -> самое новое из выборки
+        #   msgs_after[-1] -> самое старое из выборки
+        #
+        # Для теста "реакция на последнее актуальное сообщение" берём msgs_after[0].
+        # Если захочешь реакцию именно на последний элемент в выведенном списке,
+        # поменяй target_row = msgs_after[-1]
+        # =========================================================
+        result["reaction_test"] = {
+            "attempted": False,
+            "success": False,
+            "emoji": payload.reaction_emoji,
+            "target_message_id": None,
+            "error": None,
+        }
+
+        try:
+            msgs_after = result.get("read_after_join", {}).get("messages") or []
+
+            if payload.react_to_last_read and msgs_after:
+                target_row = msgs_after[0]   # самое новое сообщение из прочитанной выборки
+                target_message_id = target_row.get("message_id")
+
+                result["reaction_test"]["attempted"] = True
+                result["reaction_test"]["target_message_id"] = target_message_id
+
+                if target_message_id:
+                    await client(
+                        functions.messages.SendReactionRequest(
+                            peer=joined_entity,
+                            msg_id=int(target_message_id),
+                            big=True,
+                            add_to_recent=True,
+                            reaction=[
+                                types.ReactionEmoji(
+                                    emoticon=payload.reaction_emoji
+                                )
+                            ],
+                        )
+                    )
+
+                    result["reaction_test"]["success"] = True
+                else:
+                    result["reaction_test"]["error"] = "TARGET_MESSAGE_ID_MISSING"
+            else:
+                result["reaction_test"]["error"] = "NO_MESSAGES_FOR_REACTION"
+        except Exception as e:
+            result["reaction_test"]["success"] = False
+            result["reaction_test"]["error"] = f"{e.__class__.__name__}: {str(e)}"
+        # --- /TESTING BLOCK: send reaction to one of read messages ---
+        # =========================================================
+
+
 
         result["report_text"] = _format_diag_report(result)
         return result
