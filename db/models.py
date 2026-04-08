@@ -2,6 +2,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -34,9 +35,18 @@ class Subscription(Base):
     frequency_minutes = Column(Integer, nullable=False, default=60)  # 60=час, 1440=день
     prompt = Column(Text, nullable=False)
 
+    # Главное поле для расчёта "активных подписок"
     is_active = Column(Boolean, nullable=False, default=True)
-    status = Column(String(30), nullable=False, default="ok")  # ok/auth_required/error
+
+    # Текстовый статус для UI / диагностики
+    # active / paused / ok / auth_required / error / trial_expired
+    status = Column(String(30), nullable=False, default="ok")
     last_error = Column(Text, nullable=True)
+
+    # Trial-подписки для free
+    is_trial = Column(Boolean, nullable=False, server_default=sa.text("false"), index=True)
+    trial_started_at = Column(DateTime(timezone=True), nullable=True)
+    trial_ends_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -45,6 +55,12 @@ class Subscription(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+    __table_args__ = (
+        sa.Index("ix_subscriptions_owner_active", "owner_user_id", "is_active"),
+        sa.Index("ix_subscriptions_owner_trial", "owner_user_id", "is_trial"),
+    )
+
 
 class SubscriptionState(Base):
     __tablename__ = "subscription_state"
@@ -147,6 +163,34 @@ class BotLinkCode(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+class Plan(Base):
+    __tablename__ = "plans"
+
+    code = Column(String(32), primary_key=True)  # free / basic / pro
+
+    price_usd = Column(Numeric(10, 2), nullable=False, server_default="0")
+    is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
+
+    daily_qa_limit = Column(Integer, nullable=False)
+    monthly_qa_limit = Column(Integer, nullable=False)
+
+    qa_history_days = Column(Integer, nullable=False)
+
+    max_active_subscriptions = Column(Integer, nullable=False)
+    min_subscription_interval_minutes = Column(Integer, nullable=False)
+
+    trial_subscription_limit = Column(Integer, nullable=False, server_default="0")
+    trial_subscription_duration_days = Column(Integer, nullable=False, server_default="0")
+
+    has_chat_history = Column(Boolean, nullable=False, server_default=sa.text("false"))
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
 class User(Base):
     __tablename__ = "users"
@@ -159,7 +203,15 @@ class User(Base):
     password_hash = Column(String(255), nullable=True)
     is_email_verified = Column(Boolean, nullable=False, server_default=sa.text("false"))
 
-    plan = Column(String(32), nullable=False, server_default="free")
+    # Строковый код тарифа, но уже с FK на plans.code
+    plan = Column(
+        String(32),
+        ForeignKey("plans.code", ondelete="RESTRICT"),
+        nullable=False,
+        server_default="free",
+        index=True,
+    )
+
     is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
 
     country_code = Column(String(2), nullable=True, index=True)
@@ -174,6 +226,170 @@ class User(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+# ++ПЛАТЕЖНЫЕ ДАННЫЕ
+class BillingSubscription(Base):
+    __tablename__ = "billing_subscriptions"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    provider = Column(String(32), nullable=False)  # lemonsqueezy / stripe / etc
+    provider_customer_id = Column(String(128), nullable=True, index=True)
+    provider_subscription_id = Column(String(128), nullable=True, unique=True, index=True)
+    provider_variant_id = Column(String(128), nullable=True)
+    provider_product_id = Column(String(128), nullable=True)
+
+    plan_code = Column(
+        String(32),
+        ForeignKey("plans.code", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    status = Column(String(32), nullable=False, index=True)  # active / canceled / past_due / trialing / expired
+    cancel_at_period_end = Column(Boolean, nullable=False, server_default=sa.text("false"))
+
+    current_period_start = Column(DateTime(timezone=True), nullable=True)
+    current_period_end = Column(DateTime(timezone=True), nullable=True)
+
+    last_payment_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        sa.Index("ix_billing_subscriptions_user_status", "user_id", "status"),
+    )
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    billing_subscription_id = Column(
+        BigInteger,
+        ForeignKey("billing_subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    provider = Column(String(32), nullable=False, index=True)
+    provider_order_id = Column(String(128), nullable=True, index=True)
+    provider_payment_id = Column(String(128), nullable=True, unique=True, index=True)
+
+    amount = Column(Numeric(12, 2), nullable=False)
+    currency = Column(String(8), nullable=False)
+
+    status = Column(String(32), nullable=False, index=True)  # paid / failed / refunded / pending
+    raw_payload = Column(JSONB, nullable=True)
+
+    paid_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        sa.Index("ix_payments_user_created", "user_id", "created_at"),
+    )
+# --ПЛАТЕЖНЫЕ ДАННЫЕ
+
+# ++Счетчики лимитов
+class UsageCounter(Base):
+    __tablename__ = "usage_counters"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    metric_code = Column(String(32), nullable=False)  # qa_request
+    period_type = Column(String(16), nullable=False)  # day / month
+    period_start = Column(Date, nullable=False)
+
+    used_count = Column(Integer, nullable=False, server_default="0")
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "metric_code",
+            "period_type",
+            "period_start",
+            name="uq_usage_counter_user_metric_period",
+        ),
+        sa.Index(
+            "ix_usage_counters_user_metric_period",
+            "user_id",
+            "metric_code",
+            "period_type",
+            "period_start",
+        ),
+    )
+
+class UsageEvent(Base):
+    __tablename__ = "usage_events"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    event_type = Column(String(32), nullable=False, index=True)
+    # qa_request_success / qa_request_rejected / subscription_created / subscription_resumed / subscription_paused
+
+    source_mode = Column(String(20), nullable=True)  # personal / service
+    chat_ref = Column(Text, nullable=True)
+
+    subscription_id = Column(
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    status = Column(String(32), nullable=False, index=True)
+    # success_counted / failed_not_counted / limit_rejected
+
+    meta_json = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        sa.Index("ix_usage_events_user_created", "user_id", "created_at"),
+        sa.Index("ix_usage_events_user_type_created", "user_id", "event_type", "created_at"),
+    )
+# --Счетчики лимитов
 
 class EmailVerificationCode(Base):
     __tablename__ = "email_verification_codes"
