@@ -176,7 +176,6 @@ async def upsert_user_chat_history(
     )
 
     await db.execute(stmt)
-    await db.commit()
 
 
 def serialize_chat_history_row(row: UserChatHistory) -> dict:
@@ -1147,6 +1146,14 @@ async def tg_analyze_chat(
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
+    await enforce_qa_limits(
+        db,
+        user=user,
+        requested_days=days,
+        source_mode="personal",
+        chat_ref=chat_link,
+    )
+
     try:
         entity, messages = await fetch_chat_messages(db, owner_user_id, chat_link, days)
     except ValueError as ve:
@@ -1170,12 +1177,23 @@ async def tg_analyze_chat(
         chat_id=getattr(entity, "id", None),
     )
 
+    await record_qa_success(
+        db,
+        user=user,
+        source_mode="personal",
+        chat_ref=chat_link,
+        requested_days=days,
+    )
+
+    await db.commit()
+
     return {
         "status": "ok",
         "summary": summary,
         "chat_name": chat_name,
         "messages_count": len(messages),
         "source_mode": "personal",
+        "usage": await build_usage_snapshot(db, user=user),
     }
 
 @app.get("/tg/chats")
