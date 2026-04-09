@@ -12,6 +12,7 @@ from service_account_service import (
     analyze_chat_via_service_account,
     normalize_public_chat_ref,
 )
+from plan_limits import enforce_qa_limits, record_qa_success, build_usage_snapshot
 
 router = APIRouter()
 
@@ -31,6 +32,14 @@ async def tg_service_analyze_chat(
     # user нужен для общей авторизации в CoTel и будущего учёта лимитов
     if not user:
         raise HTTPException(status_code=401, detail="UNAUTHORIZED")
+
+    await enforce_qa_limits(
+        db,
+        user=user,
+        requested_days=payload.days,
+        source_mode="service",
+        chat_ref=payload.chat_link,
+    )
 
     try:
         result = await analyze_chat_via_service_account(
@@ -70,9 +79,18 @@ async def tg_service_analyze_chat(
             )
         )
 
+        await record_qa_success(
+            db,
+            user=user,
+            source_mode="service",
+            chat_ref=payload.chat_link,
+            requested_days=payload.days,
+        )
+
         await db.execute(stmt)
         await db.commit()
 
+        result["usage"] = await build_usage_snapshot(db, user=user)
         return result
 
     except ServiceAccountError as e:

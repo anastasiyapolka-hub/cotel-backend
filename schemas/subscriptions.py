@@ -32,6 +32,10 @@ class SubscriptionOut(BaseModel):
     updated_at: datetime
     subscription_type: Optional[str] = None
 
+    is_trial: bool = False
+    trial_started_at: Optional[datetime] = None
+    trial_ends_at: Optional[datetime] = None
+
     class Config:
         from_attributes = True
 

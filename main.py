@@ -31,6 +31,9 @@ from db.models import (
     BotUserLink,
     UserChatHistory,
     BotLinkCode,
+    Plan,
+    UsageCounter,
+    UsageEvent,
 )
 
 from db.session import get_db
@@ -58,11 +61,20 @@ from telegram_service import (
     export_string_session,
     save_user_telegram_session,
 )
-
 from service_account_service import (
     ServiceAccountError,
     validate_service_subscription_target,
     fetch_service_chat_messages_for_subscription,
+)
+from plan_limits import (
+    build_usage_snapshot,
+    ensure_can_create_subscription,
+    ensure_can_delete_subscription,
+    ensure_can_toggle_subscription,
+    ensure_can_update_subscription,
+    enforce_qa_limits,
+    record_qa_success,
+    expire_trial_subscription_if_needed,
 )
 
 app = FastAPI()
@@ -92,6 +104,13 @@ DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/account/plan-usage")
+async def get_account_plan_usage(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await build_usage_snapshot(db, user=user)
 
 def sha256_hex(s: str) -> str:
     import hashlib
@@ -605,10 +624,17 @@ async def run_subscriptions(
     owner_user_id = user.id
 
     # 1) Берём активные подписки ТОЛЬКО этого пользователя
+    now_utc = datetime.now(timezone.utc)
+
     res = await db.execute(
         select(Subscription).where(
             Subscription.is_active == True,
             Subscription.owner_user_id == owner_user_id,
+            sa.or_(
+                Subscription.is_trial == False,  # noqa: E712
+                Subscription.trial_ends_at.is_(None),
+                Subscription.trial_ends_at > now_utc,
+            ),
         )
     )
     subs = list(res.scalars().all())
@@ -618,6 +644,12 @@ async def run_subscriptions(
     total_matches = 0
 
     for sub in subs:
+
+        expired = await expire_trial_subscription_if_needed(db, sub=sub, now_utc=now_utc)
+        if expired:
+            await db.commit()
+            continue
+
         sub_report = {
             "subscription_id": sub.id,
             "name": getattr(sub, "name", None),
@@ -877,7 +909,9 @@ async def run_subscriptions(
 @app.post("/analyze")
 async def analyze_chat(
     file: UploadFile = File(...),
-        params: str = Form("{}"),
+    params: str = Form("{}"),
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     # 1. парсим params из фронта
     try:
@@ -891,6 +925,14 @@ async def analyze_chat(
     )
     result_type = params_dict.get("result_type", "summary")
 
+    requested_days = 7  # для JSON-экспорта пока считаем как базовое Q&A
+    await enforce_qa_limits(
+        db,
+        user=user,
+        requested_days=requested_days,
+        source_mode="file",
+        chat_ref=(file.filename or "").strip(),
+    )
 
     # 1. Проверяем расширение файла
     if not file.filename.lower().endswith(".json"):
@@ -960,6 +1002,17 @@ async def analyze_chat(
             # Чтобы фронт получил понятную ошибку
             raise HTTPException(status_code=500, detail=f"LLM_ERROR: {str(e)}")
 
+
+    await record_qa_success(
+        db,
+        user=user,
+        source_mode="file",
+        chat_ref=(file.filename or "").strip(),
+        requested_days=requested_days,
+    )
+    await db.commit()
+
+    usage_snapshot = await build_usage_snapshot(db, user=user)
     # Ответ фронту
     return {
         "status": "ok",
@@ -970,6 +1023,7 @@ async def analyze_chat(
         "chat_type": chat_type,
         "user_query": user_query,
         "result_type": result_type,
+        "usage": usage_snapshot,
         "summary": summary
     }
 
@@ -1448,7 +1502,18 @@ async def list_subscriptions(
     stmt = stmt.order_by(Subscription.id.desc())
 
     res = await db.execute(stmt)
-    return list(res.scalars().all())
+    subs = list(res.scalars().all())
+
+    changed = False
+    for sub in subs:
+        expired = await expire_trial_subscription_if_needed(db, sub=sub)
+        if expired:
+            changed = True
+
+    if changed:
+        await db.commit()
+
+    return subs
 
 @app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
 async def get_subscription(
@@ -1478,6 +1543,14 @@ async def update_subscription(
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
 
+    await ensure_can_update_subscription(
+        db,
+        user=user,
+        sub=sub,
+        requested_frequency_minutes=payload.frequency_minutes,
+        requested_is_active=payload.is_active,
+    )
+
     old_chat_ref = (sub.chat_ref or "").strip()
     old_source_mode = (sub.source_mode or "").strip().lower()
 
@@ -1500,6 +1573,8 @@ async def update_subscription(
     sub.last_error = None
     sub.updated_at = sa.func.now()
 
+    await expire_trial_subscription_if_needed(db, sub=sub)
+
     # если чат или режим изменились — сбрасываем state
     state_res = await db.execute(
         select(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id)
@@ -1521,10 +1596,69 @@ async def update_subscription(
         chat_id=chat_id,
     )
 
+    db.add(
+        UsageEvent(
+            user_id=user.id,
+            event_type="subscription_updated",
+            status="success_counted",
+            source_mode=sub.source_mode,
+            chat_ref=sub.chat_ref,
+            subscription_id=sub.id,
+            meta_json={
+                "is_active": bool(sub.is_active),
+                "frequency_minutes": int(sub.frequency_minutes),
+            },
+        )
+    )
+
     await db.commit()
     await db.refresh(sub)
     return sub
 
+@app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
+async def toggle_subscription(
+    subscription_id: int,
+    payload: ToggleRequest,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    sub = res.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
+    if sub.owner_user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    await ensure_can_toggle_subscription(
+        db,
+        user=user,
+        sub=sub,
+        target_is_active=payload.is_active,
+    )
+
+    sub.is_active = bool(payload.is_active)
+    sub.status = "active" if payload.is_active else "paused"
+    sub.updated_at = sa.func.now()
+
+    await expire_trial_subscription_if_needed(db, sub=sub)
+
+    db.add(
+        UsageEvent(
+            user_id=user.id,
+            event_type="subscription_resumed" if payload.is_active else "subscription_paused",
+            status="success_counted",
+            source_mode=sub.source_mode,
+            chat_ref=sub.chat_ref,
+            subscription_id=sub.id,
+            meta_json={
+                "is_trial": bool(sub.is_trial),
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(sub)
+    return sub
 
 @app.post("/subscriptions", response_model=SubscriptionOut)
 async def create_subscription(
@@ -1532,6 +1666,13 @@ async def create_subscription(
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    plan, is_trial, trial_started_at, trial_ends_at = await ensure_can_create_subscription(
+        db,
+        user=user,
+        frequency_minutes=payload.frequency_minutes,
+        requested_is_active=payload.is_active,
+    )
+
     normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
         db,
         owner_user_id=user.id,
@@ -1551,6 +1692,9 @@ async def create_subscription(
         is_active=payload.is_active,
         status="active" if payload.is_active else "paused",
         last_error=None,
+        is_trial=is_trial,
+        trial_started_at=trial_started_at,
+        trial_ends_at=trial_ends_at,
     )
     db.add(sub)
     await db.flush()
@@ -1574,6 +1718,22 @@ async def create_subscription(
         chat_id=chat_id,
     )
 
+    db.add(
+        UsageEvent(
+            user_id=user.id,
+            event_type="subscription_created",
+            status="success_counted",
+            source_mode=payload.source_mode,
+            chat_ref=normalized_chat_ref,
+            subscription_id=sub.id,
+            meta_json={
+                "is_trial": bool(is_trial),
+                "is_active": bool(payload.is_active),
+                "frequency_minutes": int(payload.frequency_minutes),
+            },
+        )
+    )
+
     await db.commit()
     await db.refresh(sub)
     return sub
@@ -1590,6 +1750,22 @@ async def delete_subscription(
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    ensure_can_delete_subscription(sub=sub)
+
+    db.add(
+        UsageEvent(
+            user_id=user.id,
+            event_type="subscription_deleted",
+            status="success_counted",
+            source_mode=sub.source_mode,
+            chat_ref=sub.chat_ref,
+            subscription_id=sub.id,
+            meta_json={
+                "is_trial": bool(sub.is_trial),
+            },
+        )
+    )
 
     await db.execute(delete(MatchEvent).where(MatchEvent.subscription_id == subscription_id))
     await db.execute(delete(DigestEvent).where(DigestEvent.subscription_id == subscription_id))

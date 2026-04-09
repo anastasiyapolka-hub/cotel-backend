@@ -15,7 +15,7 @@ from main import (
     call_openai_subscription_match,
     call_openai_subscription_digest,
 )
-
+from plan_limits import utc_now
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 from service_account_service import fetch_service_chat_messages_for_subscription
 
@@ -43,6 +43,13 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
             select(SubscriptionState, Subscription)
             .join(Subscription, Subscription.id == SubscriptionState.subscription_id)
             .where(Subscription.is_active == True)  # noqa: E712
+            .where(
+                or_(
+                    Subscription.is_trial == False,  # noqa: E712
+                    Subscription.trial_ends_at.is_(None),
+                    Subscription.trial_ends_at > now_utc,
+                )
+            )
             .where(
                 or_(
                     SubscriptionState.next_run_at.is_(None),
@@ -81,6 +88,28 @@ from sqlalchemy.dialects.postgresql import insert
 async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     # Берём sub + state
     sub = (await db.execute(select(Subscription).where(Subscription.id == sub_id))).scalar_one()
+
+    if getattr(sub, "is_trial", False):
+        trial_ends_at = getattr(sub, "trial_ends_at", None)
+        if trial_ends_at and trial_ends_at <= now_utc:
+            st = (
+                await db.execute(
+                    select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
+                )
+            ).scalar_one_or_none()
+
+            sub.is_active = False
+            sub.status = "trial_expired"
+            sub.last_error = None
+
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+
+            st.last_checked_at = now_utc
+            st.next_run_at = None
+            return
+
     st = (
         await db.execute(
             select(SubscriptionState).where(SubscriptionState.subscription_id == sub_id)
