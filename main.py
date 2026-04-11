@@ -1769,7 +1769,7 @@ async def delete_subscription(
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
 
-    ensure_can_delete_subscription(sub=sub)
+    ensure_can_delete_subscription(user=user, sub=sub)
 
     db.add(
         UsageEvent(

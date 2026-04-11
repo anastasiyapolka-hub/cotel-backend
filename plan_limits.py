@@ -450,7 +450,16 @@ async def ensure_can_toggle_subscription(
     return plan
 
 
-def ensure_can_delete_subscription(*, sub: Subscription) -> None:
+def ensure_can_delete_subscription(*, user: User, sub: Subscription) -> None:
+    if str(getattr(user, "plan", "")).lower() == "free":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FREE_SUBSCRIPTION_DELETE_FORBIDDEN",
+                "message": "На бесплатном тарифе удаление подписок недоступно. Вы можете только приостановить или возобновить подписку.",
+            },
+        )
+
     if getattr(sub, "is_trial", False):
         raise HTTPException(
             status_code=403,
@@ -459,7 +468,6 @@ def ensure_can_delete_subscription(*, sub: Subscription) -> None:
                 "message": "Trial-подписки нельзя удалять вручную.",
             },
         )
-
 
 async def build_usage_snapshot(
     db: AsyncSession,
