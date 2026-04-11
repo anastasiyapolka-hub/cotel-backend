@@ -45,13 +45,6 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
             .where(Subscription.is_active == True)  # noqa: E712
             .where(
                 or_(
-                    Subscription.is_trial == False,  # noqa: E712
-                    Subscription.trial_ends_at.is_(None),
-                    Subscription.trial_ends_at > now_utc,
-                )
-            )
-            .where(
-                or_(
                     SubscriptionState.next_run_at.is_(None),
                     SubscriptionState.next_run_at <= now_utc,
                 )

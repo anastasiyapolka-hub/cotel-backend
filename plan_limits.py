@@ -166,7 +166,6 @@ def ensure_frequency_within_plan(*, requested_frequency_minutes: int, plan: Plan
             },
         )
 
-
 async def expire_trial_subscription_if_needed(
     db: AsyncSession,
     *,
@@ -176,6 +175,21 @@ async def expire_trial_subscription_if_needed(
     now_utc = now_utc or utc_now()
 
     if not getattr(sub, "is_trial", False):
+        return False
+
+    owner_user_id = getattr(sub, "owner_user_id", None)
+    if not owner_user_id:
+        return False
+
+    user_res = await db.execute(
+        select(User).where(User.id == owner_user_id)
+    )
+    owner_user = user_res.scalar_one_or_none()
+    if not owner_user:
+        return False
+
+    # Trial-логика действует только пока пользователь на Free
+    if str(owner_user.plan or "").lower() != "free":
         return False
 
     trial_ends_at = getattr(sub, "trial_ends_at", None)
@@ -190,7 +204,6 @@ async def expire_trial_subscription_if_needed(
         return True
 
     return False
-
 
 async def enforce_qa_limits(
     db: AsyncSession,

@@ -112,6 +112,76 @@ async def get_account_plan_usage(
 ):
     return await build_usage_snapshot(db, user=user)
 
+@app.post("/account/change-plan")
+async def change_account_plan(
+    payload: ChangePlanRequest,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    target_plan = str(payload.target_plan).strip().lower()
+
+    plan_res = await db.execute(
+        select(Plan).where(
+            Plan.code == target_plan,
+            Plan.is_active == True,  # noqa: E712
+        )
+    )
+    plan_row = plan_res.scalar_one_or_none()
+    if not plan_row:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "PLAN_NOT_FOUND",
+                "message": "Выбранный тариф не найден или неактивен.",
+            },
+        )
+
+    old_plan = str(user.plan or "").lower()
+
+    user.plan = target_plan
+    user.updated_at = sa.func.now()
+
+    # Сбрасываем только счётчики Q&A
+    await db.execute(
+        delete(UsageCounter).where(
+            UsageCounter.user_id == user.id,
+            UsageCounter.metric_code == "qa_request",
+        )
+    )
+
+    db.add(
+        UsageEvent(
+            user_id=user.id,
+            event_type="plan_changed_manual",
+            status="success_counted",
+            meta_json={
+                "old_plan": old_plan,
+                "new_plan": target_plan,
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(user)
+
+    return {
+        "ok": True,
+        "message": f"Тариф изменён на {target_plan}.",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "plan": user.plan,
+            "is_email_verified": user.is_email_verified,
+            "is_active": user.is_active,
+            "country_code": user.country_code,
+            "language": user.language,
+            "language_source": user.language_source,
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+            "phone": user.phone,
+        },
+        "usage": await build_usage_snapshot(db, user=user),
+    }
+
 def sha256_hex(s: str) -> str:
     import hashlib
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -195,6 +265,8 @@ def serialize_chat_history_row(row: UserChatHistory) -> dict:
 
 class SubscriptionSwitchModeRequest(BaseModel):
     target_source_mode: Literal["personal", "service"]
+class ChangePlanRequest(BaseModel):
+    target_plan: Literal["free", "basic", "pro"]
 
 async def prepare_subscription_target(
     db: AsyncSession,
@@ -1394,6 +1466,18 @@ async def list_chat_history(
 ):
     limit = max(1, min(int(limit or 30), 30))
     source_mode = (source_mode or "personal").strip().lower()
+
+    plan_snapshot = await build_usage_snapshot(db, user=user)
+    plan_info = plan_snapshot.get("plan") or {}
+
+    if not plan_info.get("has_chat_history", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PLAN_CHAT_HISTORY_NOT_AVAILABLE",
+                "message": "История чатов недоступна на вашем тарифе.",
+            },
+        )
 
     if source_mode not in {"personal", "service"}:
         raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
