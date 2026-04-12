@@ -77,6 +77,9 @@ from plan_limits import (
     expire_trial_subscription_if_needed,
 )
 
+class ChangePlanRequest(BaseModel):
+    target_plan: Literal["free", "basic", "pro"]
+
 app = FastAPI()
 
 app.add_middleware(
@@ -265,8 +268,6 @@ def serialize_chat_history_row(row: UserChatHistory) -> dict:
 
 class SubscriptionSwitchModeRequest(BaseModel):
     target_source_mode: Literal["personal", "service"]
-class ChangePlanRequest(BaseModel):
-    target_plan: Literal["free", "basic", "pro"]
 
 async def prepare_subscription_target(
     db: AsyncSession,
