@@ -10,10 +10,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from db.session import AsyncSessionLocal  # см. db/session.py :contentReference[oaicite:4]{index=4}
 from db.models import Subscription, SubscriptionState, MatchEvent, DigestEvent
 import os
-from main import (
-    parse_iso_ts,
-    call_openai_subscription_match,
-    call_openai_subscription_digest,
+from main import parse_iso_ts
+from llm.service import (
+    classify_subscription_matches,
+    build_subscription_digest,
 )
 from plan_limits import utc_now
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
@@ -190,8 +190,8 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
 
         chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
 
-        llm_json = await call_openai_subscription_digest(
-            prompt=sub.prompt,  # prompt пользователя обязателен
+        llm_json = await build_subscription_digest(
+            prompt=sub.prompt,
             chat_title=chat_title,
             messages=msgs,
         )
@@ -294,7 +294,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     ]
     newest_id = max(ids) if ids else last_message_id
 
-    llm_json = await call_openai_subscription_match(
+    llm_json = await classify_subscription_matches(
         prompt=sub.prompt,
         chat_title=getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat",
         messages=msgs,

@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 import random
 import sqlalchemy as sa
-from openai import AsyncOpenAI
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import TelegramClient, errors, functions, types
@@ -22,7 +21,7 @@ from db.models import (
     ServiceAccountStatusHistory,
 )
 from telegram_service import decrypt_session
-
+from llm.service import summarize_chat_messages
 
 # =========================
 # Константы MVP
@@ -57,7 +56,6 @@ def get_usage_role_chain(operation_kind: str) -> list[str]:
         SERVICE_USAGE_ROLE_SUBSCRIPTIONS,
     ]
 
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 api_id = int(os.environ["TELEGRAM_API_ID"])
 api_hash = os.environ["TELEGRAM_API_HASH"]
@@ -777,44 +775,11 @@ async def summarize_chat(
     chat_name: str,
     text_messages: list[dict],
 ) -> str:
-    if not text_messages:
-        return "В чате нет текстовых сообщений для анализа."
-
-    lines = []
-    for msg in text_messages:
-        date = msg.get("date") or ""
-        sender = msg.get("from") or "Unknown"
-        text = msg.get("text") or ""
-        lines.append(f"[{date}] {sender}: {text}")
-
-    context = "\n".join(lines)
-
-    system_prompt = (
-        "Ты аналитик переписок в Telegram.\n"
-        "Тебе даётся фрагмент чата и запрос пользователя.\n"
-        "Найди по смыслу релевантные сообщения и дай краткое, структурированное summary по-русски.\n"
-        "Если информации мало, честно скажи об этом."
+    return await summarize_chat_messages(
+        user_query=user_query,
+        chat_name=chat_name,
+        text_messages=text_messages,
     )
-
-    user_prompt = (
-        f"Название чата: {chat_name}\n\n"
-        f"Запрос пользователя:\n{user_query}\n\n"
-        "Ниже переписка (от старых к новым сообщениям):\n\n"
-        f"{context}\n\n"
-        "Сделай ответ именно по запросу выше. Структурируй ответ в 3–6 абзацев или списком."
-    )
-
-    completion = await openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
-
-    return completion.choices[0].message.content.strip()
-
 
 async def validate_service_subscription_target(
     db: AsyncSession,
