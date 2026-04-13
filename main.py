@@ -1045,7 +1045,7 @@ async def tg_analyze_chat(
 
     chat_name = getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
 
-    summary = await call_openai_summary(
+    summary = await summarize_chat_messages(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=messages,
