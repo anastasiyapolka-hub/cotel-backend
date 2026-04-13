@@ -1610,6 +1610,15 @@ async def create_subscription(
         trial_started_at=trial_started_at,
         trial_ends_at=trial_ends_at,
     )
+
+    user_plan_code = str(getattr(user, "plan", "") or "").strip().lower()
+    if user_plan_code == "free":
+        sub.is_trial = True
+        sub.trial_started_at = trial_started_at or datetime.now(timezone.utc)
+        sub.trial_ends_at = trial_ends_at or (
+                sub.trial_started_at + timedelta(days=int(plan.trial_subscription_duration_days))
+        )
+
     db.add(sub)
     await db.flush()
 
