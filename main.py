@@ -1437,6 +1437,7 @@ async def update_subscription(
     sub.chat_id = chat_id
     sub.frequency_minutes = payload.frequency_minutes
     sub.prompt = payload.prompt
+    sub.ai_model = payload.ai_model or "openai:gpt-4.1-mini"
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
@@ -1564,6 +1565,7 @@ async def create_subscription(
         is_trial=is_trial,
         trial_started_at=trial_started_at,
         trial_ends_at=trial_ends_at,
+        ai_model=payload.ai_model or "openai:gpt-4.1-mini",
     )
 
     user_plan_code = str(getattr(user, "plan", "") or "").strip().lower()

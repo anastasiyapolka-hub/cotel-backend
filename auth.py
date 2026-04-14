@@ -5,6 +5,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
@@ -18,6 +19,7 @@ from passlib.context import CryptContext
 from db.session import get_db
 from db.models import User, EmailVerificationCode, Session
 from email_service import send_verification_email
+from telegram_service import logout_telegram
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -38,22 +40,25 @@ EMAIL_RE = re.compile(r"^.{1,320}$")
 # -------------------------
 # Pydantic schemas (минимум)
 # -------------------------
-
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
     password_confirm: str
     country_code: Optional[str] = None
+    timezone: Optional[str] = None
     language: Optional[str] = None
     language_source: Optional[str] = None
+
 
 class VerifyEmailIn(BaseModel):
     email: EmailStr
     code: str
 
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
 
 class MeOut(BaseModel):
     id: int
@@ -62,27 +67,38 @@ class MeOut(BaseModel):
     is_email_verified: bool
     is_active: bool
     country_code: Optional[str] = None
+    timezone: str
     language: Optional[str] = None
     language_source: Optional[str] = None
     last_login_at: Optional[datetime] = None
     phone: Optional[str] = None
+    logout_revokes_telegram: bool = False
+    default_ai_model: str = "openai:gpt-4.1-mini"
+
 
 class AuthSessionOut(MeOut):
     session_id: Optional[str] = None
 
+
 class CheckEmailIn(BaseModel):
     email: EmailStr
+
 
 class CheckEmailOut(BaseModel):
     exists: bool
 
+
 class ResendVerifyCodeIn(BaseModel):
     email: EmailStr
+
 
 class UpdatePreferencesIn(BaseModel):
     language: str
     language_source: Optional[str] = "manual"
     phone: Optional[str] = None
+    timezone: Optional[str] = None
+    logout_revokes_telegram: Optional[bool] = None
+    default_ai_model: Optional[str] = None
 
 # -------------------------
 # Helpers
@@ -128,6 +144,27 @@ def _normalize_country_code(value: Optional[str]) -> Optional[str]:
     if len(code) != 2 or not code.isalpha():
         raise HTTPException(status_code=400, detail="COUNTRY_CODE_INVALID")
     return code
+
+def _normalize_timezone(value: Optional[str]) -> str:
+    tz = str(value or "").strip()
+    if not tz:
+        return "UTC"
+
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        raise HTTPException(status_code=400, detail="TIMEZONE_INVALID")
+
+    return tz
+
+
+def _normalize_ai_model(value: Optional[str]) -> str:
+    raw = str(value or "").strip().lower()
+    allowed = {
+        "openai:gpt-4.1-mini",
+        "anthropic:claude-sonnet-4-6",
+    }
+    return raw if raw in allowed else "openai:gpt-4.1-mini"
 
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -252,6 +289,7 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
     _validate_password_policy(payload.password)
     password_hash = pwd_context.hash(payload.password)
     country_code = _normalize_country_code(payload.country_code)
+    timezone = _normalize_timezone(payload.timezone)
     language = _normalize_language(payload.language)
     language_source = _normalize_language_source(payload.language_source)
 
@@ -259,11 +297,14 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
         email=email,
         password_hash=password_hash,
         is_email_verified=False,
-        is_active=False,  # до verify
+        is_active=False,
         plan="free",
         country_code=country_code,
+        timezone=timezone,
         language=language,
         language_source=language_source,
+        logout_revokes_telegram=False,
+        default_ai_model="openai:gpt-4.1-mini",
     )
 
     try:
@@ -428,6 +469,9 @@ async def verify_email(payload: VerifyEmailIn, request: Request, response: Respo
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
         country_code=user.country_code,
+        timezone=user.timezone,
+        logout_revokes_telegram=bool(user.logout_revokes_telegram),
+        default_ai_model=user.default_ai_model,
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
@@ -470,6 +514,9 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
         country_code=user.country_code,
+        timezone=user.timezone,
+        logout_revokes_telegram=bool(user.logout_revokes_telegram),
+        default_ai_model=user.default_ai_model,
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
@@ -480,19 +527,41 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
 
 @router.post("/logout")
 async def logout(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    user: User | None = None
     raw = _extract_raw_session_id(request)
+
     if raw:
         session_hash = _sha256_hex(raw)
-        await db.execute(
-            update(Session)
-            .where(Session.session_hash == session_hash, Session.revoked_at.is_(None))
-            .values(revoked_at=_now())
+
+        q = (
+            select(Session, User)
+            .join(User, User.id == Session.user_id)
+            .where(
+                Session.session_hash == session_hash,
+                Session.revoked_at.is_(None),
+                Session.expires_at > _now(),
+            )
         )
-        await db.commit()
+        row = (await db.execute(q)).first()
+        if row:
+            sess, user = row[0], row[1]
+
+            await db.execute(
+                update(Session)
+                .where(Session.session_hash == session_hash, Session.revoked_at.is_(None))
+                .values(revoked_at=_now())
+            )
+            await db.commit()
+
+    if user and bool(user.logout_revokes_telegram):
+        try:
+            await logout_telegram(db, int(user.id))
+        except Exception:
+            # logout из CoTel не должен ломаться из-за Telegram revoke
+            pass
 
     _clear_session_cookie(response)
     return {"status": "ok"}
-
 
 @router.get("/me", response_model=MeOut)
 async def me(user: User = Depends(get_current_user_from_cookie)):
@@ -503,6 +572,9 @@ async def me(user: User = Depends(get_current_user_from_cookie)):
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
         country_code=user.country_code,
+        timezone=user.timezone,
+        logout_revokes_telegram=bool(user.logout_revokes_telegram),
+        default_ai_model=user.default_ai_model,
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
@@ -527,6 +599,13 @@ async def update_preferences(
     user.language = _normalize_language(payload.language)
     user.language_source = _normalize_language_source(payload.language_source)
     user.phone = _normalize_phone(payload.phone)
+    user.timezone = _normalize_timezone(payload.timezone)
+
+    if payload.logout_revokes_telegram is not None:
+        user.logout_revokes_telegram = bool(payload.logout_revokes_telegram)
+
+    if payload.default_ai_model is not None:
+        user.default_ai_model = _normalize_ai_model(payload.default_ai_model)
 
     try:
         await db.commit()
@@ -544,9 +623,12 @@ async def update_preferences(
         is_email_verified=user.is_email_verified,
         is_active=user.is_active,
         country_code=user.country_code,
+        timezone=user.timezone,
         language=user.language,
         language_source=user.language_source,
         last_login_at=user.last_login_at,
+        logout_revokes_telegram=bool(user.logout_revokes_telegram),
+        default_ai_model=user.default_ai_model,
     )
 
 get_current_user = get_current_user_from_cookie

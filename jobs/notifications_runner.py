@@ -10,8 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal
-from db.models import Subscription, MatchEvent, DigestEvent, BotUserLink
-
+from db.models import Subscription, MatchEvent, DigestEvent, BotUserLink, User
 # используем уже существующие функции из main.py
 from main import build_tg_message_link, bot_send_message
 
@@ -269,28 +268,28 @@ async def _reserve_digest_events(db, now_utc: datetime) -> list[int]:
 
 async def _load_digest_events_with_subscriptions(db, event_ids: list[int]):
     q = (
-        select(DigestEvent, Subscription)
+        select(DigestEvent, Subscription, User)
         .join(Subscription, Subscription.id == DigestEvent.subscription_id)
+        .join(User, User.id == Subscription.owner_user_id)
         .where(DigestEvent.id.in_(event_ids))
         .order_by(DigestEvent.subscription_id.asc(), DigestEvent.id.asc())
     )
     return list((await db.execute(q)).all())
 
 
-def _format_digest_message(sub: Subscription, ev: DigestEvent) -> str:
-    """
-    Формат:
-      заголовок: “Резюме по подписке: {name}”
-      период: {window_start} — {window_end}
-      тело: digest_text
-    """
+def _format_digest_message(sub: Subscription, ev: DigestEvent, user: User) -> str:
+
     title = f"Резюме по подписке: {sub.name or f'#{sub.id}'}"
+
+    # Формат:
+    #     заголовок: “Резюме по подписке: {name}”
+    #      период: {window_start} — {window_end}
+    #      тело: digest_text
 
     ws_dt = getattr(ev, "window_start", None)
     we_dt = getattr(ev, "window_end", None)
 
-    # MVP: TZ пока константой (позже возьмём из users.timezone)
-    tz_name = os.getenv("DEV_USER_TZ", "Asia/Almaty")  # UTC+5
+    tz_name = getattr(user, "timezone", None) or "UTC"
 
     if ws_dt and we_dt:
         period_human = format_period_variant_f(ws_dt, we_dt, tz_name)
@@ -408,8 +407,7 @@ async def run_tick() -> int:
         async with AsyncSessionLocal() as db:
             rows = await _load_digest_events_with_subscriptions(db, digest_ids)
 
-            # Здесь можно отправлять 1 сообщение на DigestEvent (как ты и сказала — проще)
-            for ev, sub in rows:
+            for ev, sub, user in rows:
                 owner_user_id = getattr(sub, "owner_user_id", None)
                 if not owner_user_id:
                     print(f"[notifications_runner] DIGEST_SKIP sub_id={sub.id} ev_id={ev.id} reason=NO_OWNER_USER_ID")
@@ -432,7 +430,7 @@ async def run_tick() -> int:
                     if not dest_chat_id:
                         raise RuntimeError(f"NO_BOT_USER_LINK owner_user_id={owner_user_id}")
 
-                    text = _format_digest_message(sub, ev)
+                    text = _format_digest_message(sub, ev, user)
                     await bot_send_message(chat_id=int(dest_chat_id), text=text)
 
                     await _mark_digest_events(db, [int(ev.id)], STATUS_SENT)
