@@ -34,6 +34,7 @@ class Subscription(Base):
 
     frequency_minutes = Column(Integer, nullable=False, default=60)  # 60=час, 1440=день
     prompt = Column(Text, nullable=False)
+    ai_model = Column(String(64), nullable=False, server_default="openai:gpt-4.1-mini")
 
     # Главное поле для расчёта "активных подписок"
     is_active = Column(Boolean, nullable=False, default=True)
@@ -60,7 +61,6 @@ class Subscription(Base):
         sa.Index("ix_subscriptions_owner_active", "owner_user_id", "is_active"),
         sa.Index("ix_subscriptions_owner_trial", "owner_user_id", "is_trial"),
     )
-
 
 class SubscriptionState(Base):
     __tablename__ = "subscription_state"
@@ -127,7 +127,6 @@ class DigestEvent(Base):
         UniqueConstraint("subscription_id", "end_message_id", name="uq_digest_subscription_endmsg"),
         sa.Index("ix_digest_subscription_created", "subscription_id", "created_at"),
     )
-
 
 class BotUserLink(Base):
     __tablename__ = "bot_user_link"
@@ -217,6 +216,10 @@ class User(Base):
     country_code = Column(String(2), nullable=True, index=True)
     language = Column(String(5), nullable=True, server_default="en")
     language_source = Column(String(10), nullable=True, server_default="auto")
+
+    timezone = Column(String(64), nullable=False, server_default="UTC")
+    logout_revokes_telegram = Column(Boolean, nullable=False, server_default=sa.text("false"))
+    default_ai_model = Column(String(64), nullable=False, server_default="openai:gpt-4.1-mini")
 
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
