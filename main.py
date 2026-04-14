@@ -1354,51 +1354,6 @@ async def delete_chat_history_item(
 
     return {"status": "ok", "deleted_id": history_id}
 
-@app.post("/subscriptions", response_model=SubscriptionOut)
-async def create_subscription(
-    payload: SubscriptionCreate,
-    user: User = Depends(auth_get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    sub = Subscription(
-        owner_user_id=user.id,     # <-- ВАЖНО
-        name=payload.name,
-        source_mode=payload.source_mode,
-        chat_ref=payload.chat_ref,
-        chat_id=None,
-        frequency_minutes=payload.frequency_minutes,
-        prompt=payload.prompt,
-        subscription_type=payload.subscription_type,
-        is_active=payload.is_active,
-        status="active" if payload.is_active else "paused",
-        last_error=None,
-    )
-    if sub.owner_user_id != user.id:
-        raise HTTPException(status_code=403, detail="FORBIDDEN")
-
-    db.add(sub)
-
-    try:
-        await db.flush()  # чтобы получить sub.id без commit
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=409, detail="SUBSCRIPTION_CONFLICT")
-
-    # 2) сразу создаём subscription_state
-    state = SubscriptionState(
-        subscription_id=sub.id,
-        last_message_id=None,
-        last_checked_at=None,
-        last_success_at=None,
-    )
-    db.add(state)
-
-    await db.commit()
-    await db.refresh(sub)
-
-    return sub
-
-
 @app.get("/subscriptions", response_model=list[SubscriptionOut])
 async def list_subscriptions(
     source_mode: str | None = None,
