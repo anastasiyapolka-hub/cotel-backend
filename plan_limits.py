@@ -490,6 +490,24 @@ async def build_usage_snapshot(
     plan = await get_user_plan(db, user)
     now_utc = utc_now()
 
+    changed = False
+
+    trial_res = await db.execute(
+        select(Subscription).where(
+            Subscription.owner_user_id == user.id,
+            Subscription.is_trial == True,  # noqa: E712
+        )
+    )
+    trial_subs = list(trial_res.scalars().all())
+
+    for sub in trial_subs:
+        expired = await expire_trial_subscription_if_needed(db, sub=sub, now_utc=now_utc)
+        if expired:
+            changed = True
+
+    if changed:
+        await db.commit()
+
     daily_used = await get_used_count(
         db,
         user_id=user.id,
@@ -506,6 +524,26 @@ async def build_usage_snapshot(
     )
     active_subscriptions = await count_active_subscriptions(db, user_id=user.id)
     trial_total = await count_trial_subscriptions_total(db, user_id=user.id)
+
+    live_trial_res = await db.execute(
+        select(func.count()).select_from(Subscription).where(
+            Subscription.owner_user_id == user.id,
+            Subscription.is_trial == True,  # noqa: E712
+            sa.or_(
+                Subscription.trial_ends_at.is_(None),
+                Subscription.trial_ends_at > now_utc,
+            ),
+        )
+    )
+    live_trial_count = int(live_trial_res.scalar_one() or 0)
+
+    free_trial_limit_reached = (
+            str(plan.code or "").lower() == "free"
+            and int(plan.trial_subscription_limit or 0) > 0
+            and int(trial_total) >= int(plan.trial_subscription_limit)
+    )
+
+    free_trial_expired = free_trial_limit_reached and live_trial_count == 0
 
     return {
         "plan": {
@@ -525,5 +563,7 @@ async def build_usage_snapshot(
             "monthly_used": int(monthly_used),
             "active_subscriptions": int(active_subscriptions),
             "trial_subscriptions_total": int(trial_total),
+            "free_trial_limit_reached": bool(free_trial_limit_reached),
+            "free_trial_expired": bool(free_trial_expired),
         },
     }
