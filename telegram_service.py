@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 from db.models import TelegramSession
 
+
 _qr_login = None  # telethon.tl.custom.qrlogin.QRLogin | None
 _qr_wait_task = None  # asyncio.Task | None
 
@@ -30,7 +31,7 @@ api_hash = os.environ["TELEGRAM_API_HASH"]
 
 # Создаём клиент сессии
 #tg_client = TelegramClient("session_cotel", api_id, api_hash) - старый код
-tg_client: TelegramClient | None = None
+tg_clients: dict[int, TelegramClient] = {}
 
 async def get_tg_client(db: AsyncSession, owner_user_id: int) -> TelegramClient:
     """
@@ -38,22 +39,27 @@ async def get_tg_client(db: AsyncSession, owner_user_id: int) -> TelegramClient:
     Если в БД есть сессия — поднимаем из неё.
     Если нет — создаём пустую сессию (для шага send_code / login).
     """
-    global tg_client
+    # Проверяем, есть ли уже клиент для этого пользователя
+    client = tg_clients.get(owner_user_id)
 
-    if tg_client is not None:
-        # Если уже поднят — просто убедимся, что соединение есть
-        if not tg_client.is_connected():
-            await tg_client.connect()
-        return tg_client
+    if client is not None:
+        if not client.is_connected():
+            await client.connect()
+        return client
 
     ss = await load_user_telegram_session(db, owner_user_id)
-    if ss:
-        tg_client = TelegramClient(StringSession(ss), api_id, api_hash)
-    else:
-        tg_client = TelegramClient(StringSession(), api_id, api_hash)
 
-    await tg_client.connect()
-    return tg_client
+    if ss:
+        client = TelegramClient(StringSession(ss), api_id, api_hash)
+    else:
+        client = TelegramClient(StringSession(), api_id, api_hash)
+
+    await client.connect()
+
+    # сохраняем клиент для конкретного пользователя
+    tg_clients[owner_user_id] = client
+
+    return client
 
 
 # ---- ВСПОМОГАТЕЛЬНЫЕ  ФУНКЦИИ ---------------------------------------
@@ -443,13 +449,14 @@ async def logout_telegram(db: AsyncSession, owner_user_id: int):
         if await client.is_user_authorized():
             await client.log_out()
     finally:
-        # на всякий случай рвём соединение, чтобы не держать sqlite-lock
+        # на всякий случай рвём соединение
         try:
             await client.disconnect()
-            global tg_client
-            tg_client = None
         except Exception:
             pass
+
+        # удаляем клиента именно этого пользователя из runtime-кэша
+        tg_clients.pop(owner_user_id, None)
 
         # чистим локальный файл сессии
         for fname in ["session_cotel.session", "session_cotel.session-journal"]:
