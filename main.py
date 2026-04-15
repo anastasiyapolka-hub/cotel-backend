@@ -1094,11 +1094,25 @@ async def tg_list_chats(
 
     try:
         chats = await list_user_chats(db, owner_user_id, limit=limit)
-        return {"status": "ok", "count": len(chats), "chats": chats}
+
+        return {
+            "status": "ok",
+            "count": len(chats),
+            "chats": chats,
+            "me": {
+                "id": me.id,
+                "username": me.username,
+                "first_name": me.first_name,
+                "last_name": me.last_name,
+            }
+        }
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_CHATS_FAILED: {str(e)}")
+
+
 @app.post("/tg/logout")
 async def tg_logout(
     user: User = Depends(auth_get_current_user),
