@@ -966,10 +966,13 @@ async def tg_confirm_code(payload: dict, user: User = Depends(auth_get_current_u
 
         return {
             "status": "authorized",
-            "user_id": me.id,
-            "username": me.username,
-            "first_name": me.first_name,
-            "phone": me.phone,
+            "me": {
+                "id": me.id,
+                "username": me.username,
+                "first_name": me.first_name,
+                "last_name": getattr(me, "last_name", None),
+                "phone": me.phone,
+            }
         }
 
     except HTTPException:
@@ -994,7 +997,6 @@ async def tg_password_encryption_start(
         "status": "ok",
         **data,
     }
-
 
 @app.post("/tg/confirm_password")
 async def tg_confirm_password(
@@ -1029,10 +1031,13 @@ async def tg_confirm_password(
 
         return {
             "status": "authorized",
-            "user_id": me.id,
-            "username": me.username,
-            "first_name": me.first_name,
-            "phone": me.phone,
+            "me": {
+                "id": me.id,
+                "username": me.username,
+                "first_name": me.first_name,
+                "last_name": getattr(me, "last_name", None),
+                "phone": me.phone,
+            }
         }
 
     except HTTPException:
