@@ -1,6 +1,9 @@
 # telegram_service.py
 import asyncio
 import os
+import base64
+import secrets
+from dataclasses import dataclass
 
 from typing import Optional, Tuple, List, Dict
 from datetime import datetime, timedelta, timezone
@@ -14,6 +17,9 @@ from telethon.errors import (
 from telethon.errors import InviteHashInvalidError, InviteHashExpiredError, UserAlreadyParticipantError
 
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
 from telethon.sessions import StringSession
 
 from sqlalchemy import select
@@ -32,6 +38,15 @@ api_hash = os.environ["TELEGRAM_API_HASH"]
 # Создаём клиент сессии
 #tg_client = TelegramClient("session_cotel", api_id, api_hash) - старый код
 tg_clients: dict[int, TelegramClient] = {}
+TG_PASSWORD_CONTEXT_TTL_SEC = 300  # 5 минут
+
+@dataclass
+class PasswordEncryptionContext:
+    owner_user_id: int
+    private_key_pem: str
+    expires_at: datetime
+
+_password_encryption_contexts: dict[str, PasswordEncryptionContext] = {}
 
 async def get_tg_client(db: AsyncSession, owner_user_id: int) -> TelegramClient:
     """
@@ -85,6 +100,93 @@ def decrypt_session(ciphertext: str) -> str:
         return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
     except InvalidToken as e:
         raise RuntimeError("Invalid TELEGRAM session ciphertext or key") from e
+
+def _cleanup_expired_password_contexts() -> None:
+    now = datetime.now(timezone.utc)
+    expired_ids = [
+        ctx_id
+        for ctx_id, ctx in _password_encryption_contexts.items()
+        if ctx.expires_at <= now
+    ]
+    for ctx_id in expired_ids:
+        _password_encryption_contexts.pop(ctx_id, None)
+
+
+def create_password_encryption_context(owner_user_id: int) -> dict:
+    _cleanup_expired_password_contexts()
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    public_key = private_key.public_key()
+
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    public_key_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+    context_id = secrets.token_urlsafe(24)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=TG_PASSWORD_CONTEXT_TTL_SEC)
+
+    _password_encryption_contexts[context_id] = PasswordEncryptionContext(
+        owner_user_id=owner_user_id,
+        private_key_pem=private_key_pem,
+        expires_at=expires_at,
+    )
+
+    return {
+        "context_id": context_id,
+        "public_key_pem": public_key_pem,
+        "expires_at": expires_at.isoformat(),
+    }
+
+def decrypt_password_ciphertext(
+    *,
+    owner_user_id: int,
+    context_id: str,
+    ciphertext_b64: str,
+) -> str:
+    _cleanup_expired_password_contexts()
+
+    ctx = _password_encryption_contexts.pop(context_id, None)
+    if not ctx:
+        raise ValueError("PASSWORD_ENCRYPTION_CONTEXT_INVALID")
+
+    if ctx.owner_user_id != owner_user_id:
+        raise ValueError("PASSWORD_ENCRYPTION_CONTEXT_INVALID")
+
+    if ctx.expires_at <= datetime.now(timezone.utc):
+        raise ValueError("PASSWORD_ENCRYPTION_CONTEXT_EXPIRED")
+
+    try:
+        private_key = serialization.load_pem_private_key(
+            ctx.private_key_pem.encode("utf-8"),
+            password=None,
+        )
+        plaintext = private_key.decrypt(
+            base64.b64decode(ciphertext_b64),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        password = plaintext.decode("utf-8").strip()
+    except Exception as e:
+        raise ValueError("PASSWORD_DECRYPT_FAILED") from e
+
+    if not password:
+        raise ValueError("PASSWORD_REQUIRED")
+
+    return password
+
 
 async def save_user_telegram_session(db: AsyncSession, owner_user_id: int, plain_string_session: str) -> None:
     cipher = encrypt_session(plain_string_session)

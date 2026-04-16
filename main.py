@@ -56,6 +56,8 @@ from telegram_service import (
     send_login_code,
     confirm_login,
     confirm_password,
+    create_password_encryption_context,
+    decrypt_password_ciphertext,
     get_current_user as tg_get_current_user,  # <-- переименовали
     fetch_chat_messages,
     list_user_chats,
@@ -981,6 +983,19 @@ async def tg_confirm_code(payload: dict, user: User = Depends(auth_get_current_u
             detail=f"TG_CONFIRM_FAILED: {str(e)}"
         )
 
+@app.post("/tg/password_encryption/start")
+async def tg_password_encryption_start(
+    user: User = Depends(auth_get_current_user),
+):
+    owner_user_id = user.id
+
+    data = create_password_encryption_context(owner_user_id)
+    return {
+        "status": "ok",
+        **data,
+    }
+
+
 @app.post("/tg/confirm_password")
 async def tg_confirm_password(
     payload: dict,
@@ -990,9 +1005,20 @@ async def tg_confirm_password(
     owner_user_id = user.id
 
     try:
-        password = (payload.get("password") or "").strip()
-        if not password:
-            raise HTTPException(status_code=400, detail="PASSWORD_REQUIRED")
+        context_id = (payload.get("encryption_context_id") or "").strip()
+        password_ciphertext = (payload.get("password_ciphertext") or "").strip()
+
+        if not context_id or not password_ciphertext:
+            raise HTTPException(status_code=400, detail="PASSWORD_ENCRYPTED_PAYLOAD_REQUIRED")
+
+        try:
+            password = decrypt_password_ciphertext(
+                owner_user_id=owner_user_id,
+                context_id=context_id,
+                ciphertext_b64=password_ciphertext,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
 
         await confirm_password(db, owner_user_id, password)
 
