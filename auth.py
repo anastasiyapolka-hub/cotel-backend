@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from passlib.context import CryptContext
 
 from db.session import get_db
-from db.models import User, EmailVerificationCode, Session
-from email_service import send_verification_email
+from db.models import User, EmailVerificationCode, PasswordResetCode, Session
+from email_service import send_verification_email, send_password_reset_email
 from telegram_service import logout_telegram
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -91,6 +91,14 @@ class CheckEmailOut(BaseModel):
 class ResendVerifyCodeIn(BaseModel):
     email: EmailStr
 
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirmIn(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+    new_password_confirm: str
 
 class UpdatePreferencesIn(BaseModel):
     language: str
@@ -240,6 +248,15 @@ async def _create_session(db: AsyncSession, user_id: int, request: Request) -> s
     await db.commit()
     return raw_session_id
 
+async def _revoke_all_user_sessions(db: AsyncSession, user_id: int) -> None:
+    await db.execute(
+        update(Session)
+        .where(
+            Session.user_id == user_id,
+            Session.revoked_at.is_(None),
+        )
+        .values(revoked_at=_now())
+    )
 
 async def get_current_user_from_cookie(
     request: Request,
@@ -418,6 +435,145 @@ async def resend_verification_code(
         out["dev_code"] = code
     return out
 
+@router.post("/password-reset/request")
+async def password_reset_request(
+    payload: PasswordResetRequestIn,
+    db: AsyncSession = Depends(get_db),
+):
+    email = payload.email.strip().lower()
+
+    r = await db.execute(select(User).where(User.email == email))
+    user = r.scalar_one_or_none()
+
+    # Не раскрываем, существует email или нет
+    if not user:
+        return {"status": "ok"}
+
+    now = _now()
+
+    r = await db.execute(
+        select(PasswordResetCode).where(PasswordResetCode.user_id == user.id)
+    )
+    rec = r.scalar_one_or_none()
+
+    if rec and rec.expires_at:
+        last_sent_at = rec.expires_at - timedelta(minutes=EMAIL_CODE_TTL_MIN)
+        retry_at = last_sent_at + timedelta(seconds=EMAIL_RESEND_COOLDOWN_SEC)
+
+        if now < retry_at:
+            retry_after = int((retry_at - now).total_seconds())
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "RESET_RESEND_COOLDOWN",
+                    "retry_after_sec": retry_after,
+                },
+            )
+
+    code = _make_email_code()
+    code_hash = _sha256_hex(code)
+    expires_at = now + timedelta(minutes=EMAIL_CODE_TTL_MIN)
+
+    if rec:
+        rec.code_hash = code_hash
+        rec.expires_at = expires_at
+        rec.used_at = None
+        rec.attempts = 0
+    else:
+        db.add(
+            PasswordResetCode(
+                user_id=user.id,
+                code_hash=code_hash,
+                expires_at=expires_at,
+                used_at=None,
+                attempts=0,
+            )
+        )
+
+    await db.commit()
+
+    try:
+        await send_password_reset_email(user.email, code, EMAIL_CODE_TTL_MIN)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
+
+    out = {"status": "ok"}
+    if DEV_RETURN_EMAIL_CODE:
+        out["dev_code"] = code
+    return out
+
+@router.post("/password-reset/confirm", response_model=AuthSessionOut)
+async def password_reset_confirm(
+    payload: PasswordResetConfirmIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    email = payload.email.strip().lower()
+    code = (payload.code or "").strip()
+    new_password = payload.new_password or ""
+    new_password_confirm = payload.new_password_confirm or ""
+
+    if not code:
+        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+
+    if new_password != new_password_confirm:
+        raise HTTPException(status_code=400, detail="PASSWORD_MISMATCH")
+
+    _validate_password_policy(new_password)
+
+    r = await db.execute(select(User).where(User.email == email))
+    user = r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="CODE_INVALID")
+
+    r = await db.execute(
+        select(PasswordResetCode).where(PasswordResetCode.user_id == user.id)
+    )
+    rec = r.scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=400, detail="CODE_NOT_FOUND")
+
+    if rec.used_at is not None:
+        raise HTTPException(status_code=400, detail="CODE_ALREADY_USED")
+
+    if rec.expires_at <= _now():
+        raise HTTPException(status_code=400, detail="CODE_EXPIRED")
+
+    if (rec.attempts or 0) >= 5:
+        raise HTTPException(status_code=429, detail="TOO_MANY_ATTEMPTS")
+
+    if _sha256_hex(code) != rec.code_hash:
+        rec.attempts = (rec.attempts or 0) + 1
+        await db.commit()
+        raise HTTPException(status_code=400, detail="CODE_INVALID")
+
+    rec.used_at = _now()
+    user.password_hash = pwd_context.hash(new_password)
+    user.last_login_at = _now()
+
+    await _revoke_all_user_sessions(db, user.id)
+    await db.commit()
+
+    raw_session_id = await _create_session(db, user.id, request)
+    _set_session_cookie(response, raw_session_id)
+
+    return AuthSessionOut(
+        id=user.id,
+        email=user.email,
+        plan=user.plan,
+        is_email_verified=user.is_email_verified,
+        is_active=user.is_active,
+        country_code=user.country_code,
+        timezone=user.timezone,
+        logout_revokes_telegram=bool(user.logout_revokes_telegram),
+        default_ai_model=user.default_ai_model,
+        language=user.language,
+        language_source=user.language_source,
+        last_login_at=user.last_login_at,
+        phone=user.phone,
+        session_id=raw_session_id,
+    )
 
 @router.post("/verify-email", response_model=AuthSessionOut)
 async def verify_email(payload: VerifyEmailIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):

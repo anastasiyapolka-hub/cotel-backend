@@ -418,6 +418,28 @@ class EmailVerificationCode(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
+class PasswordResetCode(Base):
+    __tablename__ = "password_reset_codes"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        unique=True,  # одна активная reset-запись на пользователя
+    )
+
+    code_hash = Column(String(64), nullable=False)
+
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+
+    attempts = Column(Integer, nullable=False, server_default="0")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 class Session(Base):
     __tablename__ = "sessions"
 

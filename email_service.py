@@ -41,6 +41,38 @@ def build_verify_email_text(code: str, ttl_minutes: int) -> str:
         f"Если это были не вы, просто проигнорируйте это письмо."
     )
 
+def build_password_reset_email_html(code: str, ttl_minutes: int) -> str:
+    return f"""
+    <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827;">
+      <h2 style="margin-bottom: 12px;">Сброс пароля в CoTel</h2>
+      <p>Мы получили запрос на сброс пароля для вашего аккаунта.</p>
+      <p>Ваш код для сброса пароля:</p>
+      <div style="
+        display: inline-block;
+        padding: 12px 18px;
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: 4px;
+        border-radius: 12px;
+        background: #f3f4f6;
+        border: 1px solid #e5e7eb;
+        margin: 8px 0 16px;
+      ">
+        {code}
+      </div>
+      <p>Код действует {ttl_minutes} минут.</p>
+      <p>Если это были не вы, просто проигнорируйте это письмо.</p>
+    </div>
+    """
+
+def build_password_reset_email_text(code: str, ttl_minutes: int) -> str:
+    return (
+        f"Сброс пароля в CoTel\n\n"
+        f"Мы получили запрос на сброс пароля для вашего аккаунта.\n\n"
+        f"Ваш код для сброса пароля: {code}\n"
+        f"Код действует {ttl_minutes} минут.\n\n"
+        f"Если это были не вы, просто проигнорируйте это письмо."
+    )
 
 async def send_verification_email(to_email: str, code: str, ttl_minutes: int) -> None:
     if not RESEND_API_KEY:
@@ -58,4 +90,21 @@ async def send_verification_email(to_email: str, code: str, ttl_minutes: int) ->
     }
 
     # SDK синхронный, поэтому уводим в thread, чтобы не блокировать event loop
+    await asyncio.to_thread(resend.Emails.send, params)
+
+async def send_password_reset_email(to_email: str, code: str, ttl_minutes: int) -> None:
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not set")
+
+    if not EMAIL_FROM:
+        raise RuntimeError("EMAIL_FROM is not set")
+
+    params = {
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": "Ваш код для сброса пароля CoTel",
+        "html": build_password_reset_email_html(code, ttl_minutes),
+        "text": build_password_reset_email_text(code, ttl_minutes),
+    }
+
     await asyncio.to_thread(resend.Emails.send, params)
