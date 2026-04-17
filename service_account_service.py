@@ -774,11 +774,13 @@ async def summarize_chat(
     user_query: str,
     chat_name: str,
     text_messages: list[dict],
+    ai_model: str,
 ) -> str:
     return await summarize_chat_messages(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=text_messages,
+        ai_model=ai_model,
     )
 
 async def validate_service_subscription_target(
@@ -1226,6 +1228,7 @@ async def analyze_chat_via_service_account(
     chat_link: str,
     user_query: str,
     days: int,
+    ai_model: str,
 ) -> dict:
     last_error: Optional[ServiceAccountError] = None
     normalized_ref = normalize_public_chat_ref(chat_link)
@@ -1259,6 +1262,7 @@ async def analyze_chat_via_service_account(
                 user_query=user_query,
                 chat_name=chat_name,
                 text_messages=messages,
+                ai_model=ai_model,
             )
 
             now = utcnow()
@@ -1298,6 +1302,7 @@ async def analyze_chat_via_service_account(
                 "chat_ref_normalized": normalized_ref,
                 "chat_id": getattr(entity, "id", None),
                 "chat_username": getattr(entity, "username", None),
+                "ai_model": ai_model,
             }
 
         except ServiceAccountError as e:

@@ -166,6 +166,34 @@ def ensure_frequency_within_plan(*, requested_frequency_minutes: int, plan: Plan
             },
         )
 
+DEFAULT_AI_MODEL = "openai:gpt-4.1-mini"
+CLAUDE_AI_MODEL = "anthropic:claude-sonnet-4-6"
+
+def resolve_ai_model_for_user(
+    *,
+    user: User,
+    requested_ai_model: Optional[str] = None,
+    fallback_ai_model: Optional[str] = None,
+) -> str:
+    plan_code = str(getattr(user, "plan", "") or "").strip().lower()
+
+    requested = str(requested_ai_model or "").strip().lower()
+    fallback = str(fallback_ai_model or "").strip().lower()
+
+    if plan_code == "free":
+        allowed = {DEFAULT_AI_MODEL}
+    else:
+        allowed = {DEFAULT_AI_MODEL, CLAUDE_AI_MODEL}
+
+
+    if requested in allowed:
+        return requested
+
+    if fallback in allowed:
+        return fallback
+
+    return DEFAULT_AI_MODEL
+
 async def expire_trial_subscription_if_needed(
     db: AsyncSession,
     *,

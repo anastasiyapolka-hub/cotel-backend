@@ -194,6 +194,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             prompt=sub.prompt,
             chat_title=chat_title,
             messages=msgs,
+            ai_model=sub.ai_model,
         )
 
         digest_text = ""
@@ -298,6 +299,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         prompt=sub.prompt,
         chat_title=getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat",
         messages=msgs,
+        ai_model=sub.ai_model,
     )
 
     matches = (llm_json.get("matches") or []) if isinstance(llm_json, dict) else []

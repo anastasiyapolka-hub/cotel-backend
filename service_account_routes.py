@@ -12,7 +12,12 @@ from service_account_service import (
     analyze_chat_via_service_account,
     normalize_public_chat_ref,
 )
-from plan_limits import enforce_qa_limits, record_qa_success, build_usage_snapshot
+from plan_limits import (
+    enforce_qa_limits,
+    record_qa_success,
+    build_usage_snapshot,
+    resolve_ai_model_for_user,
+)
 
 router = APIRouter()
 
@@ -21,7 +26,7 @@ class ServiceAnalyzeRequest(BaseModel):
     chat_link: str = Field(min_length=1)
     user_query: str = Field(default="")
     days: int = Field(default=7, ge=1, le=30)
-
+    ai_model: str | None = None
 
 @router.post("/tg/service/analyze_chat")
 async def tg_service_analyze_chat(
@@ -42,11 +47,18 @@ async def tg_service_analyze_chat(
     )
 
     try:
+        ai_model = resolve_ai_model_for_user(
+            user=user,
+            requested_ai_model=payload.ai_model,
+            fallback_ai_model=getattr(user, "default_ai_model", None),
+        )
+
         result = await analyze_chat_via_service_account(
             db,
             chat_link=payload.chat_link,
             user_query=payload.user_query.strip(),
             days=payload.days,
+            ai_model=ai_model,
         )
 
         normalized_ref = result.get("chat_ref_normalized") or normalize_public_chat_ref(payload.chat_link)
@@ -91,6 +103,7 @@ async def tg_service_analyze_chat(
         await db.commit()
 
         result["usage"] = await build_usage_snapshot(db, user=user)
+        result["ai_model"] = ai_model
         return result
 
     except ServiceAccountError as e:

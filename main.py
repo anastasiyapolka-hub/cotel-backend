@@ -82,6 +82,7 @@ from plan_limits import (
     enforce_qa_limits,
     record_qa_success,
     expire_trial_subscription_if_needed,
+    resolve_ai_model_for_user,
 )
 
 class ChangePlanRequest(BaseModel):
@@ -626,10 +627,11 @@ async def run_subscriptions(
                 chat_title = getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat"
 
                 if sub_type == "events":
-                    llm_json = await call_openai_subscription_match(
+                    llm_json = await classify_subscription_matches(
                         prompt=sub.prompt,
                         chat_title=chat_title,
                         messages=msgs,
+                        ai_model=sub.ai_model,
                     )
 
                     sub_report["llm_found"] = bool(llm_json.get("found")) if isinstance(llm_json, dict) else None
@@ -1057,6 +1059,13 @@ async def tg_analyze_chat(
     user_query = (payload.get("user_query") or "").strip()
     days = int(payload.get("days") or 7)
 
+    requested_ai_model = payload.get("ai_model")
+    ai_model = resolve_ai_model_for_user(
+        user=user,
+        requested_ai_model=requested_ai_model,
+        fallback_ai_model=getattr(user, "default_ai_model", None),
+    )
+
     me = await tg_get_current_user(db, owner_user_id)
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
@@ -1080,6 +1089,7 @@ async def tg_analyze_chat(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=messages,
+        ai_model=ai_model,
     )
 
     await upsert_user_chat_history(
@@ -1108,6 +1118,7 @@ async def tg_analyze_chat(
         "chat_name": chat_name,
         "messages_count": len(messages),
         "source_mode": "personal",
+        "ai_model": ai_model,
         "usage": await build_usage_snapshot(db, user=user),
     }
 
@@ -1475,6 +1486,12 @@ async def update_subscription(
         chat_ref=payload.chat_ref,
     )
 
+    ai_model = resolve_ai_model_for_user(
+        user=user,
+        requested_ai_model=payload.ai_model,
+        fallback_ai_model=getattr(user, "default_ai_model", None),
+    )
+
     sub.name = payload.name
     sub.source_mode = payload.source_mode
     sub.subscription_type = payload.subscription_type or "events"
@@ -1482,7 +1499,7 @@ async def update_subscription(
     sub.chat_id = chat_id
     sub.frequency_minutes = payload.frequency_minutes
     sub.prompt = payload.prompt
-    sub.ai_model = payload.ai_model or "openai:gpt-4.1-mini"
+    sub.ai_model = ai_model
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
     sub.last_error = None
@@ -1595,6 +1612,12 @@ async def create_subscription(
         chat_ref=payload.chat_ref,
     )
 
+    ai_model = resolve_ai_model_for_user(
+        user=user,
+        requested_ai_model=payload.ai_model,
+        fallback_ai_model=getattr(user, "default_ai_model", None),
+    )
+
     sub = Subscription(
         owner_user_id=user.id,
         name=payload.name,
@@ -1610,7 +1633,7 @@ async def create_subscription(
         is_trial=is_trial,
         trial_started_at=trial_started_at,
         trial_ends_at=trial_ends_at,
-        ai_model=payload.ai_model or "openai:gpt-4.1-mini",
+        ai_model=ai_model,
     )
 
     user_plan_code = str(getattr(user, "plan", "") or "").strip().lower()
