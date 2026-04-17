@@ -10,14 +10,30 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from passlib.context import CryptContext
 
 from db.session import get_db
-from db.models import User, EmailVerificationCode, PasswordResetCode, Session
+from db.models import (
+    User,
+    EmailVerificationCode,
+    PasswordResetCode,
+    Session,
+    TelegramSession,
+    UserChatHistory,
+    Subscription,
+    SubscriptionState,
+    MatchEvent,
+    DigestEvent,
+    BotUserLink,
+    BotLinkCode,
+    UsageCounter,
+    UsageEvent,
+)
+
 from email_service import send_verification_email, send_password_reset_email
 from telegram_service import logout_telegram
 
@@ -107,6 +123,15 @@ class UpdatePreferencesIn(BaseModel):
     timezone: Optional[str] = None
     logout_revokes_telegram: Optional[bool] = None
     default_ai_model: Optional[str] = None
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+    new_password_confirm: str
+
+class DeleteAccountIn(BaseModel):
+    current_password: str
+    confirm_text: str
 
 # -------------------------
 # Helpers
@@ -247,6 +272,26 @@ async def _create_session(db: AsyncSession, user_id: int, request: Request) -> s
     )
     await db.commit()
     return raw_session_id
+
+async def _revoke_user_sessions(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    except_raw_session_id: Optional[str] = None,
+) -> None:
+    stmt = (
+        update(Session)
+        .where(
+            Session.user_id == user_id,
+            Session.revoked_at.is_(None),
+        )
+        .values(revoked_at=_now())
+    )
+
+    if except_raw_session_id:
+        stmt = stmt.where(Session.session_hash != _sha256_hex(except_raw_session_id))
+
+    await db.execute(stmt)
 
 async def _revoke_all_user_sessions(db: AsyncSession, user_id: int) -> None:
     await db.execute(
@@ -786,5 +831,96 @@ async def update_preferences(
         logout_revokes_telegram=bool(user.logout_revokes_telegram),
         default_ai_model=user.default_ai_model,
     )
+
+@router.post("/change-password")
+async def change_password(
+    payload: ChangePasswordIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user_from_cookie),
+):
+    current_password = payload.current_password or ""
+    new_password = payload.new_password or ""
+    new_password_confirm = payload.new_password_confirm or ""
+
+    if not user.password_hash:
+        raise HTTPException(status_code=400, detail="PASSWORD_NOT_SET")
+
+    if not pwd_context.verify(current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="CURRENT_PASSWORD_INVALID")
+
+    if new_password != new_password_confirm:
+        raise HTTPException(status_code=400, detail="PASSWORD_MISMATCH")
+
+    _validate_password_policy(new_password)
+
+    if pwd_context.verify(new_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="PASSWORD_SAME_AS_CURRENT")
+
+    user.password_hash = pwd_context.hash(new_password)
+    user.updated_at = _now()
+
+    raw_current_session = _extract_raw_session_id(request)
+    await _revoke_user_sessions(
+        db,
+        user.id,
+        except_raw_session_id=raw_current_session,
+    )
+
+    await db.commit()
+
+    return {"status": "ok"}
+
+@router.post("/delete-account")
+async def delete_account(
+    payload: DeleteAccountIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user_from_cookie),
+):
+    current_password = payload.current_password or ""
+    confirm_text = (payload.confirm_text or "").strip()
+
+    if confirm_text.upper() != "DELETE":
+        raise HTTPException(status_code=400, detail="DELETE_CONFIRM_TEXT_INVALID")
+
+    if not user.password_hash:
+        raise HTTPException(status_code=400, detail="PASSWORD_NOT_SET")
+
+    if not pwd_context.verify(current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="CURRENT_PASSWORD_INVALID")
+
+    try:
+        await logout_telegram(db, int(user.id))
+    except Exception:
+        pass
+
+    await db.execute(delete(Session).where(Session.user_id == user.id))
+    await db.execute(delete(TelegramSession).where(TelegramSession.owner_user_id == user.id))
+    await db.execute(delete(UserChatHistory).where(UserChatHistory.owner_user_id == user.id))
+    await db.execute(delete(BotUserLink).where(BotUserLink.owner_user_id == user.id))
+    await db.execute(delete(BotLinkCode).where(BotLinkCode.user_id == user.id))
+    await db.execute(delete(EmailVerificationCode).where(EmailVerificationCode.user_id == user.id))
+    await db.execute(text("DELETE FROM password_reset_codes WHERE user_id = :user_id"), {"user_id": user.id})
+    await db.execute(delete(UsageCounter).where(UsageCounter.user_id == user.id))
+    await db.execute(delete(UsageEvent).where(UsageEvent.user_id == user.id))
+
+    await db.execute(delete(Subscription).where(Subscription.owner_user_id == user.id))
+    # дочерние subscription_state / match_events / digest_events удалятся каскадно через FK ondelete="CASCADE"
+
+    user.email = None
+    user.phone = None
+    user.password_hash = None
+    user.is_email_verified = False
+    user.is_active = False
+    user.logout_revokes_telegram = False
+    user.updated_at = _now()
+
+    await db.commit()
+
+    _clear_session_cookie(response)
+    return {"status": "ok"}
+
 
 get_current_user = get_current_user_from_cookie
