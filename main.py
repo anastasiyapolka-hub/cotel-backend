@@ -90,18 +90,63 @@ class ChangePlanRequest(BaseModel):
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "https://cotel.onrender.com",
+    "https://cotel-backend.onrender.com",
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:5500",
+    "http://127.0.0.1:8080",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://cotel.onrender.com",
-        "https://cotel-backend.onrender.com",
-        "http://localhost:3000",
-        "http://127.0.0.1:5500",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https://([a-z0-9-]+\.)*onrender\.com$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Authorization",
+        "Content-Type",
+        "Origin",
+        "X-Requested-With",
+    ],
+    expose_headers=["*"],
+    max_age=600,
 )
+
+
+# Fallback: ensure CORS headers are attached even when an unhandled exception
+# occurs deep in a route (otherwise the browser sees "No CORS headers" and
+# reports a misleading CORS error instead of the real 5xx).
+@app.exception_handler(Exception)
+async def _cors_safe_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    origin = request.headers.get("origin", "")
+    headers = {}
+    if origin in ALLOWED_ORIGINS or (
+        origin.startswith("https://") and origin.endswith(".onrender.com")
+    ):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+
+    # Re-raise HTTPException so FastAPI's own handler formats it normally
+    from fastapi import HTTPException
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers,
+        )
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"INTERNAL_ERROR: {type(exc).__name__}"},
+        headers=headers,
+    )
 app.include_router(auth_router)
 app.include_router(service_account_router)
 app.include_router(service_account_admin_router)
