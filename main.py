@@ -870,7 +870,10 @@ async def analyze_chat(
     if not file.filename.lower().endswith(".json"):
         raise HTTPException(
             status_code=400,
-            detail="Ожидается JSON-файл экспорта Telegram (.json)",
+            detail={
+                "code": "TG_JSON_EXPORT_REQUIRED",
+                "message": "Ожидается JSON-файл экспорта Telegram (.json).",
+            },
         )
 
     # 2. Читаем файл в память
@@ -882,7 +885,10 @@ async def analyze_chat(
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=400,
-            detail="Ошибка: Файл не является корректным JSON."
+            detail={
+                "code": "TG_JSON_INVALID",
+                "message": "Файл не является корректным JSON.",
+            },
         )
 
     # 4. Проверка структуры Telegram экспорта (опционально)
@@ -890,13 +896,19 @@ async def analyze_chat(
     if messages is None:
         raise HTTPException(
             status_code=400,
-            detail="JSON не содержит поле 'messages'. Возможно, экспорт выполнен в HTML-формате."
+            detail={
+                "code": "TG_JSON_NO_MESSAGES",
+                "message": "JSON не содержит поле 'messages'. Возможно, экспорт выполнен в HTML-формате.",
+            },
         )
 
     if not isinstance(messages, list):
         raise HTTPException(
             status_code=400,
-            detail="Поле 'messages' должно быть списком сообщений"
+            detail={
+                "code": "TG_JSON_MESSAGES_NOT_LIST",
+                "message": "Поле 'messages' должно быть списком сообщений.",
+            },
         )
 
     # 📌 Извлекаем имя чата
