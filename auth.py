@@ -403,7 +403,9 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
     try:
-        await send_verification_email(user.email, code, EMAIL_CODE_TTL_MIN)
+        await send_verification_email(
+            user.email, code, EMAIL_CODE_TTL_MIN, language=user.language
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
 
@@ -471,7 +473,9 @@ async def resend_verification_code(
     await db.commit()
 
     try:
-        await send_verification_email(user.email, code, EMAIL_CODE_TTL_MIN)
+        await send_verification_email(
+            user.email, code, EMAIL_CODE_TTL_MIN, language=user.language
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
 
@@ -538,7 +542,9 @@ async def password_reset_request(
     await db.commit()
 
     try:
-        await send_password_reset_email(user.email, code, EMAIL_CODE_TTL_MIN)
+        await send_password_reset_email(
+            user.email, code, EMAIL_CODE_TTL_MIN, language=user.language
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EMAIL_SEND_FAILED: {str(e)}")
 
