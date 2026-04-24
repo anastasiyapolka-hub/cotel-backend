@@ -775,11 +775,13 @@ async def summarize_chat(
     chat_name: str,
     text_messages: list[dict],
     ai_model: str,
+    fallback_language: str = "en",
 ) -> str:
     return await summarize_chat_messages(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=text_messages,
+        fallback_language=fallback_language,
         ai_model=ai_model,
     )
 
@@ -1229,6 +1231,7 @@ async def analyze_chat_via_service_account(
     user_query: str,
     days: int,
     ai_model: str,
+    fallback_language: str = "en",
 ) -> dict:
     last_error: Optional[ServiceAccountError] = None
     normalized_ref = normalize_public_chat_ref(chat_link)
@@ -1263,6 +1266,7 @@ async def analyze_chat_via_service_account(
                 chat_name=chat_name,
                 text_messages=messages,
                 ai_model=ai_model,
+                fallback_language=fallback_language,
             )
 
             now = utcnow()

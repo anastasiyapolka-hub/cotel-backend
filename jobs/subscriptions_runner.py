@@ -8,7 +8,7 @@ from sqlalchemy import select, update, or_
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal  # см. db/session.py :contentReference[oaicite:4]{index=4}
-from db.models import Subscription, SubscriptionState, MatchEvent, DigestEvent
+from db.models import Subscription, SubscriptionState, MatchEvent, DigestEvent, User
 import os
 from main import parse_iso_ts
 from llm.service import (
@@ -134,6 +134,14 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
 
     owner_user_id = int(owner_user_id)
 
+    # Подгружаем владельца, чтобы знать user.language для UX-копий
+    # (classify reason/summary_reason, digest narration). Без него
+    # LLM будет писать наши UX-поля на языке по умолчанию.
+    owner = (
+        await db.execute(select(User).where(User.id == owner_user_id))
+    ).scalar_one_or_none()
+    owner_language = getattr(owner, "language", None) or "en"
+
     # -------------------------
     # DIGEST / SUMMARY
     # -------------------------
@@ -194,6 +202,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             prompt=sub.prompt,
             chat_title=chat_title,
             messages=msgs,
+            answer_language=owner_language,
             ai_model=sub.ai_model,
         )
 
@@ -299,6 +308,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         prompt=sub.prompt,
         chat_title=getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat",
         messages=msgs,
+        ux_language=owner_language,
         ai_model=sub.ai_model,
     )
 

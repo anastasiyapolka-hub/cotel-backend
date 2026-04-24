@@ -13,6 +13,7 @@ from db.session import AsyncSessionLocal
 from db.models import Subscription, MatchEvent, DigestEvent, BotUserLink, User
 # используем уже существующие функции из main.py
 from main import build_tg_message_link, bot_send_message
+from bot_i18n import t as bot_t, months as bot_months, weekdays as bot_weekdays
 
 
 # -----------------------------
@@ -55,15 +56,6 @@ async def _get_dest_chat_id(db, owner_user_id: int) -> int | None:
     )
     return (await db.execute(q)).scalar_one_or_none()
 
-RU_MONTHS = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-RU_WEEKDAYS = [
-    "понедельник", "вторник", "среда", "четверг",
-    "пятница", "суббота", "воскресенье",
-]
-
 def _tz_gmt_label(tz: ZoneInfo, dt_utc: datetime) -> str:
     # dt_utc ожидаем aware UTC
     offset = tz.utcoffset(dt_utc)
@@ -76,14 +68,30 @@ def _tz_gmt_label(tz: ZoneInfo, dt_utc: datetime) -> str:
     mm = total_min % 60
     return f"GMT{sign}{hh}" if mm == 0 else f"GMT{sign}{hh}:{mm:02d}"
 
-def _fmt_date_ru(dt_local: datetime) -> str:
-    # dt_local aware (уже в нужной TZ)
-    return f"{dt_local.day} {RU_MONTHS[dt_local.month - 1]} {dt_local.year} ({RU_WEEKDAYS[dt_local.weekday()]})"
 
-def format_period_variant_f(window_start_utc: datetime, window_end_utc: datetime, tz_name: str) -> str:
+def _fmt_date(dt_local: datetime, language: str) -> str:
     """
-    Вариант F:
-    - один день: "10 января 2026 (суббота), 04:00–10:00 (GMT+5)"
+    Форматирует дату в виде "10 января 2026 (суббота)" (RU) или
+    "10 January 2026 (Saturday)" (EN). Формат нейтральный ISO-like,
+    не US-стиль.
+    """
+    months_list = bot_months(language)
+    weekdays_list = bot_weekdays(language)
+    return (
+        f"{dt_local.day} {months_list[dt_local.month - 1]} {dt_local.year}"
+        f" ({weekdays_list[dt_local.weekday()]})"
+    )
+
+
+def format_period_variant_f(
+    window_start_utc: datetime,
+    window_end_utc: datetime,
+    tz_name: str,
+    language: str = "en",
+) -> str:
+    """
+    Вариант F (language-aware):
+    - один день: "10 января 2026 (суббота), 04:00–10:00 (GMT+5)" / EN-аналог
     - разные дни: "9 января 2026 (пятница) 23:00 — 10 января 2026 (суббота) 11:00 (GMT+5)"
     """
     tz = ZoneInfo(tz_name)
@@ -100,9 +108,12 @@ def format_period_variant_f(window_start_utc: datetime, window_end_utc: datetime
     gmt = _tz_gmt_label(tz, window_start_utc)
 
     if s.date() == e.date():
-        return f"{_fmt_date_ru(s)}, {s:%H:%M}–{e:%H:%M} ({gmt})"
+        return f"{_fmt_date(s, language)}, {s:%H:%M}–{e:%H:%M} ({gmt})"
 
-    return f"{_fmt_date_ru(s)} {s:%H:%M} — {_fmt_date_ru(e)} {e:%H:%M} ({gmt})"
+    return (
+        f"{_fmt_date(s, language)} {s:%H:%M}"
+        f" — {_fmt_date(e, language)} {e:%H:%M} ({gmt})"
+    )
 
 
 # -----------------------------
@@ -136,27 +147,38 @@ async def _reserve_match_events(db, now_utc: datetime) -> list[int]:
 
 async def _load_match_events_with_subscriptions(db, event_ids: list[int]):
     """
-    Подтягиваем MatchEvent + Subscription одним запросом.
+    Подтягиваем MatchEvent + Subscription + User одним запросом.
+    User нужен, чтобы знать `user.language` для wrapper-литералов.
     """
     q = (
-        select(MatchEvent, Subscription)
+        select(MatchEvent, Subscription, User)
         .join(Subscription, Subscription.id == MatchEvent.subscription_id)
+        .join(User, User.id == Subscription.owner_user_id)
         .where(MatchEvent.id.in_(event_ids))
         .order_by(MatchEvent.subscription_id.asc(), MatchEvent.id.asc())
     )
     return list((await db.execute(q)).all())
 
 
-def _format_match_events_message(sub: Subscription, events: list[MatchEvent]) -> str:
+def _format_match_events_message(
+    sub: Subscription,
+    events: list[MatchEvent],
+    language: str = "en",
+) -> str:
     """
     Формат:
       - подробная часть заполняется до DETAIL_TEXT_LIMIT
       - остаток выводим ссылками (11), (12) ... пока не упремся в TG_MSG_HARD_LIMIT
+
+    Язык wrapper-литералов (шапка, счётчик, «Остальные совпадения»,
+    «дальше не влезло…») определяется параметром `language`. Excerpt
+    и ссылки — raw.
     """
     sid = int(sub.id)
+    name = sub.name or f"#{sid}"
     header = (
-        f"Найдены события по подписке: {sub.name or f'#{sid}'}\n"
-        f"Совпадений: {len(events)}\n"
+        bot_t("match_header", language, name=name) + "\n"
+        + bot_t("match_count", language, count=len(events)) + "\n"
     )
 
     text_parts: list[str] = [header]
@@ -193,7 +215,7 @@ def _format_match_events_message(sub: Subscription, events: list[MatchEvent]) ->
 
     # 2) Если осталось что-то — добавляем секцию ссылок
     if remaining_indexes:
-        tail_header = "\n\nОстальные совпадения (ссылками):"
+        tail_header = bot_t("remaining_links_header", language)
         if used + len(tail_header) < TG_MSG_HARD_LIMIT:
             text_parts.append(tail_header)
             used += len(tail_header)
@@ -213,7 +235,7 @@ def _format_match_events_message(sub: Subscription, events: list[MatchEvent]) ->
                 used += len(line)
             else:
                 # если даже ссылки уже не влезают — честно сообщаем
-                ell = "\n…(дальше не влезло по лимиту Telegram)"
+                ell = bot_t("tg_limit_truncated", language)
                 if used + len(ell) <= TG_MSG_HARD_LIMIT:
                     text_parts.append(ell)
                 break
@@ -277,14 +299,20 @@ async def _load_digest_events_with_subscriptions(db, event_ids: list[int]):
     return list((await db.execute(q)).all())
 
 
-def _format_digest_message(sub: Subscription, ev: DigestEvent, user: User) -> str:
-
-    title = f"Резюме по подписке: {sub.name or f'#{sub.id}'}"
-
-    # Формат:
-    #     заголовок: “Резюме по подписке: {name}”
-    #      период: {window_start} — {window_end}
-    #      тело: digest_text
+def _format_digest_message(
+    sub: Subscription,
+    ev: DigestEvent,
+    user: User,
+    language: str = "en",
+) -> str:
+    """
+    Формат:
+      заголовок: "Summary for your subscription: {name}" / «Резюме по подписке: {name}»
+      период:   "Period: {window_start} — {window_end}" / «Период: …»
+      тело:     digest_text (язык narration уже выставлен LLM по `user.language`)
+    """
+    name = sub.name or f"#{sub.id}"
+    title = bot_t("digest_title", language, name=name)
 
     ws_dt = getattr(ev, "window_start", None)
     we_dt = getattr(ev, "window_end", None)
@@ -292,10 +320,10 @@ def _format_digest_message(sub: Subscription, ev: DigestEvent, user: User) -> st
     tz_name = getattr(user, "timezone", None) or "UTC"
 
     if ws_dt and we_dt:
-        period_human = format_period_variant_f(ws_dt, we_dt, tz_name)
-        period = f"Период: {period_human}"
+        period_human = format_period_variant_f(ws_dt, we_dt, tz_name, language)
+        period = bot_t("digest_period", language, period=period_human)
     else:
-        period = "Период: —"
+        period = bot_t("digest_period_empty", language)
 
     body = (ev.digest_text or "").strip() or "—"
 
@@ -346,9 +374,9 @@ async def run_tick() -> int:
         async with AsyncSessionLocal() as db:
             rows = await _load_match_events_with_subscriptions(db, match_ids)
 
-            # группировка: (owner_user_id, subscription_id) -> {sub, events[]}
+            # группировка: (owner_user_id, subscription_id) -> {sub, user, events[]}
             grouped: dict[tuple[int, int], dict] = {}
-            for ev, sub in rows:
+            for ev, sub, user in rows:
                 owner_user_id = getattr(sub, "owner_user_id", None)
                 if not owner_user_id:
                     # Некорректная подписка — нельзя понять, кому слать.
@@ -359,12 +387,14 @@ async def run_tick() -> int:
                 owner_user_id = int(owner_user_id)
                 sid = int(ev.subscription_id)
                 key = (owner_user_id, sid)
-                grouped.setdefault(key, {"sub": sub, "events": []})
+                grouped.setdefault(key, {"sub": sub, "user": user, "events": []})
                 grouped[key]["events"].append(ev)
 
             for (owner_user_id, sid), pack in grouped.items():
                 sub: Subscription = pack["sub"]
+                user: User = pack["user"]
                 events: list[MatchEvent] = pack["events"]
+                language = getattr(user, "language", None) or "en"
 
                 # если тип подписки не events — помечаем failed
                 sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
@@ -379,7 +409,7 @@ async def run_tick() -> int:
                     if not dest_chat_id:
                         raise RuntimeError(f"NO_BOT_USER_LINK owner_user_id={owner_user_id}")
 
-                    text = _format_match_events_message(sub, events)
+                    text = _format_match_events_message(sub, events, language=language)
                     await bot_send_message(chat_id=int(dest_chat_id), text=text)
 
                     await _mark_match_events(db, [int(e.id) for e in events], STATUS_SENT)
@@ -430,7 +460,8 @@ async def run_tick() -> int:
                     if not dest_chat_id:
                         raise RuntimeError(f"NO_BOT_USER_LINK owner_user_id={owner_user_id}")
 
-                    text = _format_digest_message(sub, ev, user)
+                    language = getattr(user, "language", None) or "en"
+                    text = _format_digest_message(sub, ev, user, language=language)
                     await bot_send_message(chat_id=int(dest_chat_id), text=text)
 
                     await _mark_digest_events(db, [int(ev.id)], STATUS_SENT)

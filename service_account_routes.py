@@ -59,6 +59,7 @@ async def tg_service_analyze_chat(
             user_query=payload.user_query.strip(),
             days=payload.days,
             ai_model=ai_model,
+            fallback_language=user.language,
         )
 
         normalized_ref = result.get("chat_ref_normalized") or normalize_public_chat_ref(payload.chat_link)

@@ -676,6 +676,7 @@ async def run_subscriptions(
                         prompt=sub.prompt,
                         chat_title=chat_title,
                         messages=msgs,
+                        ux_language=user.language,
                         ai_model=sub.ai_model,
                     )
 
@@ -941,6 +942,7 @@ async def analyze_chat(
                 user_query=user_query,
                 chat_name=chat_name,
                 text_messages=text_messages,
+                fallback_language=user.language,
             )
         except Exception as e:
             # Чтобы фронт получил понятную ошибку
@@ -1146,6 +1148,7 @@ async def tg_analyze_chat(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=messages,
+        fallback_language=user.language,
         ai_model=ai_model,
     )
 
