@@ -64,6 +64,10 @@ class RegisterIn(BaseModel):
     timezone: Optional[str] = None
     language: Optional[str] = None
     language_source: Optional[str] = None
+    # Акцепт юр. документов (Privacy Policy + Terms of Service + подтверждение
+    # возраста 16+). Без True регистрация отклоняется.
+    accepted_terms: bool = False
+    terms_version: Optional[str] = None
 
 
 class VerifyEmailIn(BaseModel):
@@ -348,12 +352,21 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
     if payload.password != payload.password_confirm:
         raise HTTPException(status_code=400, detail="PASSWORD_MISMATCH")
 
+    # Акцепт юр. документов обязателен. Фронт показывает чекбокс с ссылками на
+    # Privacy Policy и Terms of Service и подтверждением возраста; без него
+    # кнопка "Зарегистрироваться" неактивна. Дублируем проверку на сервере на
+    # случай прямого обращения к API.
+    if not payload.accepted_terms:
+        raise HTTPException(status_code=400, detail="TERMS_NOT_ACCEPTED")
+
     _validate_password_policy(payload.password)
     password_hash = pwd_context.hash(payload.password)
     country_code = _normalize_country_code(payload.country_code)
     timezone = _normalize_timezone(payload.timezone)
     language = _normalize_language(payload.language)
     language_source = _normalize_language_source(payload.language_source)
+
+    terms_version = (payload.terms_version or "1.0").strip()[:16]
 
     user = User(
         email=email,
@@ -367,6 +380,8 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
         language_source=language_source,
         logout_revokes_telegram=False,
         default_ai_model="openai:gpt-4.1-mini",
+        terms_accepted_at=_now(),
+        terms_accepted_version=terms_version,
     )
 
     try:

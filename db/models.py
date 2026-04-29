@@ -230,6 +230,13 @@ class User(Base):
         onupdate=func.now(),
     )
 
+    # Акцепт юр. документов (Privacy Policy + Terms of Service + подтверждение
+    # возраста 16+) при регистрации. Заполняется единоразово при создании
+    # аккаунта; обновляется только если пользователь повторно принимает
+    # обновлённую версию документов.
+    terms_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    terms_accepted_version = Column(String(16), nullable=True)
+
 # ++ПЛАТЕЖНЫЕ ДАННЫЕ
 class BillingSubscription(Base):
     __tablename__ = "billing_subscriptions"
