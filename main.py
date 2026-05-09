@@ -45,7 +45,8 @@ from db.session import get_db
 from auth import get_current_user as auth_get_current_user
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 from pydantic import BaseModel
-from typing import Literal
+from typing import Literal, List, Optional
+from email_service import send_feedback_email, FEEDBACK_RECIPIENT_EMAIL
 from service_account_routes import router as service_account_router
 from service_account_admin_routes import router as service_account_admin_router
 
@@ -159,6 +160,123 @@ DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Feedback / bug report submission (from in-app "Обратная связь" modal).
+#
+# The recipient inbox is hardcoded as a constant in `email_service.py` —
+# see FEEDBACK_RECIPIENT_EMAIL. Update it there to route feedback elsewhere.
+# ---------------------------------------------------------------------------
+
+FEEDBACK_ALLOWED_CATEGORIES = {
+    "bug",
+    "improvement",
+    "support",
+    "billing",
+    "account",
+    "other",
+}
+FEEDBACK_MAX_SUBJECT_LEN = 200
+FEEDBACK_MAX_MESSAGE_LEN = 5000
+FEEDBACK_MAX_FILES = 5
+FEEDBACK_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+@app.post("/feedback")
+async def submit_feedback(
+    subject: str = Form(...),
+    category: str = Form("other"),
+    message: str = Form(...),
+    language: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    user: User = Depends(auth_get_current_user),
+):
+    subject = (subject or "").strip()
+    message = (message or "").strip()
+    category = (category or "other").strip().lower()
+
+    if not subject:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FEEDBACK_SUBJECT_REQUIRED",
+                    "message": "Заголовок заявки обязателен."},
+        )
+    if len(subject) > FEEDBACK_MAX_SUBJECT_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FEEDBACK_SUBJECT_TOO_LONG",
+                    "message": "Заголовок слишком длинный."},
+        )
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FEEDBACK_MESSAGE_REQUIRED",
+                    "message": "Текст обращения обязателен."},
+        )
+    if len(message) > FEEDBACK_MAX_MESSAGE_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FEEDBACK_MESSAGE_TOO_LONG",
+                    "message": "Сообщение слишком длинное."},
+        )
+    if category not in FEEDBACK_ALLOWED_CATEGORIES:
+        category = "other"
+
+    safe_files = [f for f in (files or []) if f is not None]
+    if len(safe_files) > FEEDBACK_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FEEDBACK_TOO_MANY_FILES",
+                    "message": "Можно прикрепить не более 5 файлов."},
+        )
+
+    attachments = []
+    for upload in safe_files:
+        try:
+            content_bytes = await upload.read()
+        except Exception:
+            content_bytes = b""
+        if not content_bytes:
+            continue
+        if len(content_bytes) > FEEDBACK_MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "FEEDBACK_FILE_TOO_LARGE",
+                    "message": "Один из файлов превышает допустимый размер (5 МБ).",
+                    "filename": upload.filename or "",
+                },
+            )
+        attachments.append({
+            "filename": upload.filename or "attachment",
+            "content_bytes": content_bytes,
+            "content_type": upload.content_type or "application/octet-stream",
+        })
+
+    try:
+        await send_feedback_email(
+            user_email=user.email or "",
+            subject=subject,
+            category=category,
+            message=message,
+            attachments=attachments,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "FEEDBACK_SEND_FAILED",
+                "message": "Не удалось отправить заявку. Попробуйте позже.",
+                "error": type(exc).__name__,
+            },
+        )
+
+    return {
+        "ok": True,
+        "recipient": FEEDBACK_RECIPIENT_EMAIL,
+        "category": category,
+    }
 
 @app.get("/account/plan-usage")
 async def get_account_plan_usage(
