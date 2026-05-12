@@ -22,6 +22,7 @@ from db.models import (
 )
 from telegram_service import decrypt_session
 from llm.service import summarize_chat_messages
+from llm.usage import LlmTextResult, LlmUsage
 
 # =========================
 # Константы MVP
@@ -776,13 +777,20 @@ async def summarize_chat(
     text_messages: list[dict],
     ai_model: str,
     fallback_language: str = "en",
-) -> str:
+    return_usage: bool = False,
+):
+    """
+    Thin wrapper. `return_usage=True` returns the full LlmTextResult
+    so the caller can read .usage / .provider / .provider_model for
+    UsageEvent logging. Default behavior is unchanged (returns str).
+    """
     return await summarize_chat_messages(
         user_query=user_query,
         chat_name=chat_name,
         text_messages=text_messages,
         fallback_language=fallback_language,
         ai_model=ai_model,
+        return_usage=return_usage,
     )
 
 async def validate_service_subscription_target(
@@ -1233,6 +1241,8 @@ async def analyze_chat_via_service_account(
     ai_model: str,
     fallback_language: str = "en",
 ) -> dict:
+    import time as _time  # local import to avoid touching module header
+
     last_error: Optional[ServiceAccountError] = None
     normalized_ref = normalize_public_chat_ref(chat_link)
 
@@ -1248,12 +1258,15 @@ async def analyze_chat_via_service_account(
         await db.commit()
 
         try:
+            # ---- measure fetch ----
+            _fetch_t0 = _time.perf_counter()
             entity, messages = await fetch_public_chat_messages(
                 db,
                 service_account_id=account.id,
                 chat_ref=normalized_ref,
                 days=days,
             )
+            fetch_duration_ms = int((_time.perf_counter() - _fetch_t0) * 1000)
 
             chat_name = (
                 getattr(entity, "title", None)
@@ -1261,13 +1274,30 @@ async def analyze_chat_via_service_account(
                 or "Без названия"
             )
 
-            summary = await summarize_chat(
+            # Approximate the size of the LLM context for diagnostics. The
+            # LLM itself reports exact input_tokens via .usage.input_tokens,
+            # so this number is informational only.
+            context_chars = sum(
+                len(m.get("text") or "")
+                + len(m.get("from") or "")
+                + len(m.get("date") or "")
+                + 4
+                for m in messages
+            )
+
+            # ---- measure LLM ----
+            _llm_t0 = _time.perf_counter()
+            llm_result: LlmTextResult = await summarize_chat(
                 user_query=user_query,
                 chat_name=chat_name,
                 text_messages=messages,
                 ai_model=ai_model,
                 fallback_language=fallback_language,
+                return_usage=True,
             )
+            llm_duration_ms = int((_time.perf_counter() - _llm_t0) * 1000)
+
+            summary = llm_result.text
 
             now = utcnow()
 
@@ -1307,6 +1337,19 @@ async def analyze_chat_via_service_account(
                 "chat_id": getattr(entity, "id", None),
                 "chat_username": getattr(entity, "username", None),
                 "ai_model": ai_model,
+                # Internal QA metrics for the route to log into UsageEvent.
+                # The route pops these before returning to the frontend.
+                "_qa_metrics": {
+                    "messages_fetched_count": len(messages),
+                    "messages_sent_to_llm_count": len(messages),
+                    "context_chars": context_chars,
+                    "answer_chars": len(summary or ""),
+                    "fetch_duration_ms": fetch_duration_ms,
+                    "llm_duration_ms": llm_duration_ms,
+                    "llm_usage": llm_result.usage,
+                    "llm_provider": llm_result.provider,
+                    "llm_provider_model": llm_result.provider_model,
+                },
             }
 
         except ServiceAccountError as e:

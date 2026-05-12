@@ -237,6 +237,61 @@ class User(Base):
     terms_accepted_at = Column(DateTime(timezone=True), nullable=True)
     terms_accepted_version = Column(String(16), nullable=True)
 
+class LLMPricing(Base):
+    __tablename__ = "llm_pricing"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Slug модели ровно в том формате, который используется в коде:
+    # "openai:gpt-4.1-mini", "anthropic:claude-sonnet-4-6" и т.д.
+    ai_model = Column(String(64), nullable=False)
+
+    # Цена за 1M input/output токенов в USD
+    input_price_per_1m_usd = Column(Numeric(12, 6), nullable=False)
+    output_price_per_1m_usd = Column(Numeric(12, 6), nullable=False)
+
+    # На MVP используем только USD, но поле оставляем для будущего
+    currency = Column(String(8), nullable=False, server_default="USD")
+
+    # false = прайс устарел / не используется для новых расчётов
+    is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
+
+    # Комментарий админа: источник, дата проверки, пояснения
+    note = Column(Text, nullable=True)
+
+    # Кто последний изменил запись
+    updated_by_user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        sa.Index(
+            "ix_llm_pricing_ai_model_unique",
+            "ai_model",
+            unique=True,
+        ),
+        sa.Index(
+            "ix_llm_pricing_active",
+            "is_active",
+        ),
+    )
+
 # ++ПЛАТЕЖНЫЕ ДАННЫЕ
 class BillingSubscription(Base):
     __tablename__ = "billing_subscriptions"

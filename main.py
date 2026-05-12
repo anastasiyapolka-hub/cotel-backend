@@ -82,8 +82,16 @@ from plan_limits import (
     ensure_can_update_subscription,
     enforce_qa_limits,
     record_qa_success,
+    record_qa_failure,
     expire_trial_subscription_if_needed,
     resolve_ai_model_for_user,
+)
+from llm import (
+    estimate_llm_cost_usd,
+    split_usage_for_meta,
+    cost_kwargs_for_meta,
+    LlmUsage,
+    TOKENS_SOURCE_EMPTY,
 )
 
 class ChangePlanRequest(BaseModel):
@@ -1245,8 +1253,11 @@ async def tg_analyze_chat(
 
     me = await tg_get_current_user(db, owner_user_id)
     if not me:
+        # Pre-condition: no Telegram link. Not a Q&A failure to log —
+        # the request never actually started consuming anything.
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
+    # enforce_qa_limits writes qa_request_rejected itself on 429.
     await enforce_qa_limits(
         db,
         user=user,
@@ -1255,21 +1266,111 @@ async def tg_analyze_chat(
         chat_ref=chat_link,
     )
 
+    query_chars = len(user_query)
+    total_t0 = time.perf_counter()
+
+    # -------- FETCH messages from Telegram --------
+    fetch_t0 = time.perf_counter()
     try:
         entity, messages = await fetch_chat_messages(db, owner_user_id, chat_link, days)
     except ValueError as ve:
+        fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await record_qa_failure(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=chat_link,
+            requested_days=days,
+            ai_model=ai_model,
+            error_code="TELEGRAM_FETCH_FAILED",
+            error_message=(str(ve) or "")[:300] or None,
+            query_chars=query_chars or None,
+            duration_ms_total=total_ms,
+            duration_ms_fetch=fetch_ms,
+        )
+        await db.commit()
         raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await record_qa_failure(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=chat_link,
+            requested_days=days,
+            ai_model=ai_model,
+            error_code="TELEGRAM_FETCH_FAILED",
+            error_message=(str(e) or "")[:300] or None,
+            query_chars=query_chars or None,
+            duration_ms_total=total_ms,
+            duration_ms_fetch=fetch_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="TELEGRAM_FETCH_FAILED")
+    fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+
+    messages_fetched_count = len(messages)
+    # Approximate the LLM context size. The provider returns exact
+    # input_tokens via .usage, so this number is informational only.
+    context_chars = sum(
+        len(m.get("text") or "")
+        + len(m.get("from") or "")
+        + len(m.get("date") or "")
+        + 4
+        for m in messages
+    )
 
     chat_name = getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
 
-    summary = await summarize_chat_messages(
-        user_query=user_query,
-        chat_name=chat_name,
-        text_messages=messages,
-        fallback_language=user.language,
+    # -------- LLM call --------
+    llm_t0 = time.perf_counter()
+    try:
+        llm_result = await summarize_chat_messages(
+            user_query=user_query,
+            chat_name=chat_name,
+            text_messages=messages,
+            fallback_language=user.language,
+            ai_model=ai_model,
+            return_usage=True,
+        )
+    except Exception as e:
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await record_qa_failure(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=chat_link,
+            requested_days=days,
+            ai_model=ai_model,
+            error_code="LLM_ERROR",
+            error_message=(str(e) or "")[:300] or None,
+            query_chars=query_chars or None,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars,
+            duration_ms_total=total_ms,
+            duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="LLM_ERROR")
+    llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+
+    summary = llm_result.text
+    llm_usage: LlmUsage = llm_result.usage
+
+    # -------- Cost estimation (safe to missing llm_pricing table) --------
+    cost = await estimate_llm_cost_usd(
+        db,
         ai_model=ai_model,
+        input_tokens=llm_usage.input_tokens,
+        output_tokens=llm_usage.output_tokens,
+        tokens_source=llm_usage.tokens_source,
     )
 
+    # -------- Chat history + success event --------
     await upsert_user_chat_history(
         db,
         owner_user_id=owner_user_id,
@@ -1280,12 +1381,25 @@ async def tg_analyze_chat(
         chat_id=getattr(entity, "id", None),
     )
 
+    total_ms = int((time.perf_counter() - total_t0) * 1000)
+
     await record_qa_success(
         db,
         user=user,
         source_mode="personal",
         chat_ref=chat_link,
         requested_days=days,
+        ai_model=ai_model,
+        query_chars=query_chars or None,
+        messages_fetched_count=messages_fetched_count,
+        messages_sent_to_llm_count=messages_fetched_count,
+        context_chars=context_chars,
+        answer_chars=len(summary or ""),
+        duration_ms_total=total_ms,
+        duration_ms_fetch=fetch_ms,
+        duration_ms_llm=llm_ms,
+        **split_usage_for_meta(llm_usage),
+        **cost_kwargs_for_meta(cost),
     )
 
     await db.commit()
@@ -1294,7 +1408,7 @@ async def tg_analyze_chat(
         "status": "ok",
         "summary": summary,
         "chat_name": chat_name,
-        "messages_count": len(messages),
+        "messages_count": messages_fetched_count,
         "source_mode": "personal",
         "ai_model": ai_model,
         "usage": await build_usage_snapshot(db, user=user),

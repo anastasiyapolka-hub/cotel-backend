@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
-from typing import Any, Optional
-
-from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI
+from typing import Any, Optional, Union
 
 from .models import resolve_model_config, DEFAULT_AI_MODEL
-
-
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+from .adapters import get_adapter
+from .usage import (
+    LlmUsage,
+    LlmTextResult,
+    LlmJsonResult,
+    TOKENS_SOURCE_EMPTY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,17 +47,6 @@ def _lang_name(value: Any) -> str:
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
-def _extract_anthropic_text(response: Any) -> str:
-    parts: list[str] = []
-
-    for block in getattr(response, "content", []) or []:
-        text = getattr(block, "text", None)
-        if isinstance(text, str) and text.strip():
-            parts.append(text)
-
-    return "\n".join(parts).strip()
-
-
 def _safe_parse_json(raw: str) -> dict:
     try:
         return json.loads(raw)
@@ -72,7 +58,7 @@ def _safe_parse_json(raw: str) -> dict:
         raise
 
 
-async def _chat_text_completion(
+async def _chat_text_completion_rich(
     *,
     ai_model: str,
     task: Optional[str] = None,
@@ -80,48 +66,60 @@ async def _chat_text_completion(
     user_prompt: str,
     temperature: float,
     max_output_tokens: int | None = None,
-) -> str:
+) -> LlmTextResult:
     """
-    Run a single-turn chat completion against the configured provider.
+    Run a single-turn chat completion against the configured provider
+    and return a normalized `LlmTextResult` that includes token usage.
 
     `task` is a hint used by Anthropic task-based routing
     (see llm.models.resolve_model_config). It is safely ignored by
     the OpenAI provider.
     """
     config = resolve_model_config(ai_model, task=task)
+    adapter = get_adapter(config.provider)
 
-    if config.provider == "openai":
-        completion = await openai_client.chat.completions.create(
-            model=config.provider_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-            max_tokens=max_output_tokens or 1500,
-        )
-        text = completion.choices[0].message.content or ""
-        return text.strip()
+    text, usage, finish_reason = await adapter.complete(
+        provider_model=config.provider_model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens or 1500,
+    )
 
-    if config.provider == "anthropic":
-        if anthropic_client is None:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set")
+    return LlmTextResult(
+        text=text,
+        usage=usage,
+        ai_model=ai_model,
+        provider=config.provider,
+        provider_model=config.provider_model,
+        raw_finish_reason=finish_reason,
+    )
 
-        response = await anthropic_client.messages.create(
-            model=config.provider_model,
-            system=system_prompt,
-            max_tokens=max_output_tokens or 1500,
-            temperature=temperature,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                }
-            ],
-        )
-        return _extract_anthropic_text(response)
 
-    raise RuntimeError(f"Unsupported provider: {config.provider}")
+def _empty_text_result(*, ai_model: str, text: str) -> LlmTextResult:
+    """Build a short-circuit LlmTextResult for cases where no LLM call was made."""
+    config = resolve_model_config(ai_model)
+    return LlmTextResult(
+        text=text,
+        usage=LlmUsage.empty(),
+        ai_model=ai_model,
+        provider=config.provider,
+        provider_model=config.provider_model,
+        raw_finish_reason=None,
+    )
+
+
+def _empty_json_result(*, ai_model: str, data: dict) -> LlmJsonResult:
+    config = resolve_model_config(ai_model)
+    return LlmJsonResult(
+        data=data,
+        raw_text="",
+        usage=LlmUsage.empty(),
+        ai_model=ai_model,
+        provider=config.provider,
+        provider_model=config.provider_model,
+        raw_finish_reason=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +139,8 @@ async def summarize_chat_messages(
     text_messages: list[dict],
     fallback_language: str = "en",
     ai_model: str = DEFAULT_AI_MODEL,
-) -> str:
+    return_usage: bool = False,
+) -> Union[str, LlmTextResult]:
     """
     Answer a user's question grounded in a Telegram chat fragment.
 
@@ -149,6 +148,14 @@ async def summarize_chat_messages(
     language as `user_query`. `fallback_language` (expected to be
     `user.language`) is used only when the question's language is
     ambiguous (too short, emoji-only, mixed).
+
+    Return contract:
+      - default (`return_usage=False`): returns the plain text str —
+        backward-compatible with the original signature.
+      - `return_usage=True`: returns an `LlmTextResult` with .text,
+        .usage (input/output/total tokens + tokens_source), .ai_model,
+        .provider, .provider_model. Use this in code paths that need
+        to write a UsageEvent.
     """
     lines = []
     for msg in text_messages:
@@ -160,7 +167,10 @@ async def summarize_chat_messages(
     context = "\n".join(lines)
 
     if not context:
-        return _EMPTY_CHAT_MESSAGES[_normalize_lang_code(fallback_language)]
+        empty_text = _EMPTY_CHAT_MESSAGES[_normalize_lang_code(fallback_language)]
+        if return_usage:
+            return _empty_text_result(ai_model=ai_model, text=empty_text)
+        return empty_text
 
     fallback_lang_name = _lang_name(fallback_language)
 
@@ -213,7 +223,7 @@ async def summarize_chat_messages(
         f"User question:\n{user_query}"
     )
 
-    return await _chat_text_completion(
+    result = await _chat_text_completion_rich(
         ai_model=ai_model,
         task="qa",
         system_prompt=system_prompt,
@@ -221,6 +231,10 @@ async def summarize_chat_messages(
         temperature=0.2,
         max_output_tokens=1500,
     )
+
+    if return_usage:
+        return result
+    return result.text
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +254,8 @@ async def classify_subscription_matches(
     messages: list[dict],
     ux_language: str = "en",
     ai_model: str = DEFAULT_AI_MODEL,
-) -> dict:
+    return_usage: bool = False,
+) -> Union[dict, LlmJsonResult]:
     """
     Filter a batch of messages against an event-subscription query.
 
@@ -248,6 +263,12 @@ async def classify_subscription_matches(
     language of the service fields (`reason`, `summary_reason`) which
     are OUR UX copy shown in the dispatched Telegram digest.
     `excerpt` is always a verbatim raw quote.
+
+    Return contract:
+      - default (`return_usage=False`): returns parsed JSON dict
+        (backward-compatible).
+      - `return_usage=True`: returns an `LlmJsonResult` with .data
+        (the same dict), .usage, .ai_model, .provider, .provider_model.
     """
     lines = []
     for m in messages:
@@ -260,12 +281,15 @@ async def classify_subscription_matches(
 
     context = "\n".join(lines)
     if not context:
-        return {
+        empty_data = {
             "found": False,
             "matches": [],
             "summary_reason": _EMPTY_CLASSIFY_SUMMARY[_normalize_lang_code(ux_language)],
             "confidence": 0.0,
         }
+        if return_usage:
+            return _empty_json_result(ai_model=ai_model, data=empty_data)
+        return empty_data
 
     ux_lang_name = _lang_name(ux_language)
 
@@ -321,7 +345,7 @@ async def classify_subscription_matches(
         f"{context}"
     )
 
-    raw = await _chat_text_completion(
+    rich = await _chat_text_completion_rich(
         ai_model=ai_model,
         task="classify",
         system_prompt=system_prompt,
@@ -329,7 +353,19 @@ async def classify_subscription_matches(
         temperature=0.1,
         max_output_tokens=2000,
     )
-    return _safe_parse_json(raw)
+    parsed = _safe_parse_json(rich.text)
+
+    if return_usage:
+        return LlmJsonResult(
+            data=parsed,
+            raw_text=rich.text,
+            usage=rich.usage,
+            ai_model=rich.ai_model,
+            provider=rich.provider,
+            provider_model=rich.provider_model,
+            raw_finish_reason=rich.raw_finish_reason,
+        )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -343,13 +379,20 @@ async def build_subscription_digest(
     messages: list[dict],
     answer_language: str = "en",
     ai_model: str = DEFAULT_AI_MODEL,
-) -> dict:
+    return_usage: bool = False,
+) -> Union[dict, LlmJsonResult]:
     """
     Build a summary-style digest for a subscription window.
 
     `answer_language` (expected to be `user.language`) controls the
     narration language. Verbatim quotes inside the digest remain in
     their source language per our i18n rules.
+
+    Return contract:
+      - default (`return_usage=False`): returns parsed JSON dict
+        (backward-compatible).
+      - `return_usage=True`: returns an `LlmJsonResult` with .data,
+        .usage, .ai_model, .provider, .provider_model.
     """
     lines = []
     for m in messages:
@@ -364,7 +407,10 @@ async def build_subscription_digest(
 
     context = "\n".join(lines)
     if not context:
-        return {"digest_text": "", "confidence": 0.0}
+        empty_data = {"digest_text": "", "confidence": 0.0}
+        if return_usage:
+            return _empty_json_result(ai_model=ai_model, data=empty_data)
+        return empty_data
 
     answer_lang_name = _lang_name(answer_language)
 
@@ -414,7 +460,7 @@ async def build_subscription_digest(
         f"User query for the summary:\n{prompt}"
     )
 
-    raw = await _chat_text_completion(
+    rich = await _chat_text_completion_rich(
         ai_model=ai_model,
         task="digest",
         system_prompt=system_prompt,
@@ -422,4 +468,16 @@ async def build_subscription_digest(
         temperature=0.2,
         max_output_tokens=2000,
     )
-    return _safe_parse_json(raw)
+    parsed = _safe_parse_json(rich.text)
+
+    if return_usage:
+        return LlmJsonResult(
+            data=parsed,
+            raw_text=rich.text,
+            usage=rich.usage,
+            ai_model=rich.ai_model,
+            provider=rich.provider,
+            provider_model=rich.provider_model,
+            raw_finish_reason=rich.raw_finish_reason,
+        )
+    return parsed
