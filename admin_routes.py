@@ -1,12 +1,18 @@
 """
 Admin backend for CoTel — MVP version.
 
-Five endpoints, all read-only on this stage:
-  GET /admin/users
-  GET /admin/users/{user_id}
-  GET /admin/usage-events
-  GET /admin/subscriptions
-  GET /admin/sessions
+Read endpoints:
+  GET  /admin/whoami            — non-throwing admin check for UI gating
+  GET  /admin/users             — paginated user list with per-user aggregates
+  GET  /admin/users/{user_id}   — user detail card (5 sections)
+  GET  /admin/usage-events      — UsageEvent feed with filters + pagination
+  GET  /admin/subscriptions     — subscriptions across all users with aggregates
+  GET  /admin/sessions          — web sessions / Telegram sessions / bot links
+
+Write endpoints (Pricing):
+  GET  /admin/pricing           — list all llm_pricing rows
+  POST /admin/pricing           — create new pricing row
+  PUT  /admin/pricing/{id}      — patch existing row (incl. is_active=false to retire)
 
 Authorization: simple ADMIN_EMAILS env list. The list is comma-separated,
 e.g. ADMIN_EMAILS=anastasiya.polka@gmail.com,other.admin@example.com .
@@ -24,8 +30,6 @@ Privacy guardrails enforced in this file:
   - chat_ref for source_mode="personal": SHA-256 hash prefix
   - bot link telegram_chat_id: masked first 3 / last 3 digits
   - user_agent: shortened to 64 chars
-
-The Pricing tab (vkladka) is deferred to Stage 8 — not in this file yet.
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ from typing import Any, Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,9 +49,10 @@ from db.models import (
     User, Subscription, SubscriptionState,
     MatchEvent, DigestEvent,
     BotUserLink, Session as WebSession, TelegramSession,
-    UsageCounter, UsageEvent, Plan,
+    UsageCounter, UsageEvent, Plan, LLMPricing,
 )
 from db.session import get_db
+from llm.pricing import invalidate_pricing_cache
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -973,3 +979,152 @@ async def admin_list_sessions(
         "limit": limit,
         "offset": offset,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pricing CRUD (Stage 8)
+# ---------------------------------------------------------------------------
+#
+# Admin manages the llm_pricing table directly. The cost helper at
+# llm/pricing.py reads from this table via a raw-SQL SELECT with a 60-second
+# cache, so after every write we call invalidate_pricing_cache() so the new
+# numbers take effect on the next Q&A / subscription run.
+#
+# We do NOT support DELETE — historical UsageEvents may reference an ai_model
+# slug; retiring a price is done by setting is_active=false. The cost helper
+# already returns "no_pricing_in_db" for missing/inactive rows.
+# ---------------------------------------------------------------------------
+
+
+class PricingCreate(BaseModel):
+    ai_model: str = Field(min_length=1, max_length=64)
+    input_price_per_1m_usd: float = Field(ge=0)
+    output_price_per_1m_usd: float = Field(ge=0)
+    currency: str = Field(default="USD", max_length=8)
+    is_active: bool = True
+    note: Optional[str] = None
+
+
+class PricingUpdate(BaseModel):
+    input_price_per_1m_usd: Optional[float] = Field(default=None, ge=0)
+    output_price_per_1m_usd: Optional[float] = Field(default=None, ge=0)
+    currency: Optional[str] = Field(default=None, max_length=8)
+    is_active: Optional[bool] = None
+    note: Optional[str] = None
+
+
+def _serialize_pricing(row: LLMPricing, updater_email: Optional[str] = None) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "ai_model": row.ai_model,
+        "input_price_per_1m_usd": float(row.input_price_per_1m_usd) if row.input_price_per_1m_usd is not None else None,
+        "output_price_per_1m_usd": float(row.output_price_per_1m_usd) if row.output_price_per_1m_usd is not None else None,
+        "currency": row.currency,
+        "is_active": bool(row.is_active),
+        "note": row.note,
+        "updated_by_user_id": int(row.updated_by_user_id) if row.updated_by_user_id is not None else None,
+        "updated_by_email": updater_email,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+    }
+
+
+@router.get("/pricing")
+async def admin_list_pricing(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """List all pricing rows (active + inactive), sorted by ai_model."""
+    rows = (
+        await db.execute(
+            select(LLMPricing, User.email)
+            .outerjoin(User, User.id == LLMPricing.updated_by_user_id)
+            .order_by(LLMPricing.ai_model.asc())
+        )
+    ).all()
+
+    items = [_serialize_pricing(r, updater_email=email) for (r, email) in rows]
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/pricing")
+async def admin_create_pricing(
+    body: PricingCreate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Create a new pricing row. Returns the created row.
+
+    Conflict on ai_model (unique) -> 409. The frontend should fetch the
+    existing row and call PUT instead.
+    """
+    # Reject duplicates explicitly (clean error rather than DB constraint trace).
+    existing = (
+        await db.execute(
+            select(LLMPricing).where(LLMPricing.ai_model == body.ai_model)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PRICING_ROW_EXISTS",
+                "message": f"Row for ai_model={body.ai_model} already exists. Use PUT to update.",
+                "id": int(existing.id),
+            },
+        )
+
+    row = LLMPricing(
+        ai_model=body.ai_model.strip(),
+        input_price_per_1m_usd=body.input_price_per_1m_usd,
+        output_price_per_1m_usd=body.output_price_per_1m_usd,
+        currency=(body.currency or "USD").strip().upper(),
+        is_active=bool(body.is_active),
+        note=(body.note or None),
+        updated_by_user_id=int(admin.id),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    # Drop the 60s cost-helper cache so the new price applies immediately.
+    invalidate_pricing_cache()
+
+    return _serialize_pricing(row, updater_email=admin.email)
+
+
+@router.put("/pricing/{pricing_id}")
+async def admin_update_pricing(
+    pricing_id: int,
+    body: PricingUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Patch an existing pricing row. Fields not present in the body are left
+    unchanged. To retire a model, send {"is_active": false}.
+    """
+    res = await db.execute(select(LLMPricing).where(LLMPricing.id == pricing_id))
+    row = res.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"code": "PRICING_NOT_FOUND"})
+
+    if body.input_price_per_1m_usd is not None:
+        row.input_price_per_1m_usd = body.input_price_per_1m_usd
+    if body.output_price_per_1m_usd is not None:
+        row.output_price_per_1m_usd = body.output_price_per_1m_usd
+    if body.currency is not None:
+        row.currency = body.currency.strip().upper()
+    if body.is_active is not None:
+        row.is_active = bool(body.is_active)
+    if body.note is not None:
+        # Allow clearing the note by sending an empty string.
+        row.note = body.note or None
+
+    row.updated_by_user_id = int(admin.id)
+
+    await db.commit()
+    await db.refresh(row)
+
+    invalidate_pricing_cache()
+
+    return _serialize_pricing(row, updater_email=admin.email)
