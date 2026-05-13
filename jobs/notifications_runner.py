@@ -10,7 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.session import AsyncSessionLocal
-from db.models import Subscription, MatchEvent, DigestEvent, BotUserLink, User
+from db.models import Subscription, MatchEvent, DigestEvent, BotUserLink, User, UsageEvent
 # используем уже существующие функции из main.py
 from main import build_tg_message_link, bot_send_message
 from bot_i18n import t as bot_t, months as bot_months, weekdays as bot_weekdays
@@ -31,6 +31,73 @@ STATUS_FAILED = "failed"
 # Для Telegram ограничение ~4096 символов, но в твоей задаче — digest и events уже форматируются отдельно.
 # Здесь можно оставить запас, но это не обязательно для digest.
 TG_MSG_HARD_LIMIT = 4096
+
+
+# -----------------------------
+# UsageEvent helpers (bot dispatch)
+# -----------------------------
+#
+# Per TZ §7, every bot-dispatch attempt must produce a UsageEvent:
+#   bot_dispatch_success  (status='success_counted')
+#   bot_dispatch_failed   (status='failed_not_counted')
+#
+# Granularity for MVP: one UsageEvent per "group" — that is, per
+# (owner_user_id, subscription_id) for MatchEvent dispatch, and one per
+# DigestEvent for digest dispatch. We chose per-group instead of
+# per-tick because UsageEvent.user_id is NOT NULL — a single
+# tick-wide aggregate would have no natural user to attach to. The
+# per-group event satisfies that AND gives the admin tab better
+# failure granularity. The meta_json fields still match TZ §7
+# ("events_in_group", "subscription_id", "error_code", "error_message").
+
+def _derive_dispatch_error_code(error: BaseException) -> str:
+    msg = str(error) if error is not None else ""
+    if msg.startswith("NO_BOT_USER_LINK"):
+        return "NO_BOT_USER_LINK"
+    return "BOT_SEND_FAILED"
+
+
+async def _record_bot_dispatch_event(
+    db,
+    *,
+    owner_user_id: int,
+    subscription_id: int,
+    source_mode: str | None,
+    chat_ref: str | None,
+    success: bool,
+    meta: dict,
+) -> None:
+    """
+    Add a bot_dispatch_success / bot_dispatch_failed UsageEvent to the
+    current session and commit. Called right after _mark_match_events /
+    _mark_digest_events so it shares their transaction boundary.
+
+    Meta keys with None values are stripped to keep storage compact.
+    """
+    clean_meta = {k: v for k, v in (meta or {}).items() if v is not None}
+    try:
+        db.add(
+            UsageEvent(
+                user_id=int(owner_user_id),
+                event_type="bot_dispatch_success" if success else "bot_dispatch_failed",
+                status="success_counted" if success else "failed_not_counted",
+                source_mode=source_mode,
+                chat_ref=chat_ref,
+                subscription_id=int(subscription_id) if subscription_id is not None else None,
+                meta_json=clean_meta,
+            )
+        )
+        await db.commit()
+    except Exception as log_err:  # noqa: BLE001
+        # Don't let UsageEvent failure mask the actual dispatch outcome.
+        print(
+            f"[notifications_runner] failed to log bot_dispatch event "
+            f"(success={success}) sub_id={subscription_id} owner={owner_user_id} err={log_err}"
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 def _utc_now() -> datetime:
@@ -395,6 +462,9 @@ async def run_tick() -> int:
                 user: User = pack["user"]
                 events: list[MatchEvent] = pack["events"]
                 language = getattr(user, "language", None) or "en"
+                events_in_group = len(events)
+                sub_source_mode = getattr(sub, "source_mode", None)
+                sub_chat_ref = getattr(sub, "chat_ref", None)
 
                 # если тип подписки не events — помечаем failed
                 sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
@@ -402,8 +472,23 @@ async def run_tick() -> int:
                     await _mark_match_events(db, [int(e.id) for e in events], STATUS_FAILED)
                     exit_code = 1
                     print(f"[notifications_runner] MATCH_FAILED_UNKNOWN_TYPE owner_user_id={owner_user_id} sub_id={sid}")
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=False,
+                        meta={
+                            "subscription_type": sub_type,
+                            "events_in_group": events_in_group,
+                            "error_code": "WRONG_SUBSCRIPTION_TYPE_FOR_MATCH_DISPATCH",
+                            "error_message": f"expected events, got {sub_type}",
+                        },
+                    )
                     continue
 
+                group_t0 = time.perf_counter()
                 try:
                     dest_chat_id = await _get_dest_chat_id(db, owner_user_id)
                     if not dest_chat_id:
@@ -413,12 +498,48 @@ async def run_tick() -> int:
                     await bot_send_message(chat_id=int(dest_chat_id), text=text)
 
                     await _mark_match_events(db, [int(e.id) for e in events], STATUS_SENT)
-                    print(f"[notifications_runner] MATCH_SENT owner_user_id={owner_user_id} sub_id={sid} events={len(events)}")
+                    elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
+                    print(
+                        f"[notifications_runner] MATCH_SENT owner_user_id={owner_user_id} "
+                        f"sub_id={sid} events={events_in_group}"
+                    )
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=True,
+                        meta={
+                            "subscription_type": "events",
+                            "events_in_group": events_in_group,
+                            "elapsed_ms": elapsed_ms,
+                        },
+                    )
 
                 except Exception as e:
                     await _mark_match_events(db, [int(e.id) for e in events], STATUS_FAILED)
+                    elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
                     exit_code = 1
-                    print(f"[notifications_runner] MATCH_SEND_FAILED owner_user_id={owner_user_id} sub_id={sid} err={e}")
+                    print(
+                        f"[notifications_runner] MATCH_SEND_FAILED owner_user_id={owner_user_id} "
+                        f"sub_id={sid} err={e}"
+                    )
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=False,
+                        meta={
+                            "subscription_type": "events",
+                            "events_in_group": events_in_group,
+                            "elapsed_ms": elapsed_ms,
+                            "error_code": _derive_dispatch_error_code(e),
+                            "error_message": (str(e) or "")[:300] or None,
+                        },
+                    )
 
     else:
         print("[notifications_runner] No queued match_events")
@@ -439,7 +560,13 @@ async def run_tick() -> int:
 
             for ev, sub, user in rows:
                 owner_user_id = getattr(sub, "owner_user_id", None)
+                sub_source_mode = getattr(sub, "source_mode", None)
+                sub_chat_ref = getattr(sub, "chat_ref", None)
+                digest_event_id = int(ev.id) if ev is not None else None
+
                 if not owner_user_id:
+                    # Misconfigured subscription — can't even attribute a
+                    # UsageEvent (user_id NOT NULL). Just mark failed.
                     print(f"[notifications_runner] DIGEST_SKIP sub_id={sub.id} ev_id={ev.id} reason=NO_OWNER_USER_ID")
                     await _mark_digest_events(db, [int(ev.id)], STATUS_FAILED)
                     continue
@@ -453,8 +580,23 @@ async def run_tick() -> int:
                     await _mark_digest_events(db, [int(ev.id)], STATUS_FAILED)
                     exit_code = 1
                     print(f"[notifications_runner] DIGEST_FAILED_UNKNOWN_TYPE owner_user_id={owner_user_id} sub_id={sid} ev_id={ev.id}")
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=False,
+                        meta={
+                            "subscription_type": "digest",
+                            "digest_event_id": digest_event_id,
+                            "error_code": "WRONG_SUBSCRIPTION_TYPE_FOR_DIGEST_DISPATCH",
+                            "error_message": f"expected summary/digest, got {sub_type or 'empty'}",
+                        },
+                    )
                     continue
 
+                group_t0 = time.perf_counter()
                 try:
                     dest_chat_id = await _get_dest_chat_id(db, owner_user_id)
                     if not dest_chat_id:
@@ -465,12 +607,48 @@ async def run_tick() -> int:
                     await bot_send_message(chat_id=int(dest_chat_id), text=text)
 
                     await _mark_digest_events(db, [int(ev.id)], STATUS_SENT)
-                    print(f"[notifications_runner] DIGEST_SENT owner_user_id={owner_user_id} sub_id={sid} ev_id={ev.id}")
+                    elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
+                    print(
+                        f"[notifications_runner] DIGEST_SENT owner_user_id={owner_user_id} "
+                        f"sub_id={sid} ev_id={ev.id}"
+                    )
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=True,
+                        meta={
+                            "subscription_type": "digest",
+                            "digest_event_id": digest_event_id,
+                            "elapsed_ms": elapsed_ms,
+                        },
+                    )
 
                 except Exception as e:
                     await _mark_digest_events(db, [int(ev.id)], STATUS_FAILED)
+                    elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
                     exit_code = 1
-                    print(f"[notifications_runner] DIGEST_SEND_FAILED owner_user_id={owner_user_id} sub_id={sid} ev_id={ev.id} err={e}")
+                    print(
+                        f"[notifications_runner] DIGEST_SEND_FAILED owner_user_id={owner_user_id} "
+                        f"sub_id={sid} ev_id={ev.id} err={e}"
+                    )
+                    await _record_bot_dispatch_event(
+                        db,
+                        owner_user_id=owner_user_id,
+                        subscription_id=sid,
+                        source_mode=sub_source_mode,
+                        chat_ref=sub_chat_ref,
+                        success=False,
+                        meta={
+                            "subscription_type": "digest",
+                            "digest_event_id": digest_event_id,
+                            "elapsed_ms": elapsed_ms,
+                            "error_code": _derive_dispatch_error_code(e),
+                            "error_message": (str(e) or "")[:300] or None,
+                        },
+                    )
 
     else:
         print("[notifications_runner] No queued digest_events")
