@@ -49,6 +49,7 @@ from typing import Literal, List, Optional
 from email_service import send_feedback_email, FEEDBACK_RECIPIENT_EMAIL
 from service_account_routes import router as service_account_router
 from service_account_admin_routes import router as service_account_admin_router
+from admin_routes import router as admin_router
 
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -160,6 +161,7 @@ app.include_router(auth_router)
 app.include_router(service_account_router)
 app.include_router(service_account_admin_router)
 app.include_router(diagnostics_router)
+app.include_router(admin_router)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEV_OWNER_USER_ID = int(os.getenv("DEV_OWNER_USER_ID", "1"))
