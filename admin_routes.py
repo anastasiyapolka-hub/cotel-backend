@@ -440,9 +440,15 @@ async def _safe_rollback(db: AsyncSession) -> None:
         print(f"[admin] safe_rollback failed: {e}")
 
 
-async def _section_usage_summary(db: AsyncSession, u: User) -> dict[str, Any]:
+async def _section_usage_summary(db: AsyncSession, user_id_int: int) -> dict[str, Any]:
     """qa_* counters + JSONB-aggregated breakdowns. Defensive: each
-    sub-query is isolated so JSONB-cast errors don't poison the rest."""
+    sub-query is isolated so JSONB-cast errors don't poison the rest.
+
+    IMPORTANT: takes `user_id_int` as a plain int, not the User ORM object.
+    Reason: after `await db.rollback()` SQLAlchemy expires the identity map,
+    and accessing `u.id` would trigger a lazy reload from inside our error
+    handler — which is sync-from-async and explodes with MissingGreenlet.
+    """
     now = _utc_now()
     day_p = _day_start(now)
     mon_p = _month_start(now)
@@ -462,52 +468,57 @@ async def _section_usage_summary(db: AsyncSession, u: User) -> dict[str, Any]:
             value = await coro_factory()
             on_success(value)
         except Exception as e:  # noqa: BLE001
-            print(f"[admin/users/{u.id}] {label} failed: {e}")
+            print(f"[admin/users/{user_id_int}] {label} failed: {e}")
             traceback.print_exc()
             await _safe_rollback(db)
             out["_errors"].append(label)
 
     await _try("qa_today",
-               lambda: _get_used_counter(db, user_id=u.id, metric_code="qa_request",
+               lambda: _get_used_counter(db, user_id=user_id_int, metric_code="qa_request",
                                          period_type="day", period_start=day_p),
                lambda v: out.update(qa_today=v))
     await _try("qa_month",
-               lambda: _get_used_counter(db, user_id=u.id, metric_code="qa_request",
+               lambda: _get_used_counter(db, user_id=user_id_int, metric_code="qa_request",
                                          period_type="month", period_start=mon_p),
                lambda v: out.update(qa_month=v))
     await _try("qa_total_success",
-               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_success"),
+               lambda: _count_usage_events(db, user_id=user_id_int, event_type="qa_request_success"),
                lambda v: out.update(qa_total_success=v))
     await _try("qa_total_failed",
-               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_failed"),
+               lambda: _count_usage_events(db, user_id=user_id_int, event_type="qa_request_failed"),
                lambda v: out.update(qa_total_failed=v))
     await _try("qa_total_rejected",
-               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_rejected"),
+               lambda: _count_usage_events(db, user_id=user_id_int, event_type="qa_request_rejected"),
                lambda v: out.update(qa_total_rejected=v))
 
-    # models_used — JSONB grouping by meta_json->>'ai_model'
+    # models_used — JSONB grouping by meta_json->>'ai_model'.
+    # NOTE: we use raw SQL with the JSON key inlined as a literal because
+    # SQLAlchemy's `meta_json["ai_model"].astext` parameterizes the key,
+    # and PG treats `meta_json->>$1` and `meta_json->>$5` as DIFFERENT
+    # expressions even when the bind values are identical — which breaks
+    # GROUP BY with `column "meta_json" must appear in the GROUP BY clause`.
     async def _models():
         rows = await db.execute(
-            select(
-                UsageEvent.meta_json["ai_model"].astext.label("ai_model"),
-                func.count().label("cnt"),
-            )
-            .where(
-                UsageEvent.user_id == u.id,
-                UsageEvent.event_type == "qa_request_success",
-                UsageEvent.meta_json["ai_model"].astext.isnot(None),
-            )
-            .group_by(UsageEvent.meta_json["ai_model"].astext)
+            sa.text(
+                "SELECT meta_json->>'ai_model' AS ai_model, COUNT(*) AS cnt "
+                "FROM usage_events "
+                "WHERE user_id = :uid "
+                "  AND event_type = 'qa_request_success' "
+                "  AND (meta_json->>'ai_model') IS NOT NULL "
+                "GROUP BY meta_json->>'ai_model'"
+            ),
+            {"uid": user_id_int},
         )
         return {str(r.ai_model): int(r.cnt) for r in rows.all()}
     await _try("models_used", _models, lambda v: out.update(models_used=v))
 
-    # source_modes — plain grouping
+    # source_modes — plain grouping by an actual column (no JSONB), so the
+    # SQLAlchemy ORM form is safe here.
     async def _sources():
         rows = await db.execute(
             select(UsageEvent.source_mode, func.count())
             .where(
-                UsageEvent.user_id == u.id,
+                UsageEvent.user_id == user_id_int,
                 UsageEvent.event_type == "qa_request_success",
                 UsageEvent.source_mode.isnot(None),
             )
@@ -516,26 +527,20 @@ async def _section_usage_summary(db: AsyncSession, u: User) -> dict[str, Any]:
         return {str(sm): int(cnt) for sm, cnt in rows.all()}
     await _try("source_modes", _sources, lambda v: out.update(source_modes=v))
 
-    # avg_durations — three AVGs over JSONB-cast integers. We coerce defensively
-    # using a CASE-based regex check so any non-integer text (e.g. floats stored
-    # under duration_ms_*) doesn't blow up the whole query in PG.
+    # avg_durations — three AVGs over JSONB-cast numerics. No GROUP BY here,
+    # so the SQLAlchemy ORM form is safe. Cast to Numeric (not Integer) to
+    # tolerate float values that may have ended up in duration fields.
     async def _avgs():
-        # SQLAlchemy-friendly: cast meta->>'k' to numeric (which accepts ints and floats),
-        # then average. This avoids "invalid input syntax for type integer" if any older
-        # row happened to store a float there.
-        def _avg_numeric(key: str):
-            return func.avg(
-                sa.cast(UsageEvent.meta_json[key].astext, sa.Numeric(20, 6))
-            )
         row = (await db.execute(
-            select(
-                _avg_numeric("duration_ms_total").label("avg_total"),
-                _avg_numeric("input_tokens").label("avg_in"),
-                _avg_numeric("output_tokens").label("avg_out"),
-            ).where(
-                UsageEvent.user_id == u.id,
-                UsageEvent.event_type == "qa_request_success",
-            )
+            sa.text(
+                "SELECT "
+                "  AVG((meta_json->>'duration_ms_total')::numeric) AS avg_total, "
+                "  AVG((meta_json->>'input_tokens')::numeric)      AS avg_in, "
+                "  AVG((meta_json->>'output_tokens')::numeric)     AS avg_out "
+                "FROM usage_events "
+                "WHERE user_id = :uid AND event_type = 'qa_request_success'"
+            ),
+            {"uid": user_id_int},
         )).one_or_none()
         if row is None:
             return {}
@@ -550,16 +555,16 @@ async def _section_usage_summary(db: AsyncSession, u: User) -> dict[str, Any]:
     await _try("avg_durations", _avgs, lambda v: out.update(v))
 
     await _try("estimated_cost_usd_total",
-               lambda: _sum_estimated_cost(db, user_id=u.id),
+               lambda: _sum_estimated_cost(db, user_id=user_id_int),
                lambda v: out.update(estimated_cost_usd_total=v))
     await _try("estimated_cost_usd_month",
-               lambda: _sum_estimated_cost(db, user_id=u.id, since=month_start_dt),
+               lambda: _sum_estimated_cost(db, user_id=user_id_int, since=month_start_dt),
                lambda v: out.update(estimated_cost_usd_month=v))
 
     return out
 
 
-async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
+async def _section_telegram(db: AsyncSession, user_id_int: int) -> dict[str, Any]:
     now = _utc_now()
     out: dict[str, Any] = {"web_sessions": [], "telegram_sessions": [], "bot_links": [], "_errors": []}
 
@@ -567,7 +572,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
         web_rows = (
             await db.execute(
                 select(WebSession)
-                .where(WebSession.user_id == u.id)
+                .where(WebSession.user_id == user_id_int)
                 .order_by(WebSession.created_at.desc())
                 .limit(20)
             )
@@ -585,7 +590,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
             for s in web_rows
         ]
     except Exception as e:  # noqa: BLE001
-        print(f"[admin/users/{u.id}] web_sessions failed: {e}")
+        print(f"[admin/users/{user_id_int}] web_sessions failed: {e}")
         traceback.print_exc()
         await _safe_rollback(db)
         out["_errors"].append("web_sessions")
@@ -594,7 +599,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
         tg_rows = (
             await db.execute(
                 select(TelegramSession)
-                .where(TelegramSession.owner_user_id == u.id)
+                .where(TelegramSession.owner_user_id == user_id_int)
                 .order_by(TelegramSession.created_at.desc())
             )
         ).scalars().all()
@@ -609,7 +614,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
             for t in tg_rows
         ]
     except Exception as e:  # noqa: BLE001
-        print(f"[admin/users/{u.id}] telegram_sessions failed: {e}")
+        print(f"[admin/users/{user_id_int}] telegram_sessions failed: {e}")
         traceback.print_exc()
         await _safe_rollback(db)
         out["_errors"].append("telegram_sessions")
@@ -618,7 +623,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
         bot_rows = (
             await db.execute(
                 select(BotUserLink)
-                .where(BotUserLink.owner_user_id == u.id)
+                .where(BotUserLink.owner_user_id == user_id_int)
                 .order_by(BotUserLink.created_at.desc())
             )
         ).scalars().all()
@@ -633,7 +638,7 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
             for b in bot_rows
         ]
     except Exception as e:  # noqa: BLE001
-        print(f"[admin/users/{u.id}] bot_links failed: {e}")
+        print(f"[admin/users/{user_id_int}] bot_links failed: {e}")
         traceback.print_exc()
         await _safe_rollback(db)
         out["_errors"].append("bot_links")
@@ -641,107 +646,120 @@ async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
     return out
 
 
-async def _section_subscriptions(db: AsyncSession, u: User) -> list[dict[str, Any]]:
+async def _section_subscriptions(db: AsyncSession, user_id_int: int) -> list[dict[str, Any]]:
     try:
         sub_rows = (
             await db.execute(
                 select(Subscription, SubscriptionState)
                 .outerjoin(SubscriptionState, SubscriptionState.subscription_id == Subscription.id)
-                .where(Subscription.owner_user_id == u.id)
+                .where(Subscription.owner_user_id == user_id_int)
                 .order_by(Subscription.created_at.desc())
             )
         ).all()
     except Exception as e:  # noqa: BLE001
-        print(f"[admin/users/{u.id}] subscriptions list failed: {e}")
+        print(f"[admin/users/{user_id_int}] subscriptions list failed: {e}")
         traceback.print_exc()
         await _safe_rollback(db)
         return []
 
-    subs: list[dict[str, Any]] = []
+    # Snapshot all sub IDs upfront — after a potential rollback in the loop,
+    # ORM objects could be expired and triggering lazy loads from a print()
+    # would explode with MissingGreenlet.
+    sub_snapshots: list[tuple[int, dict, Any]] = []
     for sub, state in sub_rows:
-        # Per-sub aggregates — collected defensively so one bad sub doesn't break the others.
+        sub_snapshots.append((
+            int(sub.id),
+            {
+                "id": int(sub.id),
+                "name": sub.name,
+                "source_mode": sub.source_mode,
+                "subscription_type": sub.subscription_type,
+                "frequency_minutes": int(sub.frequency_minutes),
+                "ai_model": sub.ai_model,
+                "is_active": bool(sub.is_active),
+                "status": sub.status,
+                "is_trial": bool(sub.is_trial),
+                "trial_started_at": _iso(sub.trial_started_at),
+                "trial_ends_at": _iso(sub.trial_ends_at),
+                "created_at": _iso(sub.created_at),
+                "updated_at": _iso(sub.updated_at),
+                "chat_ref_display": _mask_chat_ref_for_source(sub.chat_ref, sub.source_mode),
+                "last_checked_at": _iso(getattr(state, "last_checked_at", None)),
+                "last_success_at": _iso(getattr(state, "last_success_at", None)),
+                "next_run_at": _iso(getattr(state, "next_run_at", None)),
+                "last_error": sub.last_error,
+            },
+            state,
+        ))
+
+    subs: list[dict[str, Any]] = []
+    for sub_id, sub_dict, _state in sub_snapshots:
         try:
             match_total = int((await db.execute(
-                select(func.count()).select_from(MatchEvent).where(MatchEvent.subscription_id == sub.id)
+                select(func.count()).select_from(MatchEvent).where(MatchEvent.subscription_id == sub_id)
             )).scalar_one() or 0)
             digest_total = int((await db.execute(
-                select(func.count()).select_from(DigestEvent).where(DigestEvent.subscription_id == sub.id)
+                select(func.count()).select_from(DigestEvent).where(DigestEvent.subscription_id == sub_id)
             )).scalar_one() or 0)
             notify_queued = int((await db.execute(
                 select(func.count()).select_from(MatchEvent).where(
-                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.subscription_id == sub_id,
                     MatchEvent.notify_status == "queued",
                 )
             )).scalar_one() or 0)
             notify_sent = int((await db.execute(
                 select(func.count()).select_from(MatchEvent).where(
-                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.subscription_id == sub_id,
                     MatchEvent.notify_status == "sent",
                 )
             )).scalar_one() or 0)
             notify_failed = int((await db.execute(
                 select(func.count()).select_from(MatchEvent).where(
-                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.subscription_id == sub_id,
                     MatchEvent.notify_status == "failed",
                 )
             )).scalar_one() or 0)
         except Exception as e:  # noqa: BLE001
-            print(f"[admin/users/{u.id}] sub#{sub.id} aggregates failed: {e}")
+            print(f"[admin/users/{user_id_int}] sub#{sub_id} aggregates failed: {e}")
             traceback.print_exc()
             await _safe_rollback(db)
             match_total = digest_total = notify_queued = notify_sent = notify_failed = None
 
-        subs.append({
-            "id": int(sub.id),
-            "name": sub.name,
-            "source_mode": sub.source_mode,
-            "subscription_type": sub.subscription_type,
-            "frequency_minutes": int(sub.frequency_minutes),
-            "ai_model": sub.ai_model,
-            "is_active": bool(sub.is_active),
-            "status": sub.status,
-            "is_trial": bool(sub.is_trial),
-            "trial_started_at": _iso(sub.trial_started_at),
-            "trial_ends_at": _iso(sub.trial_ends_at),
-            "created_at": _iso(sub.created_at),
-            "updated_at": _iso(sub.updated_at),
-            "chat_ref_display": _mask_chat_ref_for_source(sub.chat_ref, sub.source_mode),
-            "last_checked_at": _iso(getattr(state, "last_checked_at", None)),
-            "last_success_at": _iso(getattr(state, "last_success_at", None)),
-            "next_run_at": _iso(getattr(state, "next_run_at", None)),
+        sub_dict.update({
             "match_events_count": match_total,
             "digest_events_count": digest_total,
             "notify_queued_count": notify_queued,
             "notify_sent_count": notify_sent,
             "notify_failed_count": notify_failed,
-            "last_error": sub.last_error,
         })
+        subs.append(sub_dict)
     return subs
 
 
-async def _section_recent_usage_events(db: AsyncSession, u: User) -> list[dict[str, Any]]:
+async def _section_recent_usage_events(db: AsyncSession, user_id_int: int) -> list[dict[str, Any]]:
     try:
         rows = (
             await db.execute(
                 select(UsageEvent)
-                .where(UsageEvent.user_id == u.id)
+                .where(UsageEvent.user_id == user_id_int)
                 .order_by(UsageEvent.id.desc())
                 .limit(50)
             )
         ).scalars().all()
     except Exception as e:  # noqa: BLE001
-        print(f"[admin/users/{u.id}] recent_usage_events fetch failed: {e}")
+        print(f"[admin/users/{user_id_int}] recent_usage_events fetch failed: {e}")
         traceback.print_exc()
         await _safe_rollback(db)
         return []
 
+    # Serialize first (synchronous loop, no DB calls) so we don't risk
+    # expired-attribute lazy loads if a later error triggers a rollback.
     out: list[dict[str, Any]] = []
     for ev in rows:
         try:
             out.append(_serialize_usage_event(ev))
         except Exception as e:  # noqa: BLE001
-            # Skip one broken event; don't poison the list.
-            print(f"[admin/users/{u.id}] serialize UsageEvent id={getattr(ev, 'id', '?')} failed: {e}")
+            print(f"[admin/users/{user_id_int}] serialize UsageEvent id=? failed: {e}")
             traceback.print_exc()
     return out
 
@@ -768,9 +786,12 @@ async def admin_user_detail(
     if not u:
         raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})
 
-    # Profile is built from data already loaded — can't fail.
+    # Snapshot the User fields into a plain dict NOW, before any later call
+    # can trigger a rollback that would expire `u` and force lazy reloads
+    # from inside async contexts (which fail with MissingGreenlet).
+    user_id_int = int(u.id)
     profile = {
-        "id": int(u.id),
+        "id": user_id_int,
         "email": u.email,
         "phone_masked": _mask_phone(u.phone),
         "plan": u.plan,
@@ -784,10 +805,10 @@ async def admin_user_detail(
         "logout_revokes_telegram": bool(u.logout_revokes_telegram),
     }
 
-    usage_summary = await _section_usage_summary(db, u)
-    telegram = await _section_telegram(db, u)
-    subs = await _section_subscriptions(db, u)
-    recent = await _section_recent_usage_events(db, u)
+    usage_summary = await _section_usage_summary(db, user_id_int)
+    telegram = await _section_telegram(db, user_id_int)
+    subs = await _section_subscriptions(db, user_id_int)
+    recent = await _section_recent_usage_events(db, user_id_int)
 
     return {
         "profile": profile,
