@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import traceback
 from datetime import datetime, date, timezone
 from typing import Any, Optional
 
@@ -430,23 +431,344 @@ async def admin_list_users(
 # GET /admin/users/{user_id}
 # ---------------------------------------------------------------------------
 
+async def _safe_rollback(db: AsyncSession) -> None:
+    """Roll back the session so the next SELECT in the request can succeed
+    after PostgreSQL aborted the transaction."""
+    try:
+        await db.rollback()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin] safe_rollback failed: {e}")
+
+
+async def _section_usage_summary(db: AsyncSession, u: User) -> dict[str, Any]:
+    """qa_* counters + JSONB-aggregated breakdowns. Defensive: each
+    sub-query is isolated so JSONB-cast errors don't poison the rest."""
+    now = _utc_now()
+    day_p = _day_start(now)
+    mon_p = _month_start(now)
+    month_start_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+    out: dict[str, Any] = {
+        "qa_today": 0, "qa_month": 0,
+        "qa_total_success": 0, "qa_total_failed": 0, "qa_total_rejected": 0,
+        "models_used": {}, "source_modes": {},
+        "avg_duration_ms_total": None, "avg_input_tokens": None, "avg_output_tokens": None,
+        "estimated_cost_usd_total": None, "estimated_cost_usd_month": None,
+        "_errors": [],
+    }
+
+    async def _try(label, coro_factory, on_success):
+        try:
+            value = await coro_factory()
+            on_success(value)
+        except Exception as e:  # noqa: BLE001
+            print(f"[admin/users/{u.id}] {label} failed: {e}")
+            traceback.print_exc()
+            await _safe_rollback(db)
+            out["_errors"].append(label)
+
+    await _try("qa_today",
+               lambda: _get_used_counter(db, user_id=u.id, metric_code="qa_request",
+                                         period_type="day", period_start=day_p),
+               lambda v: out.update(qa_today=v))
+    await _try("qa_month",
+               lambda: _get_used_counter(db, user_id=u.id, metric_code="qa_request",
+                                         period_type="month", period_start=mon_p),
+               lambda v: out.update(qa_month=v))
+    await _try("qa_total_success",
+               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_success"),
+               lambda v: out.update(qa_total_success=v))
+    await _try("qa_total_failed",
+               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_failed"),
+               lambda v: out.update(qa_total_failed=v))
+    await _try("qa_total_rejected",
+               lambda: _count_usage_events(db, user_id=u.id, event_type="qa_request_rejected"),
+               lambda v: out.update(qa_total_rejected=v))
+
+    # models_used — JSONB grouping by meta_json->>'ai_model'
+    async def _models():
+        rows = await db.execute(
+            select(
+                UsageEvent.meta_json["ai_model"].astext.label("ai_model"),
+                func.count().label("cnt"),
+            )
+            .where(
+                UsageEvent.user_id == u.id,
+                UsageEvent.event_type == "qa_request_success",
+                UsageEvent.meta_json["ai_model"].astext.isnot(None),
+            )
+            .group_by(UsageEvent.meta_json["ai_model"].astext)
+        )
+        return {str(r.ai_model): int(r.cnt) for r in rows.all()}
+    await _try("models_used", _models, lambda v: out.update(models_used=v))
+
+    # source_modes — plain grouping
+    async def _sources():
+        rows = await db.execute(
+            select(UsageEvent.source_mode, func.count())
+            .where(
+                UsageEvent.user_id == u.id,
+                UsageEvent.event_type == "qa_request_success",
+                UsageEvent.source_mode.isnot(None),
+            )
+            .group_by(UsageEvent.source_mode)
+        )
+        return {str(sm): int(cnt) for sm, cnt in rows.all()}
+    await _try("source_modes", _sources, lambda v: out.update(source_modes=v))
+
+    # avg_durations — three AVGs over JSONB-cast integers. We coerce defensively
+    # using a CASE-based regex check so any non-integer text (e.g. floats stored
+    # under duration_ms_*) doesn't blow up the whole query in PG.
+    async def _avgs():
+        # SQLAlchemy-friendly: cast meta->>'k' to numeric (which accepts ints and floats),
+        # then average. This avoids "invalid input syntax for type integer" if any older
+        # row happened to store a float there.
+        def _avg_numeric(key: str):
+            return func.avg(
+                sa.cast(UsageEvent.meta_json[key].astext, sa.Numeric(20, 6))
+            )
+        row = (await db.execute(
+            select(
+                _avg_numeric("duration_ms_total").label("avg_total"),
+                _avg_numeric("input_tokens").label("avg_in"),
+                _avg_numeric("output_tokens").label("avg_out"),
+            ).where(
+                UsageEvent.user_id == u.id,
+                UsageEvent.event_type == "qa_request_success",
+            )
+        )).one_or_none()
+        if row is None:
+            return {}
+        result: dict[str, Optional[int]] = {}
+        if row.avg_total is not None:
+            result["avg_duration_ms_total"] = int(float(row.avg_total))
+        if row.avg_in is not None:
+            result["avg_input_tokens"] = int(float(row.avg_in))
+        if row.avg_out is not None:
+            result["avg_output_tokens"] = int(float(row.avg_out))
+        return result
+    await _try("avg_durations", _avgs, lambda v: out.update(v))
+
+    await _try("estimated_cost_usd_total",
+               lambda: _sum_estimated_cost(db, user_id=u.id),
+               lambda v: out.update(estimated_cost_usd_total=v))
+    await _try("estimated_cost_usd_month",
+               lambda: _sum_estimated_cost(db, user_id=u.id, since=month_start_dt),
+               lambda v: out.update(estimated_cost_usd_month=v))
+
+    return out
+
+
+async def _section_telegram(db: AsyncSession, u: User) -> dict[str, Any]:
+    now = _utc_now()
+    out: dict[str, Any] = {"web_sessions": [], "telegram_sessions": [], "bot_links": [], "_errors": []}
+
+    try:
+        web_rows = (
+            await db.execute(
+                select(WebSession)
+                .where(WebSession.user_id == u.id)
+                .order_by(WebSession.created_at.desc())
+                .limit(20)
+            )
+        ).scalars().all()
+        out["web_sessions"] = [
+            {
+                "created_at": _iso(s.created_at),
+                "expires_at": _iso(s.expires_at),
+                "revoked_at": _iso(s.revoked_at),
+                "last_seen_at": _iso(s.last_seen_at),
+                "user_agent": _short_ua(s.user_agent),
+                "ip_masked": _mask_ip(s.ip),
+                "is_active": bool(s.revoked_at is None and s.expires_at and s.expires_at > now),
+            }
+            for s in web_rows
+        ]
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{u.id}] web_sessions failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        out["_errors"].append("web_sessions")
+
+    try:
+        tg_rows = (
+            await db.execute(
+                select(TelegramSession)
+                .where(TelegramSession.owner_user_id == u.id)
+                .order_by(TelegramSession.created_at.desc())
+            )
+        ).scalars().all()
+        out["telegram_sessions"] = [
+            {
+                "is_active": bool(t.is_active),
+                "created_at": _iso(t.created_at),
+                "updated_at": _iso(t.updated_at),
+                "last_used_at": _iso(t.last_used_at),
+                "revoked_at": _iso(t.revoked_at),
+            }
+            for t in tg_rows
+        ]
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{u.id}] telegram_sessions failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        out["_errors"].append("telegram_sessions")
+
+    try:
+        bot_rows = (
+            await db.execute(
+                select(BotUserLink)
+                .where(BotUserLink.owner_user_id == u.id)
+                .order_by(BotUserLink.created_at.desc())
+            )
+        ).scalars().all()
+        out["bot_links"] = [
+            {
+                "started_at": _iso(b.started_at),
+                "is_blocked": bool(b.is_blocked),
+                "created_at": _iso(b.created_at),
+                "updated_at": _iso(b.updated_at),
+                "telegram_chat_id_masked": _mask_chat_id(b.telegram_chat_id),
+            }
+            for b in bot_rows
+        ]
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{u.id}] bot_links failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        out["_errors"].append("bot_links")
+
+    return out
+
+
+async def _section_subscriptions(db: AsyncSession, u: User) -> list[dict[str, Any]]:
+    try:
+        sub_rows = (
+            await db.execute(
+                select(Subscription, SubscriptionState)
+                .outerjoin(SubscriptionState, SubscriptionState.subscription_id == Subscription.id)
+                .where(Subscription.owner_user_id == u.id)
+                .order_by(Subscription.created_at.desc())
+            )
+        ).all()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{u.id}] subscriptions list failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        return []
+
+    subs: list[dict[str, Any]] = []
+    for sub, state in sub_rows:
+        # Per-sub aggregates — collected defensively so one bad sub doesn't break the others.
+        try:
+            match_total = int((await db.execute(
+                select(func.count()).select_from(MatchEvent).where(MatchEvent.subscription_id == sub.id)
+            )).scalar_one() or 0)
+            digest_total = int((await db.execute(
+                select(func.count()).select_from(DigestEvent).where(DigestEvent.subscription_id == sub.id)
+            )).scalar_one() or 0)
+            notify_queued = int((await db.execute(
+                select(func.count()).select_from(MatchEvent).where(
+                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.notify_status == "queued",
+                )
+            )).scalar_one() or 0)
+            notify_sent = int((await db.execute(
+                select(func.count()).select_from(MatchEvent).where(
+                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.notify_status == "sent",
+                )
+            )).scalar_one() or 0)
+            notify_failed = int((await db.execute(
+                select(func.count()).select_from(MatchEvent).where(
+                    MatchEvent.subscription_id == sub.id,
+                    MatchEvent.notify_status == "failed",
+                )
+            )).scalar_one() or 0)
+        except Exception as e:  # noqa: BLE001
+            print(f"[admin/users/{u.id}] sub#{sub.id} aggregates failed: {e}")
+            traceback.print_exc()
+            await _safe_rollback(db)
+            match_total = digest_total = notify_queued = notify_sent = notify_failed = None
+
+        subs.append({
+            "id": int(sub.id),
+            "name": sub.name,
+            "source_mode": sub.source_mode,
+            "subscription_type": sub.subscription_type,
+            "frequency_minutes": int(sub.frequency_minutes),
+            "ai_model": sub.ai_model,
+            "is_active": bool(sub.is_active),
+            "status": sub.status,
+            "is_trial": bool(sub.is_trial),
+            "trial_started_at": _iso(sub.trial_started_at),
+            "trial_ends_at": _iso(sub.trial_ends_at),
+            "created_at": _iso(sub.created_at),
+            "updated_at": _iso(sub.updated_at),
+            "chat_ref_display": _mask_chat_ref_for_source(sub.chat_ref, sub.source_mode),
+            "last_checked_at": _iso(getattr(state, "last_checked_at", None)),
+            "last_success_at": _iso(getattr(state, "last_success_at", None)),
+            "next_run_at": _iso(getattr(state, "next_run_at", None)),
+            "match_events_count": match_total,
+            "digest_events_count": digest_total,
+            "notify_queued_count": notify_queued,
+            "notify_sent_count": notify_sent,
+            "notify_failed_count": notify_failed,
+            "last_error": sub.last_error,
+        })
+    return subs
+
+
+async def _section_recent_usage_events(db: AsyncSession, u: User) -> list[dict[str, Any]]:
+    try:
+        rows = (
+            await db.execute(
+                select(UsageEvent)
+                .where(UsageEvent.user_id == u.id)
+                .order_by(UsageEvent.id.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{u.id}] recent_usage_events fetch failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        return []
+
+    out: list[dict[str, Any]] = []
+    for ev in rows:
+        try:
+            out.append(_serialize_usage_event(ev))
+        except Exception as e:  # noqa: BLE001
+            # Skip one broken event; don't poison the list.
+            print(f"[admin/users/{u.id}] serialize UsageEvent id={getattr(ev, 'id', '?')} failed: {e}")
+            traceback.print_exc()
+    return out
+
+
 @router.get("/users/{user_id}")
 async def admin_user_detail(
     user_id: int,
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    res = await db.execute(select(User).where(User.id == user_id))
-    u = res.scalar_one_or_none()
+    """User detail card. Each major section runs in its own try/except so a
+    failure in one (e.g. JSONB cast error) doesn't 500 the whole endpoint.
+    Section errors are logged to stdout (visible in Render logs) and the
+    response surfaces a `_errors` list inside each affected block."""
+    try:
+        res = await db.execute(select(User).where(User.id == user_id))
+        u = res.scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{user_id}] user lookup failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        raise HTTPException(status_code=500, detail={"code": "USER_LOOKUP_FAILED"})
+
     if not u:
         raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})
 
-    now = _utc_now()
-    day_p = _day_start(now)
-    mon_p = _month_start(now)
-    month_start_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-
-    # --- profile ---
+    # Profile is built from data already loaded — can't fail.
     profile = {
         "id": int(u.id),
         "email": u.email,
@@ -462,215 +784,10 @@ async def admin_user_detail(
         "logout_revokes_telegram": bool(u.logout_revokes_telegram),
     }
 
-    # --- usage summary ---
-    qa_today = await _get_used_counter(db, user_id=u.id, metric_code="qa_request", period_type="day", period_start=day_p)
-    qa_month = await _get_used_counter(db, user_id=u.id, metric_code="qa_request", period_type="month", period_start=mon_p)
-    qa_success = await _count_usage_events(db, user_id=u.id, event_type="qa_request_success")
-    qa_failed = await _count_usage_events(db, user_id=u.id, event_type="qa_request_failed")
-    qa_rejected = await _count_usage_events(db, user_id=u.id, event_type="qa_request_rejected")
-
-    models_used: dict[str, int] = {}
-    rows = await db.execute(
-        select(
-            UsageEvent.meta_json["ai_model"].astext.label("ai_model"),
-            func.count().label("cnt"),
-        )
-        .where(
-            UsageEvent.user_id == u.id,
-            UsageEvent.event_type == "qa_request_success",
-            UsageEvent.meta_json["ai_model"].astext.isnot(None),
-        )
-        .group_by(UsageEvent.meta_json["ai_model"].astext)
-    )
-    for r in rows.all():
-        models_used[str(r.ai_model)] = int(r.cnt)
-
-    source_modes: dict[str, int] = {}
-    rows = await db.execute(
-        select(UsageEvent.source_mode, func.count())
-        .where(
-            UsageEvent.user_id == u.id,
-            UsageEvent.event_type == "qa_request_success",
-            UsageEvent.source_mode.isnot(None),
-        )
-        .group_by(UsageEvent.source_mode)
-    )
-    for sm, cnt in rows.all():
-        source_modes[str(sm)] = int(cnt)
-
-    avg_durations_q = select(
-        func.avg(sa.cast(UsageEvent.meta_json["duration_ms_total"].astext, sa.Integer)).label("avg_total"),
-        func.avg(sa.cast(UsageEvent.meta_json["input_tokens"].astext, sa.Integer)).label("avg_in"),
-        func.avg(sa.cast(UsageEvent.meta_json["output_tokens"].astext, sa.Integer)).label("avg_out"),
-    ).where(
-        UsageEvent.user_id == u.id,
-        UsageEvent.event_type == "qa_request_success",
-    )
-    avg_row = (await db.execute(avg_durations_q)).one_or_none()
-    avg_duration_ms_total = int(avg_row.avg_total) if avg_row and avg_row.avg_total is not None else None
-    avg_input_tokens = int(avg_row.avg_in) if avg_row and avg_row.avg_in is not None else None
-    avg_output_tokens = int(avg_row.avg_out) if avg_row and avg_row.avg_out is not None else None
-
-    usage_summary = {
-        "qa_today": qa_today,
-        "qa_month": qa_month,
-        "qa_total_success": qa_success,
-        "qa_total_failed": qa_failed,
-        "qa_total_rejected": qa_rejected,
-        "models_used": models_used,
-        "source_modes": source_modes,
-        "avg_duration_ms_total": avg_duration_ms_total,
-        "avg_input_tokens": avg_input_tokens,
-        "avg_output_tokens": avg_output_tokens,
-        "estimated_cost_usd_total": await _sum_estimated_cost(db, user_id=u.id),
-        "estimated_cost_usd_month": await _sum_estimated_cost(db, user_id=u.id, since=month_start_dt),
-    }
-
-    # --- telegram block ---
-    web_rows = (
-        await db.execute(
-            select(WebSession)
-            .where(WebSession.user_id == u.id)
-            .order_by(WebSession.created_at.desc())
-            .limit(20)
-        )
-    ).scalars().all()
-    web_sessions = [
-        {
-            "created_at": _iso(s.created_at),
-            "expires_at": _iso(s.expires_at),
-            "revoked_at": _iso(s.revoked_at),
-            "last_seen_at": _iso(s.last_seen_at),
-            "user_agent": _short_ua(s.user_agent),
-            "ip_masked": _mask_ip(s.ip),
-            "is_active": bool(s.revoked_at is None and s.expires_at and s.expires_at > now),
-        }
-        for s in web_rows
-    ]
-
-    tg_rows = (
-        await db.execute(
-            select(TelegramSession)
-            .where(TelegramSession.owner_user_id == u.id)
-            .order_by(TelegramSession.created_at.desc())
-        )
-    ).scalars().all()
-    telegram_sessions = [
-        {
-            "is_active": bool(t.is_active),
-            "created_at": _iso(t.created_at),
-            "updated_at": _iso(t.updated_at),
-            "last_used_at": _iso(t.last_used_at),
-            "revoked_at": _iso(t.revoked_at),
-            # session_ciphertext NEVER returned
-        }
-        for t in tg_rows
-    ]
-
-    bot_rows = (
-        await db.execute(
-            select(BotUserLink)
-            .where(BotUserLink.owner_user_id == u.id)
-            .order_by(BotUserLink.created_at.desc())
-        )
-    ).scalars().all()
-    bot_links = [
-        {
-            "started_at": _iso(b.started_at),
-            "is_blocked": bool(b.is_blocked),
-            "created_at": _iso(b.created_at),
-            "updated_at": _iso(b.updated_at),
-            "telegram_chat_id_masked": _mask_chat_id(b.telegram_chat_id),
-        }
-        for b in bot_rows
-    ]
-
-    telegram = {
-        "web_sessions": web_sessions,
-        "telegram_sessions": telegram_sessions,
-        "bot_links": bot_links,
-    }
-
-    # --- subscriptions ---
-    sub_rows = (
-        await db.execute(
-            select(Subscription, SubscriptionState)
-            .outerjoin(SubscriptionState, SubscriptionState.subscription_id == Subscription.id)
-            .where(Subscription.owner_user_id == u.id)
-            .order_by(Subscription.created_at.desc())
-        )
-    ).all()
-
-    subs: list[dict[str, Any]] = []
-    for sub, state in sub_rows:
-        match_total = int((await db.execute(
-            select(func.count()).select_from(MatchEvent).where(MatchEvent.subscription_id == sub.id)
-        )).scalar_one() or 0)
-        digest_total = int((await db.execute(
-            select(func.count()).select_from(DigestEvent).where(DigestEvent.subscription_id == sub.id)
-        )).scalar_one() or 0)
-        notify_queued = int((await db.execute(
-            select(func.count()).select_from(MatchEvent).where(
-                MatchEvent.subscription_id == sub.id,
-                MatchEvent.notify_status == "queued",
-            )
-        )).scalar_one() or 0)
-        notify_sent = int((await db.execute(
-            select(func.count()).select_from(MatchEvent).where(
-                MatchEvent.subscription_id == sub.id,
-                MatchEvent.notify_status == "sent",
-            )
-        )).scalar_one() or 0)
-        notify_failed = int((await db.execute(
-            select(func.count()).select_from(MatchEvent).where(
-                MatchEvent.subscription_id == sub.id,
-                MatchEvent.notify_status == "failed",
-            )
-        )).scalar_one() or 0)
-
-        subs.append(
-            {
-                "id": int(sub.id),
-                "name": sub.name,
-                "source_mode": sub.source_mode,
-                "subscription_type": sub.subscription_type,
-                "frequency_minutes": int(sub.frequency_minutes),
-                "ai_model": sub.ai_model,
-                "is_active": bool(sub.is_active),
-                "status": sub.status,
-                "is_trial": bool(sub.is_trial),
-                "trial_started_at": _iso(sub.trial_started_at),
-                "trial_ends_at": _iso(sub.trial_ends_at),
-                "created_at": _iso(sub.created_at),
-                "updated_at": _iso(sub.updated_at),
-
-                "chat_ref_display": _mask_chat_ref_for_source(sub.chat_ref, sub.source_mode),
-
-                "last_checked_at": _iso(getattr(state, "last_checked_at", None)),
-                "last_success_at": _iso(getattr(state, "last_success_at", None)),
-                "next_run_at": _iso(getattr(state, "next_run_at", None)),
-
-                "match_events_count": match_total,
-                "digest_events_count": digest_total,
-                "notify_queued_count": notify_queued,
-                "notify_sent_count": notify_sent,
-                "notify_failed_count": notify_failed,
-
-                "last_error": sub.last_error,
-                # prompt NEVER returned
-            }
-        )
-
-    # --- recent usage events ---
-    recent_rows = (
-        await db.execute(
-            select(UsageEvent)
-            .where(UsageEvent.user_id == u.id)
-            .order_by(UsageEvent.id.desc())
-            .limit(50)
-        )
-    ).scalars().all()
-    recent = [_serialize_usage_event(ev) for ev in recent_rows]
+    usage_summary = await _section_usage_summary(db, u)
+    telegram = await _section_telegram(db, u)
+    subs = await _section_subscriptions(db, u)
+    recent = await _section_recent_usage_events(db, u)
 
     return {
         "profile": profile,
@@ -685,11 +802,30 @@ async def admin_user_detail(
 # GET /admin/usage-events
 # ---------------------------------------------------------------------------
 
+def _jsonable(value: Any) -> Any:
+    """Recursively coerce a value into something FastAPI's default JSON
+    encoder will accept. Handles Decimal/datetime/date that may have leaked
+    through JSONB deserialization or attribute reads.
+    """
+    from decimal import Decimal
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
 def _serialize_usage_event(ev: UsageEvent) -> dict[str, Any]:
     """Project an UsageEvent into the admin response shape. The full
     meta_json is returned as-is — it never contains text content per
     record_qa_success/_failure contract."""
-    m = ev.meta_json or {}
+    m = _jsonable(ev.meta_json or {})
     return {
         "id": int(ev.id),
         "created_at": _iso(ev.created_at),
