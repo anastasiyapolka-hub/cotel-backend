@@ -363,6 +363,7 @@ async def read_messages_from_entity(client: TelegramClient, entity, days: int) -
 
         collected.append(
             {
+                "message_id": getattr(msg, "id", None),
                 "date": msg_dt.isoformat(),
                 "from": sender_name,
                 "text": text,
@@ -1327,6 +1328,18 @@ async def analyze_chat_via_service_account(
 
             await db.commit()
 
+            # Карта {message_id: permalink} — для кликабельных ссылок
+            # на конкретные сообщения в выдаче LLM.
+            # Для приватных чатов / личек permalink может быть None —
+            # такие токены [msg:ID] фронт просто покажет как обычный текст.
+            from telegram_service import build_message_permalink
+            message_links: dict[int, Optional[str]] = {}
+            for _m in messages:
+                _mid = _m.get("message_id")
+                if _mid is None:
+                    continue
+                message_links[int(_mid)] = build_message_permalink(entity, _mid)
+
             return {
                 "status": "ok",
                 "summary": summary,
@@ -1337,6 +1350,7 @@ async def analyze_chat_via_service_account(
                 "chat_id": getattr(entity, "id", None),
                 "chat_username": getattr(entity, "username", None),
                 "ai_model": ai_model,
+                "message_links": message_links,
                 # Internal QA metrics for the route to log into UsageEvent.
                 # The route pops these before returning to the frontend.
                 "_qa_metrics": {

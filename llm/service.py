@@ -162,7 +162,14 @@ async def summarize_chat_messages(
         date = msg.get("date") or ""
         sender = msg.get("from") or "Unknown"
         text = msg.get("text") or ""
-        lines.append(f"[{date}] {sender}: {text}")
+        msg_id = msg.get("message_id")
+        # Включаем стабильный токен [msg:ID], если есть id —
+        # модель будет ссылаться им же в цитатах, а фронт превратит
+        # токен в кликабельную иконку-ссылку на сообщение в Telegram.
+        if msg_id is not None:
+            lines.append(f"[{date}] [msg:{int(msg_id)}] {sender}: {text}")
+        else:
+            lines.append(f"[{date}] {sender}: {text}")
 
     context = "\n".join(lines)
 
@@ -190,8 +197,16 @@ async def summarize_chat_messages(
         "fits the question.\n"
         "3. When referencing a specific message, cite it with this "
         "format:\n"
-        "       @username: \"short verbatim quote\"\n"
-        "   Keep quotes short and in the original language of the "
+        "       @username [msg:ID]: \"short verbatim quote\"\n"
+        "   - ID is the exact numeric id taken from the [msg:ID] token "
+        "that precedes the message in the chat fragment below. Copy it "
+        "verbatim. Do NOT invent ids and do NOT cite a message that has "
+        "no [msg:ID] token.\n"
+        "   - Place the [msg:ID] token immediately after the @username "
+        "(or display name) and before the colon.\n"
+        "   - If the same message is referenced multiple times in your "
+        "answer, repeat the same [msg:ID] each time.\n"
+        "   - Keep quotes short and in the original language of the "
         "message.\n"
         "4. If the chat contains conflicting information (different "
         "people say different things), surface the conflict — do not "

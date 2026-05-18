@@ -84,6 +84,45 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 
 INVITE_RE = re.compile(r"(?:t\.me\/\+|t\.me\/joinchat\/)([A-Za-z0-9_-]+)")
 
+
+def build_message_permalink(entity, message_id: int) -> Optional[str]:
+    """
+    Построить публичную ссылку на конкретное сообщение в Telegram
+    по entity (объект из Telethon) и message_id.
+
+    Правила:
+      - публичный username (канал/супергруппа/чат с username) →
+        https://t.me/<username>/<message_id>
+      - приватный канал/супергруппа (Telethon Channel без username) →
+        https://t.me/c/<channel_id>/<message_id>
+        (id у Telethon-Channel положительный — это уже "internal" id
+         без префикса -100, который ожидает t.me/c/...)
+      - basic Chat (классическая малая группа) и User (личка) →
+        permalink не существует → None
+    """
+    if entity is None or message_id is None:
+        return None
+
+    # 1) Публичный — есть username
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}/{int(message_id)}"
+
+    # 2) Приватный канал / супергруппа — у Telethon это Channel с broadcast/megagroup
+    # У него есть .id (положительный) и нет .username.
+    # Импортируем локально, чтобы не загромождать верх модуля.
+    try:
+        from telethon.tl.types import Channel as _Channel
+        if isinstance(entity, _Channel):
+            channel_id = getattr(entity, "id", None)
+            if channel_id is not None:
+                return f"https://t.me/c/{int(channel_id)}/{int(message_id)}"
+    except Exception:
+        pass
+
+    # 3) Всё остальное (basic Chat, User) — permalink невозможен
+    return None
+
 def encrypt_session(plain: str) -> str:
     key = os.getenv("TELEGRAM_SESSION_ENC_KEY")
     if not key:
@@ -469,6 +508,7 @@ async def fetch_chat_messages(db: AsyncSession, owner_user_id: int, chat_link: s
                 pass
 
             collected.append({
+                "message_id": getattr(msg, "id", None),
                 "date": msg_dt.isoformat(),
                 "from": sender_name,
                 "text": text,

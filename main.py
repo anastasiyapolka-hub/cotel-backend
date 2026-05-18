@@ -1406,6 +1406,19 @@ async def tg_analyze_chat(
 
     await db.commit()
 
+    # Карта {message_id: permalink} — даёт фронту возможность подставить
+    # кликабельные ссылки на конкретные сообщения вместо токенов [msg:ID]
+    # в тексте ответа LLM. Если ссылка для сообщения построиться не может
+    # (приватная группа / личка) — значение будет None, и фронт просто
+    # уберёт токен из текста.
+    from telegram_service import build_message_permalink as _build_permalink
+    message_links: dict[int, str | None] = {}
+    for _m in messages:
+        _mid = _m.get("message_id")
+        if _mid is None:
+            continue
+        message_links[int(_mid)] = _build_permalink(entity, _mid)
+
     return {
         "status": "ok",
         "summary": summary,
@@ -1413,6 +1426,7 @@ async def tg_analyze_chat(
         "messages_count": messages_fetched_count,
         "source_mode": "personal",
         "ai_model": ai_model,
+        "message_links": message_links,
         "usage": await build_usage_snapshot(db, user=user),
     }
 
