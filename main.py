@@ -63,6 +63,7 @@ from telegram_service import (
     get_current_user as tg_get_current_user,  # <-- переименовали
     fetch_chat_messages,
     list_user_chats,
+    get_telegram_structure,
     logout_telegram,
     qr_login_start,
     qr_login_status,
@@ -1443,12 +1444,15 @@ async def tg_list_chats(
         raise HTTPException(status_code=401, detail="TELEGRAM_NOT_AUTHORIZED")
 
     try:
-        chats = await list_user_chats(db, owner_user_id, limit=limit)
+        structure = await get_telegram_structure(db, owner_user_id, limit=limit)
+        chats = structure["chats"]
+        folders = structure["folders"]
 
         return {
             "status": "ok",
             "count": len(chats),
             "chats": chats,
+            "folders": folders,
             "me": {
                 "id": me.id,
                 "username": me.username,

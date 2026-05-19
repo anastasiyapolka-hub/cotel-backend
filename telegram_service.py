@@ -524,53 +524,152 @@ async def fetch_chat_messages(db: AsyncSession, owner_user_id: int, chat_link: s
 
 from telethon.tl.types import User, Chat, Channel
 
-async def list_user_chats(db: AsyncSession, owner_user_id: int, limit: int = 500):
+
+def _dialog_entity_to_chat_dict(ent) -> Optional[Dict]:
     """
-    Возвращает список доступных диалогов пользователя для выбора на фронте.
-    Отдаём минимум полей: id, title, type, username (если есть).
+    Преобразовать Telethon-entity (User/Chat/Channel) в обычный dict
+    для отдачи на фронт. Возвращает None для неподдерживаемых типов.
+    Используется и при выдаче плоского списка чатов, и при сборке
+    структуры с папками.
+    """
+    if isinstance(ent, User):
+        chat_type = "user"
+        title = " ".join(
+            filter(None, [getattr(ent, "first_name", None), getattr(ent, "last_name", None)])
+        ).strip()
+        if not title:
+            title = getattr(ent, "username", None) or f"User {ent.id}"
+    elif isinstance(ent, Chat):
+        chat_type = "group"
+        title = getattr(ent, "title", None) or f"Group {ent.id}"
+    elif isinstance(ent, Channel):
+        chat_type = "channel" if getattr(ent, "broadcast", False) else "supergroup"
+        title = getattr(ent, "title", None) or f"Channel {ent.id}"
+    else:
+        return None
+
+    return {
+        "id": ent.id,
+        "title": title,
+        "type": chat_type,
+        "username": getattr(ent, "username", None),
+    }
+
+
+async def get_telegram_structure(
+    db: AsyncSession,
+    owner_user_id: int,
+    limit: int = 500,
+    include_archived: bool = False,
+) -> Dict:
+    """
+    Возвращает структуру чатов пользователя:
+      {
+        "chats": [{id,title,type,username}, ...]   # активные диалоги
+        "folders": [
+          {"id": int, "title": str, "emoticon": str|None, "chat_ids": [int,...]},
+          ...
+        ]
+      }
+
+    Папки берутся из Telegram (messages.getDialogFilters). Сейчас
+    учитываем только явные включения (pinned_peers + include_peers) —
+    категорийные правила (все группы / все боты / etc.) пока не
+    раскрываем; UI про них договорились пока не заморачиваться.
+
+    Архивные чаты (folder_id == 1) по умолчанию скрываются.
+    Если ни одной пользовательской папки нет — folders == [],
+    фронт рендерит плоский список.
     """
     client = await ensure_connected(db, owner_user_id)
 
     if not await client.is_user_authorized():
         raise ValueError("TELEGRAM_NOT_AUTHORIZED")
 
+    # --- 1) Активные диалоги ---
     dialogs = await client.get_dialogs(limit=limit)
+    chats: List[Dict] = []
+    chat_ids_alive: set = set()
 
-    result = []
     for d in dialogs:
-        ent = d.entity
-
-        # Тип
-        if isinstance(ent, User):
-            chat_type = "user"
-            title = " ".join(filter(None, [getattr(ent, "first_name", None), getattr(ent, "last_name", None)])).strip()
-            if not title:
-                title = getattr(ent, "username", None) or f"User {ent.id}"
-        elif isinstance(ent, Chat):
-            chat_type = "group"
-            title = getattr(ent, "title", None) or f"Group {ent.id}"
-        elif isinstance(ent, Channel):
-            # Channel может быть и каналом, и супергруппой
-            chat_type = "channel" if getattr(ent, "broadcast", False) else "supergroup"
-            title = getattr(ent, "title", None) or f"Channel {ent.id}"
-        else:
-            # На всякий случай
+        # archive lives in folder_id == 1 в Telegram; основной — 0
+        if not include_archived and getattr(d, "folder_id", 0) == 1:
             continue
+        ent = d.entity
+        item = _dialog_entity_to_chat_dict(ent)
+        if item is None:
+            continue
+        chats.append(item)
+        chat_ids_alive.add(item["id"])
 
-        # Базовые поля
-        item = {
-            "id": ent.id,
-            "title": title,
-            "type": chat_type,
-            "username": getattr(ent, "username", None),
-        }
+    # --- 2) Папки ---
+    folders: List[Dict] = []
+    try:
+        from telethon.tl.functions.messages import GetDialogFiltersRequest
+        from telethon.tl.types import DialogFilter as _DialogFilter
+        try:
+            from telethon.tl.types import DialogFilterChatlist as _DialogFilterChatlist  # type: ignore
+            _FILTER_TYPES = (_DialogFilter, _DialogFilterChatlist)
+        except ImportError:
+            _FILTER_TYPES = (_DialogFilter,)  # type: ignore
 
-        # (опционально) признаки для UI
-        # is_verified / is_scam / is_fake можно добавить позже, если захочешь
+        raw = await client(GetDialogFiltersRequest())
+        # В новых Telethon возвращается messages.DialogFilters с .filters,
+        # в более старых — сразу список. Поддерживаем оба варианта.
+        filters_iter = getattr(raw, "filters", None)
+        if filters_iter is None:
+            filters_iter = raw if isinstance(raw, (list, tuple)) else []
 
-        result.append(item)
+        for f in filters_iter:
+            if not isinstance(f, _FILTER_TYPES):
+                # DialogFilterDefault ("Все чаты") и прочее — пропускаем.
+                continue
 
-    return result
+            chat_ids: List[int] = []
+            seen: set = set()
+            pinned = list(getattr(f, "pinned_peers", None) or [])
+            included = list(getattr(f, "include_peers", None) or [])
+
+            for peer in pinned + included:
+                peer_id = (
+                    getattr(peer, "channel_id", None)
+                    or getattr(peer, "chat_id", None)
+                    or getattr(peer, "user_id", None)
+                )
+                if peer_id is None:
+                    continue
+                if peer_id in seen:
+                    continue
+                if peer_id not in chat_ids_alive:
+                    # Чат был, но мы его не показываем (архив/исключённый
+                    # тип) — в этой папке тоже скрываем.
+                    continue
+                seen.add(peer_id)
+                chat_ids.append(peer_id)
+
+            folders.append({
+                "id": int(getattr(f, "id", 0) or 0),
+                "title": (getattr(f, "title", "") or "").strip() or "—",
+                "emoticon": (getattr(f, "emoticon", None) or None),
+                "chat_ids": chat_ids,
+            })
+
+    except Exception:
+        # На любую ошибку с папками падать на плоский список — это
+        # лучше, чем рушить весь /tg/chats. На фронте просто не будет
+        # папок, а чаты останутся видимыми.
+        folders = []
+
+    return {"chats": chats, "folders": folders}
+
+
+async def list_user_chats(db: AsyncSession, owner_user_id: int, limit: int = 500):
+    """
+    Совместимый shim над get_telegram_structure: возвращает только
+    список чатов (без папок), чтобы старый код не сломался.
+    """
+    data = await get_telegram_structure(db, owner_user_id, limit=limit)
+    return data["chats"]
 
 # --- LOGOUT / CLEAN SESSION ---
 
