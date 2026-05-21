@@ -559,7 +559,7 @@ def _dialog_entity_to_chat_dict(ent) -> Optional[Dict]:
 async def get_telegram_structure(
     db: AsyncSession,
     owner_user_id: int,
-    limit: int = 500,
+    limit: Optional[int] = None,
     include_archived: bool = False,
 ) -> Dict:
     """
@@ -580,6 +580,14 @@ async def get_telegram_structure(
     Архивные чаты (folder_id == 1) по умолчанию скрываются.
     Если ни одной пользовательской папки нет — folders == [],
     фронт рендерит плоский список.
+
+    Про лимит диалогов:
+      Telethon get_dialogs(limit=N) возвращает N САМЫХ свежих по
+      активности. Если у пользователя 500 диалогов, а лимит 200 —
+      хвост из менее активных DM выпадет, и в папке "Важные" мы
+      увидим только активную её часть. Поэтому по умолчанию тянем
+      все диалоги (limit=None). Для большого аккаунта это будет
+      одна развёртка по страницам — секунда-другая, приемлемо.
     """
     client = await ensure_connected(db, owner_user_id)
 
@@ -587,9 +595,17 @@ async def get_telegram_structure(
         raise ValueError("TELEGRAM_NOT_AUTHORIZED")
 
     # --- 1) Активные диалоги ---
+    # limit=None в Telethon означает "все диалоги" — это правильное
+    # поведение для иерархии папок, иначе хвост чатов выпадет и в
+    # папках появятся "дыры".
     dialogs = await client.get_dialogs(limit=limit)
     chats: List[Dict] = []
     chat_ids_alive: set = set()
+
+    # Параллельно копим: dialog для категорийного матчинга в папках.
+    # Чтобы не итерировать `dialogs` дважды на каждую папку, сразу
+    # собираем кортежи (entity_id, entity, dialog) для активных чатов.
+    alive_dialog_index: List[tuple] = []  # [(id, entity, dialog), ...]
 
     for d in dialogs:
         # archive lives in folder_id == 1 в Telegram; основной — 0
@@ -601,6 +617,7 @@ async def get_telegram_structure(
             continue
         chats.append(item)
         chat_ids_alive.add(item["id"])
+        alive_dialog_index.append((item["id"], ent, d))
 
     # --- 2) Папки ---
     folders: List[Dict] = []
@@ -620,32 +637,96 @@ async def get_telegram_structure(
         if filters_iter is None:
             filters_iter = raw if isinstance(raw, (list, tuple)) else []
 
+        def _peer_to_id(peer):
+            return (
+                getattr(peer, "channel_id", None)
+                or getattr(peer, "chat_id", None)
+                or getattr(peer, "user_id", None)
+            )
+
         for f in filters_iter:
             if not isinstance(f, _FILTER_TYPES):
                 # DialogFilterDefault ("Все чаты") и прочее — пропускаем.
                 continue
 
-            chat_ids: List[int] = []
-            seen: set = set()
+            # ---- 2a) Явные включения (pinned + include) ----
+            explicit_ids: set = set()
+            ordered_ids: List[int] = []
             pinned = list(getattr(f, "pinned_peers", None) or [])
             included = list(getattr(f, "include_peers", None) or [])
-
             for peer in pinned + included:
-                peer_id = (
-                    getattr(peer, "channel_id", None)
-                    or getattr(peer, "chat_id", None)
-                    or getattr(peer, "user_id", None)
-                )
-                if peer_id is None:
+                peer_id = _peer_to_id(peer)
+                if peer_id is None or peer_id in explicit_ids:
                     continue
-                if peer_id in seen:
+                explicit_ids.add(peer_id)
+                ordered_ids.append(peer_id)
+
+            # ---- 2b) Явные исключения ----
+            excluded_ids: set = set()
+            for peer in (getattr(f, "exclude_peers", None) or []):
+                peer_id = _peer_to_id(peer)
+                if peer_id is not None:
+                    excluded_ids.add(peer_id)
+
+            # ---- 2c) Категорийные авто-включения ----
+            # Telegram-папка может включать чаты по типу: все контакты,
+            # все группы, все каналы, все боты, все НЕ-контакты. Этих
+            # чатов нет в include_peers — они подцепляются автоматически.
+            # Поэтому проходим по нашему dialog-индексу и добавляем
+            # совпавшие. Это объясняет случай, когда "Важные" с правилом
+            # "все контакты" даёт только частичный список — без этого
+            # блока мы видели бы только явно прикреплённые DM.
+            has_contacts = bool(getattr(f, "contacts", False))
+            has_non_contacts = bool(getattr(f, "non_contacts", False))
+            has_groups = bool(getattr(f, "groups", False))
+            has_broadcasts = bool(getattr(f, "broadcasts", False))
+            has_bots = bool(getattr(f, "bots", False))
+            has_any_category = (
+                has_contacts or has_non_contacts or has_groups
+                or has_broadcasts or has_bots
+            )
+
+            category_ids_ordered: List[int] = []
+            if has_any_category:
+                for ent_id, ent, _d in alive_dialog_index:
+                    if ent_id in explicit_ids:
+                        continue  # уже учтён в pinned/include
+                    matched = False
+                    if isinstance(ent, User):
+                        is_bot = bool(getattr(ent, "bot", False))
+                        is_contact = bool(getattr(ent, "contact", False))
+                        if has_bots and is_bot:
+                            matched = True
+                        elif has_contacts and is_contact and not is_bot:
+                            matched = True
+                        elif has_non_contacts and (not is_contact) and (not is_bot):
+                            matched = True
+                    elif isinstance(ent, Chat):
+                        if has_groups:
+                            matched = True
+                    elif isinstance(ent, Channel):
+                        is_broadcast = bool(getattr(ent, "broadcast", False))
+                        if has_broadcasts and is_broadcast:
+                            matched = True
+                        elif has_groups and not is_broadcast:
+                            matched = True
+                    if matched:
+                        category_ids_ordered.append(ent_id)
+
+            # ---- 2d) Финальная сборка: явные + категорийные − исключённые ----
+            chat_ids: List[int] = []
+            seen: set = set()
+            for cid in ordered_ids + category_ids_ordered:
+                if cid in seen:
                     continue
-                if peer_id not in chat_ids_alive:
-                    # Чат был, но мы его не показываем (архив/исключённый
-                    # тип) — в этой папке тоже скрываем.
+                if cid in excluded_ids:
                     continue
-                seen.add(peer_id)
-                chat_ids.append(peer_id)
+                if cid not in chat_ids_alive:
+                    # подстраховка — мы итерируем по живым, но peer
+                    # из include_peers мог ссылаться на архивный/недоступный
+                    continue
+                seen.add(cid)
+                chat_ids.append(cid)
 
             folders.append({
                 "id": int(getattr(f, "id", 0) or 0),
@@ -663,10 +744,11 @@ async def get_telegram_structure(
     return {"chats": chats, "folders": folders}
 
 
-async def list_user_chats(db: AsyncSession, owner_user_id: int, limit: int = 500):
+async def list_user_chats(db: AsyncSession, owner_user_id: int, limit: Optional[int] = None):
     """
     Совместимый shim над get_telegram_structure: возвращает только
     список чатов (без папок), чтобы старый код не сломался.
+    По умолчанию limit=None — тянем все диалоги.
     """
     data = await get_telegram_structure(db, owner_user_id, limit=limit)
     return data["chats"]

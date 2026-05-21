@@ -361,12 +361,33 @@ async def read_messages_from_entity(client: TelegramClient, entity, days: int) -
         except Exception:
             pass
 
+        # Reply linkage: Telethon does not duplicate the parent message's
+        # text in `msg.message`, so we carry only the parent message_id.
+        # Two possible code paths depending on Telethon version / message
+        # type — check both.
+        reply_to: Optional[int] = None
+        reply_msg_id = getattr(msg, "reply_to_msg_id", None)
+        if reply_msg_id:
+            try:
+                reply_to = int(reply_msg_id)
+            except (TypeError, ValueError):
+                reply_to = None
+        else:
+            reply_header = getattr(msg, "reply_to", None)
+            inner_id = getattr(reply_header, "reply_to_msg_id", None) if reply_header else None
+            if inner_id:
+                try:
+                    reply_to = int(inner_id)
+                except (TypeError, ValueError):
+                    reply_to = None
+
         collected.append(
             {
                 "message_id": getattr(msg, "id", None),
                 "date": msg_dt.isoformat(),
                 "from": sender_name,
                 "text": text,
+                "reply_to": reply_to,
             }
         )
 

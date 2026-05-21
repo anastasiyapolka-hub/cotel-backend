@@ -5,6 +5,7 @@ from typing import Any, Optional, Union
 
 from .models import resolve_model_config, DEFAULT_AI_MODEL
 from .adapters import get_adapter
+from .preprocessing import clean_telegram_messages
 from .usage import (
     LlmUsage,
     LlmTextResult,
@@ -157,19 +158,35 @@ async def summarize_chat_messages(
         .provider, .provider_model. Use this in code paths that need
         to write a UsageEvent.
     """
+    # Preprocess: drop emoji-only / short reactions / system events,
+    # and compact ISO timestamps. This is the QA flow's only token
+    # optimization layer — see llm/preprocessing.py for details.
+    cleaned_messages, _preproc_stats = clean_telegram_messages(text_messages)
+
     lines = []
-    for msg in text_messages:
+    for msg in cleaned_messages:
         date = msg.get("date") or ""
         sender = msg.get("from") or "Unknown"
         text = msg.get("text") or ""
         msg_id = msg.get("message_id")
+        reply_to = msg.get("reply_to")
         # Включаем стабильный токен [msg:ID], если есть id —
         # модель будет ссылаться им же в цитатах, а фронт превратит
         # токен в кликабельную иконку-ссылку на сообщение в Telegram.
+        # Если сообщение является ответом, добавляем [reply→msg:PARENT]
+        # — это даёт модели структуру дискуссий без дублирования текста
+        # родительского сообщения (Telethon его и не дублирует, но мы
+        # явно показываем связь).
+        prefix_parts = [f"[{date}]"]
         if msg_id is not None:
-            lines.append(f"[{date}] [msg:{int(msg_id)}] {sender}: {text}")
-        else:
-            lines.append(f"[{date}] {sender}: {text}")
+            prefix_parts.append(f"[msg:{int(msg_id)}]")
+        if reply_to:
+            try:
+                prefix_parts.append(f"[reply→msg:{int(reply_to)}]")
+            except (TypeError, ValueError):
+                pass
+        prefix = " ".join(prefix_parts)
+        lines.append(f"{prefix} {sender}: {text}")
 
     context = "\n".join(lines)
 
@@ -197,17 +214,24 @@ async def summarize_chat_messages(
         "fits the question.\n"
         "3. When referencing a specific message, cite it with this "
         "format:\n"
-        "       @username [msg:ID]: \"short verbatim quote\"\n"
+        "       @username: \"short verbatim quote\" [msg:ID]\n"
         "   - ID is the exact numeric id taken from the [msg:ID] token "
         "that precedes the message in the chat fragment below. Copy it "
         "verbatim. Do NOT invent ids and do NOT cite a message that has "
         "no [msg:ID] token.\n"
-        "   - Place the [msg:ID] token immediately after the @username "
-        "(or display name) and before the colon.\n"
+        "   - Place the [msg:ID] token AT THE END of the citation, "
+        "immediately after the closing quote — not before the username "
+        "and not before the quote itself.\n"
         "   - If the same message is referenced multiple times in your "
         "answer, repeat the same [msg:ID] each time.\n"
         "   - Keep quotes short and in the original language of the "
         "message.\n"
+        "   - Some messages have an extra [reply→msg:PARENT_ID] token "
+        "after their own [msg:ID]. This means the message is a reply "
+        "to the message with that PARENT_ID. Use this to reconstruct "
+        "conversation threads when relevant, but do NOT cite the "
+        "[reply→msg:...] token itself — only the message's own "
+        "[msg:ID].\n"
         "4. If the chat contains conflicting information (different "
         "people say different things), surface the conflict — do not "
         "flatten it.\n"

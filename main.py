@@ -1433,7 +1433,7 @@ async def tg_analyze_chat(
 
 @app.get("/tg/chats")
 async def tg_list_chats(
-    limit: int = 200,
+    limit: int = 0,  # 0 / неуказано → тянем все диалоги (limit=None в Telethon)
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1444,7 +1444,12 @@ async def tg_list_chats(
         raise HTTPException(status_code=401, detail="TELEGRAM_NOT_AUTHORIZED")
 
     try:
-        structure = await get_telegram_structure(db, owner_user_id, limit=limit)
+        # limit==0 (или отрицательный) → передаём None, что в Telethon
+        # означает "все диалоги". Это критично для корректной сборки
+        # иерархии папок: при искусственном лимите хвост менее активных
+        # чатов выпадает, и папки выглядят неполными.
+        effective_limit = limit if (limit and limit > 0) else None
+        structure = await get_telegram_structure(db, owner_user_id, limit=effective_limit)
         chats = structure["chats"]
         folders = structure["folders"]
 

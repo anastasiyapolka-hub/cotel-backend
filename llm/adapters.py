@@ -6,6 +6,15 @@ from typing import Any, Optional, Protocol
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
+try:
+    from google import genai as _google_genai
+    from google.genai import types as _google_genai_types
+    _GENAI_AVAILABLE = True
+except ImportError:  # SDK not installed yet — adapter raises clearly on use
+    _google_genai = None  # type: ignore[assignment]
+    _google_genai_types = None  # type: ignore[assignment]
+    _GENAI_AVAILABLE = False
+
 from .usage import (
     LlmUsage,
     TOKENS_SOURCE_API,
@@ -227,6 +236,122 @@ class AnthropicAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Google Gemini adapter
+# ---------------------------------------------------------------------------
+
+_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+_gemini_client = (
+    _google_genai.Client(api_key=_GEMINI_API_KEY)
+    if (_GENAI_AVAILABLE and _GEMINI_API_KEY)
+    else None
+)
+
+
+def _extract_gemini_text(response: Any) -> str:
+    """
+    Pull text out of a Gemini response without trusting `response.text`,
+    which is a convenience property that can RAISE when the response was
+    blocked by a safety filter or contained no candidates. We walk the
+    canonical path (candidates[*].content.parts[*].text) defensively.
+    """
+    parts_out: list[str] = []
+    for cand in getattr(response, "candidates", None) or []:
+        content = getattr(cand, "content", None)
+        if content is None:
+            continue
+        for part in getattr(content, "parts", None) or []:
+            t = getattr(part, "text", None)
+            if isinstance(t, str) and t.strip():
+                parts_out.append(t)
+    return "\n".join(parts_out).strip()
+
+
+class GoogleGeminiAdapter:
+    """
+    Google Gemini adapter using the google-genai SDK.
+
+    Response usage shape (generate_content):
+        response.usage_metadata.prompt_token_count
+        response.usage_metadata.candidates_token_count
+        response.usage_metadata.total_token_count
+
+    Differences from OpenAI/Anthropic worth knowing when debugging:
+      - `system_instruction` lives in `GenerateContentConfig`, NOT in
+        the messages/contents list. There is no "system role".
+      - `contents` can be a plain string for single-turn calls (which
+        is what we do here).
+      - Finish reason is on `candidates[0].finish_reason` and is an
+        enum, not a plain string — we stringify it for diagnostics.
+    """
+
+    provider_name = "google"
+
+    async def complete(
+        self,
+        *,
+        provider_model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_output_tokens: int,
+    ) -> tuple[str, LlmUsage, Optional[str]]:
+        if _gemini_client is None:
+            if not _GENAI_AVAILABLE:
+                raise RuntimeError(
+                    "google-genai package is not installed; "
+                    "run `pip install google-genai` and add it to requirements.txt"
+                )
+            raise RuntimeError(
+                "Gemini API key is not set (expected env var "
+                "GEMINI_API_KEY or GOOGLE_API_KEY)"
+            )
+
+        config = _google_genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+
+        response = await _gemini_client.aio.models.generate_content(
+            model=provider_model,
+            contents=user_prompt,
+            config=config,
+        )
+
+        text = _extract_gemini_text(response)
+
+        finish_reason: Optional[str] = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            fr = getattr(candidates[0], "finish_reason", None)
+            if fr is not None:
+                # finish_reason is an enum — `.name` is more useful than str(enum)
+                finish_reason = getattr(fr, "name", None) or str(fr)
+
+        usage_meta = getattr(response, "usage_metadata", None)
+        if usage_meta is not None:
+            in_t = _coerce_int(getattr(usage_meta, "prompt_token_count", 0))
+            out_t = _coerce_int(getattr(usage_meta, "candidates_token_count", 0))
+            total_t = _coerce_int(
+                getattr(usage_meta, "total_token_count", in_t + out_t)
+            )
+            usage = LlmUsage(
+                input_tokens=in_t,
+                output_tokens=out_t,
+                total_tokens=total_t,
+                tokens_source=TOKENS_SOURCE_API,
+            )
+        else:
+            usage = estimate_chars_usage(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                output_text=text,
+            )
+
+        return text, usage, finish_reason
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 #
@@ -243,6 +368,7 @@ class AnthropicAdapter:
 _ADAPTERS: dict[str, LlmProviderAdapter] = {
     OpenAiAdapter.provider_name: OpenAiAdapter(),
     AnthropicAdapter.provider_name: AnthropicAdapter(),
+    GoogleGeminiAdapter.provider_name: GoogleGeminiAdapter(),
 }
 
 
