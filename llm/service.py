@@ -277,6 +277,187 @@ async def summarize_chat_messages(
 
 
 # ---------------------------------------------------------------------------
+# Q&A — summarize_chat_messages_group (multi-chat / group request)
+# ---------------------------------------------------------------------------
+
+_EMPTY_GROUP_MESSAGE: dict[str, str] = {
+    "en": "No chats had any text messages to analyze.",
+    "ru": "Ни в одном из выбранных чатов нет сообщений для анализа.",
+}
+
+
+def _build_group_chat_section(
+    *,
+    chat_index: int,
+    chat_name: str,
+    cleaned_messages: list[dict],
+) -> str:
+    """
+    Render a single chat as a labelled section for the group prompt.
+    Same line format as single-chat: `[date] [msg:ID] [reply→msg:PID] sender: text`.
+    msg-IDs are unique within a chat but may collide across chats — the
+    LLM is instructed to keep IDs scoped to their parent section, and
+    the frontend uses per-chat message_links maps anyway.
+    """
+    if not cleaned_messages:
+        return ""
+
+    lines: list[str] = [f"=== CHAT {chat_index}: «{chat_name}» ==="]
+    for msg in cleaned_messages:
+        date = msg.get("date") or ""
+        sender = msg.get("from") or "Unknown"
+        text = msg.get("text") or ""
+        msg_id = msg.get("message_id")
+        reply_to = msg.get("reply_to")
+
+        prefix_parts = [f"[{date}]"]
+        if msg_id is not None:
+            prefix_parts.append(f"[msg:{int(msg_id)}]")
+        if reply_to:
+            try:
+                prefix_parts.append(f"[reply→msg:{int(reply_to)}]")
+            except (TypeError, ValueError):
+                pass
+        prefix = " ".join(prefix_parts)
+        lines.append(f"{prefix} {sender}: {text}")
+
+    return "\n".join(lines)
+
+
+async def summarize_chat_messages_group(
+    *,
+    user_query: str,
+    chats: list[dict],
+    fallback_language: str = "en",
+    ai_model: str = DEFAULT_AI_MODEL,
+    return_usage: bool = True,
+) -> LlmTextResult:
+    """
+    Answer a user's question across multiple Telegram chats in a single
+    LLM call.
+
+    `chats` is a list of dicts with shape:
+        {
+          "chat_name": str,
+          "text_messages": list[dict],   # same shape as single-chat
+        }
+
+    Output is a single markdown document with one `## Чат: <name>` (or
+    `## Chat: <name>`) section per non-empty chat, plus a closing
+    `## Общий вывод` / `## Summary` block. The frontend parses the
+    headers to render collapsible per-chat blocks.
+
+    Notes for callers (`tg_analyze_chats_group`):
+    - We pre-filter chats with empty message lists; the LLM only sees
+      chats that have actual content. Empty chats should be marked
+      `status="empty"` in the endpoint's response BEFORE calling us.
+    - `max_output_tokens=10000` is intentionally large to allow ~500
+      words per chat at 20-chat group. This is paired with thinking
+      disabled (see adapters.py) so the full 10K goes to visible text.
+    """
+    if not chats:
+        return _empty_text_result(
+            ai_model=ai_model,
+            text=_EMPTY_GROUP_MESSAGE[_normalize_lang_code(fallback_language)],
+        )
+
+    # Build per-chat sections after preprocessing each chat. Stats are
+    # currently discarded — admin observability for group preprocessing
+    # can be added later if it proves useful.
+    sections: list[str] = []
+    chat_names: list[str] = []
+    for idx, c in enumerate(chats, start=1):
+        chat_name = (c.get("chat_name") or "").strip() or f"Chat {idx}"
+        text_messages = c.get("text_messages") or []
+        cleaned, _stats = clean_telegram_messages(text_messages)
+        section = _build_group_chat_section(
+            chat_index=idx,
+            chat_name=chat_name,
+            cleaned_messages=cleaned,
+        )
+        if section:
+            sections.append(section)
+            chat_names.append(chat_name)
+
+    if not sections:
+        return _empty_text_result(
+            ai_model=ai_model,
+            text=_EMPTY_GROUP_MESSAGE[_normalize_lang_code(fallback_language)],
+        )
+
+    combined_context = "\n\n".join(sections)
+    fallback_lang_name = _lang_name(fallback_language)
+    chat_count = len(sections)
+
+    # System prompt: instruct the model to produce one labelled section
+    # per chat plus a short overall conclusion. Cite [msg:ID] tokens
+    # verbatim, but only within the parent chat's section — msg IDs are
+    # not globally unique across chats.
+    system_prompt = (
+        "You are CoTel, an expert analyst of Telegram chat "
+        "conversations. The user has selected MULTIPLE chats and asked "
+        "one question. Your job: answer the question SEPARATELY for "
+        "each chat, plus give a short overall conclusion.\n\n"
+        "INPUT FORMAT\n"
+        "The chat history below is divided into sections, each starting "
+        "with a marker line of the form:\n"
+        "    === CHAT N: «chat name» ===\n"
+        "Each section contains messages from that single chat, in the "
+        "same per-message format as single-chat analysis: "
+        "[date] [msg:ID] [reply→msg:PARENT_ID] sender: text.\n\n"
+        "OUTPUT FORMAT (markdown)\n"
+        "Produce one section per chat, in the same order they appear in "
+        "the input, using THIS EXACT heading format:\n"
+        "    ## Chat: <chat name>\n"
+        "Use the chat name verbatim from the «...» marker. After all "
+        "chat sections, add a final section:\n"
+        "    ## Summary\n"
+        "with a 2-3 sentence overall conclusion across all chats.\n\n"
+        "If the user's question is in Russian, translate the section "
+        "labels accordingly: use `## Чат: ...` and `## Общий вывод`.\n\n"
+        "ANSWER RULES (per chat section)\n"
+        "- 200-400 words per chat. Be concrete, not generic.\n"
+        "- Ground every claim in messages from THAT chat only. Do not "
+        "mix evidence between chats.\n"
+        "- Cite using `[msg:ID]` exactly as it appears in the chat's "
+        "section. IDs are unique within a chat but may collide across "
+        "chats — never carry an ID from one chat into another section.\n"
+        "- If a chat has no information relevant to the question, "
+        "write a single short sentence saying so. Do not pad.\n"
+        "- Do not duplicate the same point across multiple chats; if "
+        "two chats discuss the same thing, say so in the Summary, not "
+        "in each chat section.\n\n"
+        "LANGUAGE\n"
+        "- Respond in the SAME LANGUAGE as the user's question. If the "
+        "question's language is ambiguous (one word, only emoji, mixed "
+        f"languages, too short to tell), respond in {fallback_lang_name}.\n"
+        "- Quote messages verbatim in their original language.\n\n"
+        "NO PREAMBLE. Do not restate the question. Do not list the "
+        "chats up front — just start with the first `## Chat: ...` "
+        "section."
+    )
+
+    user_prompt = (
+        f"Number of chats: {chat_count}\n"
+        f"Chat names (in order): {'; '.join(chat_names)}\n\n"
+        f"Chat history (each chat in its own labelled section):\n\n"
+        f"{combined_context}\n\n"
+        f"User question:\n{user_query}"
+    )
+
+    result = await _chat_text_completion_rich(
+        ai_model=ai_model,
+        task="qa",  # group qa stays on Sonnet for Anthropic (no Haiku downgrade)
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+        max_output_tokens=10000,
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Event-subscription classifier
 # ---------------------------------------------------------------------------
 

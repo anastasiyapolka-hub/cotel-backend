@@ -21,8 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
 
+import asyncio
+
 from llm.service import (
     summarize_chat_messages,
+    summarize_chat_messages_group,
     classify_subscription_matches,
     build_subscription_digest,
 )
@@ -87,6 +90,7 @@ from plan_limits import (
     record_qa_failure,
     expire_trial_subscription_if_needed,
     resolve_ai_model_for_user,
+    resolve_group_chats_limit,
 )
 from llm import (
     estimate_llm_cost_usd,
@@ -1430,6 +1434,319 @@ async def tg_analyze_chat(
         "message_links": message_links,
         "usage": await build_usage_snapshot(db, user=user),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /tg/analyze_chats_group
+# ---------------------------------------------------------------------------
+#
+# Multi-chat group analysis (personal Telegram account only — service
+# accounts excluded in v1). The user picks 1..N chats via checkboxes on
+# the frontend; we fetch each chat's history in parallel, send a single
+# LLM call with a labelled per-chat prompt, and return per-chat results
+# plus an overall summary.
+#
+# Quota accounting: this consumes N qa_request slots (one per chat).
+# This is intentional and will be revisited when we move to the credits
+# architecture. See plan_limits.enforce_qa_limits(slots_required=N).
+#
+# Partial-failure model: if some chats fail to fetch we still proceed
+# with the rest. The failing chats appear in the `results` array with
+# status="fetch_failed" and contribute no LLM context. If ALL chats
+# fail, we return 502 like the single-chat endpoint does.
+# ---------------------------------------------------------------------------
+
+@app.post("/tg/analyze_chats_group")
+async def tg_analyze_chats_group(
+    payload: dict,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = user.id
+
+    raw_links = payload.get("chat_links") or []
+    if not isinstance(raw_links, list):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "BAD_PAYLOAD", "message": "chat_links must be a list"},
+        )
+
+    # Normalize: strip + dedup while preserving order.
+    chat_links: list[str] = []
+    seen: set[str] = set()
+    for v in raw_links:
+        s = str(v or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        chat_links.append(s)
+
+    if not chat_links:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_EMPTY",
+                "message": "Не выбрано ни одного чата для группового анализа.",
+            },
+        )
+
+    user_query = (payload.get("user_query") or "").strip()
+    days = int(payload.get("days") or 7)
+    requested_ai_model = payload.get("ai_model")
+    ai_model = resolve_ai_model_for_user(
+        user=user,
+        requested_ai_model=requested_ai_model,
+        fallback_ai_model=getattr(user, "default_ai_model", None),
+    )
+
+    # ---- Per-plan group size limit ----
+    plan_code = str(getattr(user, "plan", "") or "").strip().lower()
+    group_limit = resolve_group_chats_limit(plan_code)
+    if len(chat_links) > group_limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_CHATS_LIMIT_EXCEEDED",
+                "message": (
+                    f"Ваш тариф разрешает не более {group_limit} чатов "
+                    f"в одном групповом запросе."
+                ),
+                "group_chats_limit": group_limit,
+                "requested": len(chat_links),
+            },
+        )
+
+    me = await tg_get_current_user(db, owner_user_id)
+    if not me:
+        raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
+
+    # ---- Quota check (N slots) ----
+    # enforce_qa_limits writes qa_request_rejected itself on 429.
+    group_size = len(chat_links)
+    await enforce_qa_limits(
+        db,
+        user=user,
+        requested_days=days,
+        source_mode="personal",
+        chat_ref=f"group:{group_size}",
+        slots_required=group_size,
+    )
+
+    query_chars = len(user_query)
+    total_t0 = time.perf_counter()
+
+    # ---- Parallel fetch ----
+    fetch_t0 = time.perf_counter()
+    fetch_tasks = [
+        fetch_chat_messages(db, owner_user_id, link, days) for link in chat_links
+    ]
+    fetch_outcomes = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+    fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+
+    # Per-chat status arrays. We track three buckets:
+    #   - ok:    successfully fetched, has messages, will be sent to LLM
+    #   - empty: fetched but zero messages within the window
+    #   - fetch_failed: exception during fetch (private/banned/network/etc.)
+    per_chat: list[dict] = []
+    chats_for_llm: list[dict] = []
+    # We need entity references to build per-chat permalink maps after LLM.
+    entities_by_index: dict[int, object] = {}
+    fetched_messages_by_index: dict[int, list] = {}
+
+    for idx, (link, outcome) in enumerate(zip(chat_links, fetch_outcomes)):
+        if isinstance(outcome, Exception):
+            # Note: we silently swallow the underlying exception text into
+            # the per-chat error field rather than the response top level —
+            # avoids leaking implementation details to the frontend while
+            # still letting the user see WHICH chats failed.
+            err = type(outcome).__name__
+            per_chat.append({
+                "chat_link": link,
+                "chat_name": None,
+                "messages_count": 0,
+                "summary": None,
+                "message_links": {},
+                "status": "fetch_failed",
+                "error": "TELEGRAM_FETCH_FAILED",
+                "error_detail": err,
+            })
+            continue
+
+        entity, messages = outcome
+        chat_name = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Без названия"
+        )
+
+        if not messages:
+            per_chat.append({
+                "chat_link": link,
+                "chat_name": chat_name,
+                "messages_count": 0,
+                "summary": None,
+                "message_links": {},
+                "status": "empty",
+                "error": None,
+            })
+            continue
+
+        entities_by_index[idx] = entity
+        fetched_messages_by_index[idx] = messages
+        chats_for_llm.append({
+            "_idx": idx,  # bookkeeping; stripped before sending to service
+            "chat_link": link,
+            "chat_name": chat_name,
+            "text_messages": messages,
+        })
+        per_chat.append({
+            "chat_link": link,
+            "chat_name": chat_name,
+            "messages_count": len(messages),
+            "summary": None,         # filled in below (whole-group summary)
+            "message_links": {},     # filled in below
+            "status": "ok",
+            "error": None,
+        })
+
+    # If literally every chat failed, treat the request as a global
+    # failure (502, mirrors single-chat behaviour on TELEGRAM_FETCH_FAILED).
+    if not chats_for_llm:
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await record_qa_failure(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            requested_days=days,
+            ai_model=ai_model,
+            error_code="TELEGRAM_FETCH_FAILED",
+            error_message="All chats in group failed to fetch.",
+            query_chars=query_chars or None,
+            duration_ms_total=total_ms,
+            duration_ms_fetch=fetch_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="TELEGRAM_FETCH_FAILED")
+
+    # ---- LLM call ----
+    # Strip the bookkeeping `_idx` key before handing chats to the service.
+    chats_for_service = [
+        {k: v for k, v in c.items() if k != "_idx"} for c in chats_for_llm
+    ]
+
+    llm_t0 = time.perf_counter()
+    try:
+        llm_result = await summarize_chat_messages_group(
+            user_query=user_query,
+            chats=chats_for_service,
+            fallback_language=user.language,
+            ai_model=ai_model,
+            return_usage=True,
+        )
+    except Exception as e:
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await record_qa_failure(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            requested_days=days,
+            ai_model=ai_model,
+            error_code="LLM_ERROR",
+            error_message=(str(e) or "")[:300] or None,
+            query_chars=query_chars or None,
+            duration_ms_total=total_ms,
+            duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="LLM_ERROR")
+    llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+
+    group_summary = llm_result.text
+    llm_usage: LlmUsage = llm_result.usage
+
+    # ---- Per-chat permalink maps ----
+    # Build a {message_id: permalink} dict for each ok-chat. The
+    # frontend uses these to turn [msg:ID] tokens in the summary into
+    # clickable links. Failed/empty chats just stay with `{}`.
+    from telegram_service import build_message_permalink as _build_permalink
+    for c in chats_for_llm:
+        idx = c["_idx"]
+        entity = entities_by_index.get(idx)
+        if entity is None:
+            continue
+        msgs = fetched_messages_by_index.get(idx) or []
+        links_map: dict[int, str | None] = {}
+        for m in msgs:
+            mid = m.get("message_id")
+            if mid is None:
+                continue
+            links_map[int(mid)] = _build_permalink(entity, mid)
+        # Find the matching entry in per_chat (same chat_link) and
+        # attach the summary + links. The summary itself is shared
+        # across all chats — frontend parses `## Chat: <name>` headers
+        # to split it.
+        for row in per_chat:
+            if row["chat_link"] == c["chat_link"] and row["status"] == "ok":
+                row["message_links"] = links_map
+                break
+
+    total_ms = int((time.perf_counter() - total_t0) * 1000)
+
+    # ---- Quota accounting: N success events ----
+    # We write one qa_request_success per chat that actually went through
+    # the LLM (status=ok). Empty and fetch_failed chats do NOT count
+    # against quota — same rule as single-chat: failed requests must not
+    # eat into the user's quota.
+    #
+    # The LLM cost is paid once but logged on the FIRST ok-chat to keep
+    # admin accounting consistent; the remaining ok-chats are logged
+    # with token/cost fields = None to avoid double-counting cost.
+    cost = await estimate_llm_cost_usd(
+        db,
+        ai_model=ai_model,
+        input_tokens=llm_usage.input_tokens,
+        output_tokens=llm_usage.output_tokens,
+        tokens_source=llm_usage.tokens_source,
+    )
+
+    ok_rows = [r for r in per_chat if r["status"] == "ok"]
+    for i, row in enumerate(ok_rows):
+        is_first = (i == 0)
+        await record_qa_success(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_ref=f"group:{row['chat_link']}",
+            requested_days=days,
+            ai_model=ai_model,
+            query_chars=query_chars or None,
+            messages_fetched_count=row["messages_count"],
+            messages_sent_to_llm_count=row["messages_count"],
+            context_chars=None,
+            answer_chars=len(group_summary or "") if is_first else None,
+            duration_ms_total=total_ms if is_first else None,
+            duration_ms_fetch=fetch_ms if is_first else None,
+            duration_ms_llm=llm_ms if is_first else None,
+            **(split_usage_for_meta(llm_usage) if is_first else {}),
+            **(cost_kwargs_for_meta(cost) if is_first else {}),
+        )
+
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "ai_model": ai_model,
+        "group_size": group_size,
+        "results": per_chat,        # per-chat status array with links
+        "summary": group_summary,    # full markdown — frontend parses it
+        "source_mode": "personal",
+        "usage": await build_usage_snapshot(db, user=user),
+    }
+
 
 @app.get("/tg/chats")
 async def tg_list_chats(

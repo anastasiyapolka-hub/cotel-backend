@@ -75,6 +75,22 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def _is_openai_reasoning_model(provider_model: str) -> bool:
+    """
+    Detect whether an OpenAI model supports the `reasoning_effort` /
+    `reasoning` parameter (i.e. is a GPT-5.x or o-series reasoning model).
+    Conservative: we only flip it on for models we KNOW are reasoning
+    models, because passing the param to a non-reasoning model returns
+    a 400. GPT-4.x / 4.1-* are NOT reasoning models.
+    """
+    name = (provider_model or "").lower()
+    if name.startswith("gpt-5"):
+        return True
+    if name.startswith("o1") or name.startswith("o3") or name.startswith("o4"):
+        return True
+    return False
+
+
 class OpenAiAdapter:
     """
     OpenAI Chat Completions adapter.
@@ -87,6 +103,14 @@ class OpenAiAdapter:
     Most OpenAI-compatible providers (e.g. DeepSeek, Mistral via OpenAI
     SDK) follow the same shape, but DO NOT assume that — verify on each
     new provider before reusing this adapter.
+
+    Reasoning models (GPT-5.x, o-series): we explicitly set
+    `reasoning_effort="minimal"` to avoid the same trap that bit us with
+    Gemini 2.5 Flash — reasoning tokens count as output and silently
+    truncate the visible answer. For summarization workloads the
+    accuracy lift from reasoning is small (~3-7%) and not worth the 2-4x
+    cost or the truncation risk. If we later expose a "deep analysis"
+    tier, opt back in there explicitly.
     """
 
     provider_name = "openai"
@@ -100,15 +124,46 @@ class OpenAiAdapter:
         temperature: float,
         max_output_tokens: int,
     ) -> tuple[str, LlmUsage, Optional[str]]:
-        completion = await _openai_client.chat.completions.create(
-            model=provider_model,
-            messages=[
+        call_kwargs: dict[str, Any] = {
+            "model": provider_model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=temperature,
-            max_tokens=max_output_tokens,
-        )
+            "temperature": temperature,
+            "max_tokens": max_output_tokens,
+        }
+
+        # Disable reasoning by default — only attempt on models that
+        # support it. If the SDK rejects the param (older SDK or model
+        # variant that doesn't accept it), retry without it rather than
+        # failing the whole request.
+        used_reasoning_param = False
+        if _is_openai_reasoning_model(provider_model):
+            call_kwargs["reasoning_effort"] = "minimal"
+            used_reasoning_param = True
+
+        try:
+            completion = await _openai_client.chat.completions.create(**call_kwargs)
+        except TypeError:
+            # Older openai SDK doesn't know `reasoning_effort` as a kwarg.
+            if used_reasoning_param:
+                call_kwargs.pop("reasoning_effort", None)
+                completion = await _openai_client.chat.completions.create(**call_kwargs)
+            else:
+                raise
+        except Exception as exc:
+            # OpenAI may also reject reasoning_effort at the API level on
+            # models that don't support it. The error class differs
+            # across SDK versions, so we sniff the message defensively.
+            msg = str(exc).lower()
+            if used_reasoning_param and (
+                "reasoning_effort" in msg or "reasoning" in msg
+            ):
+                call_kwargs.pop("reasoning_effort", None)
+                completion = await _openai_client.chat.completions.create(**call_kwargs)
+            else:
+                raise
 
         # Text
         text = ""

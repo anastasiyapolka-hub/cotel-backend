@@ -167,10 +167,23 @@ def ensure_frequency_within_plan(*, requested_frequency_minutes: int, plan: Plan
         )
 
 DEFAULT_AI_MODEL = "openai:gpt-4.1-mini"
-CLAUDE_AI_MODEL = "anthropic:claude-sonnet-4-6"
-GEMINI_AI_MODEL = "google:gemini-2.5-flash"
-GEMINI_LITE_AI_MODEL = "google:gemini-3.1-flash-lite"
-GEMINI_PRO_AI_MODEL = "google:gemini-3.5-flash"
+
+# Per-provider model slugs (kept here for the allowlist; canonical source
+# of truth is llm/models.py SUPPORTED_MODELS).
+_OPENAI_BALANCED = "openai:gpt-5.4-mini"
+_OPENAI_PRO = "openai:gpt-4.1"
+_ANTHROPIC_HAIKU = "anthropic:claude-haiku-4-5"
+_ANTHROPIC_SONNET = "anthropic:claude-sonnet-4-6"
+_GEMINI_LITE = "google:gemini-3.1-flash-lite"
+_GEMINI_FLASH = "google:gemini-2.5-flash"
+_GEMINI_PRO = "google:gemini-3.5-flash"
+
+# Backwards-compat aliases (other modules may import these names).
+CLAUDE_AI_MODEL = _ANTHROPIC_SONNET
+GEMINI_AI_MODEL = _GEMINI_FLASH
+GEMINI_LITE_AI_MODEL = _GEMINI_LITE
+GEMINI_PRO_AI_MODEL = _GEMINI_PRO
+
 
 def resolve_ai_model_for_user(
     *,
@@ -186,14 +199,20 @@ def resolve_ai_model_for_user(
     if plan_code == "free":
         allowed = {DEFAULT_AI_MODEL}
     else:
+        # Paid plans see all 8 models across 3 providers.
         allowed = {
-            DEFAULT_AI_MODEL,
-            CLAUDE_AI_MODEL,
-            GEMINI_AI_MODEL,
-            GEMINI_LITE_AI_MODEL,
-            GEMINI_PRO_AI_MODEL,
+            # OpenAI: light → balanced → deep
+            DEFAULT_AI_MODEL,        # openai:gpt-4.1-mini
+            _OPENAI_BALANCED,        # openai:gpt-5.4-mini
+            _OPENAI_PRO,             # openai:gpt-4.1
+            # Anthropic: light → deep
+            _ANTHROPIC_HAIKU,        # anthropic:claude-haiku-4-5
+            _ANTHROPIC_SONNET,       # anthropic:claude-sonnet-4-6
+            # Google: light → balanced → deep
+            _GEMINI_LITE,            # google:gemini-3.1-flash-lite
+            _GEMINI_FLASH,           # google:gemini-2.5-flash
+            _GEMINI_PRO,             # google:gemini-3.5-flash
         }
-
 
     if requested in allowed:
         return requested
@@ -249,9 +268,24 @@ async def enforce_qa_limits(
     requested_days: int,
     source_mode: Optional[str],
     chat_ref: Optional[str],
+    slots_required: int = 1,
 ) -> Plan:
+    """
+    Reject the request if it would exceed the user's daily / monthly QA
+    quota. For a single-chat request slots_required=1 (default). For a
+    group request slots_required=N where N is the number of chats — the
+    user "spends" N qa_request slots in one click (this is intentional;
+    we'll likely switch to credits later, see TZ on credit architecture).
+
+    Note: this is a CHECK, not a reservation — we do not increment the
+    counter here. record_qa_success/failure does that. If two group
+    requests fire concurrently they could in theory both pass the check.
+    Acceptable for v1; a strict atomic reservation is a v2 concern.
+    """
     plan = await get_user_plan(db, user)
     ensure_days_within_plan(requested_days=requested_days, plan=plan)
+
+    slots_required = max(1, int(slots_required))
 
     now_utc = utc_now()
     day_used = await get_used_count(
@@ -269,7 +303,7 @@ async def enforce_qa_limits(
         period_start=month_period_start(now_utc),
     )
 
-    if day_used >= int(plan.daily_qa_limit):
+    if day_used + slots_required > int(plan.daily_qa_limit):
         await add_usage_event(
             db,
             user_id=user.id,
@@ -281,6 +315,7 @@ async def enforce_qa_limits(
                 "reason": "daily_limit",
                 "daily_limit": int(plan.daily_qa_limit),
                 "daily_used": int(day_used),
+                "slots_required": slots_required,
             },
         )
         await db.commit()
@@ -291,10 +326,11 @@ async def enforce_qa_limits(
                 "message": "Дневной лимит запросов исчерпан.",
                 "daily_limit": int(plan.daily_qa_limit),
                 "daily_used": int(day_used),
+                "slots_required": slots_required,
             },
         )
 
-    if month_used >= int(plan.monthly_qa_limit):
+    if month_used + slots_required > int(plan.monthly_qa_limit):
         await add_usage_event(
             db,
             user_id=user.id,
@@ -306,6 +342,7 @@ async def enforce_qa_limits(
                 "reason": "monthly_limit",
                 "monthly_limit": int(plan.monthly_qa_limit),
                 "monthly_used": int(month_used),
+                "slots_required": slots_required,
             },
         )
         await db.commit()
@@ -316,10 +353,36 @@ async def enforce_qa_limits(
                 "message": "Месячный лимит запросов исчерпан.",
                 "monthly_limit": int(plan.monthly_qa_limit),
                 "monthly_used": int(month_used),
+                "slots_required": slots_required,
             },
         )
 
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Group analysis — per-plan chat-count limits
+# ---------------------------------------------------------------------------
+#
+# Independent of qa_request limits. Lives here (not in Plan SQL columns)
+# because (a) we want to ship this in v1 without a migration, and (b) we
+# expect to revisit it under the credits architecture anyway. Add a real
+# column when this stabilizes.
+# ---------------------------------------------------------------------------
+
+GROUP_CHATS_LIMIT_BY_PLAN: dict[str, int] = {
+    "free": 3,
+    "basic": 10,
+    "pro": 20,
+}
+DEFAULT_GROUP_CHATS_LIMIT = 20  # any paid plan we haven't named explicitly
+
+
+def resolve_group_chats_limit(plan_code: Optional[str]) -> int:
+    """Return the maximum number of chats a user can include in a single
+    group-analysis request, based on their plan code."""
+    code = str(plan_code or "").strip().lower()
+    return GROUP_CHATS_LIMIT_BY_PLAN.get(code, DEFAULT_GROUP_CHATS_LIMIT)
 
 
 # ---------------------------------------------------------------------------

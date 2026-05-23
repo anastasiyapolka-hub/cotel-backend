@@ -7,16 +7,19 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # User-facing model slugs (shown in the UI selector)
 # ---------------------------------------------------------------------------
-OPENAI_MODEL_SLUG = "openai:gpt-4.1-mini"
-ANTHROPIC_MODEL_SLUG = "anthropic:claude-sonnet-4-6"
-GEMINI_MODEL_SLUG = "google:gemini-2.5-flash"
-GEMINI_LITE_MODEL_SLUG = "google:gemini-3.1-flash-lite"
-GEMINI_PRO_MODEL_SLUG = "google:gemini-3.5-flash"
+# OpenAI tiers
+OPENAI_MODEL_SLUG = "openai:gpt-4.1-mini"           # Light  — fast + cheap
+OPENAI_BALANCED_MODEL_SLUG = "openai:gpt-5.4-mini"  # Balanced — reasoning model
+OPENAI_PRO_MODEL_SLUG = "openai:gpt-4.1"            # Deep — 1M context, premium
 
-# Internal-only slug (not exposed to users). Used by task-based routing
-# inside the Anthropic provider to serve high-frequency lightweight tasks
-# on Haiku instead of Sonnet.
-ANTHROPIC_HAIKU_SLUG = "anthropic:claude-haiku-4-5"
+# Anthropic tiers
+ANTHROPIC_HAIKU_SLUG = "anthropic:claude-haiku-4-5"  # Light — fast + cheap
+ANTHROPIC_MODEL_SLUG = "anthropic:claude-sonnet-4-6"  # Balanced/Deep
+
+# Google Gemini tiers
+GEMINI_LITE_MODEL_SLUG = "google:gemini-3.1-flash-lite"  # Light — cheapest
+GEMINI_MODEL_SLUG = "google:gemini-2.5-flash"            # Balanced
+GEMINI_PRO_MODEL_SLUG = "google:gemini-3.5-flash"        # Deep — premium
 
 DEFAULT_AI_MODEL = OPENAI_MODEL_SLUG
 
@@ -30,11 +33,31 @@ class ModelConfig:
 
 
 SUPPORTED_MODELS: dict[str, ModelConfig] = {
+    # ---- OpenAI ----
     OPENAI_MODEL_SLUG: ModelConfig(
         slug=OPENAI_MODEL_SLUG,
         provider="openai",
         provider_model="gpt-4.1-mini",
         label="OpenAI GPT-4.1 mini",
+    ),
+    OPENAI_BALANCED_MODEL_SLUG: ModelConfig(
+        slug=OPENAI_BALANCED_MODEL_SLUG,
+        provider="openai",
+        provider_model="gpt-5.4-mini",
+        label="OpenAI GPT-5.4 mini",
+    ),
+    OPENAI_PRO_MODEL_SLUG: ModelConfig(
+        slug=OPENAI_PRO_MODEL_SLUG,
+        provider="openai",
+        provider_model="gpt-4.1",
+        label="OpenAI GPT-4.1",
+    ),
+    # ---- Anthropic ----
+    ANTHROPIC_HAIKU_SLUG: ModelConfig(
+        slug=ANTHROPIC_HAIKU_SLUG,
+        provider="anthropic",
+        provider_model="claude-haiku-4-5",
+        label="Claude Haiku 4.5",
     ),
     ANTHROPIC_MODEL_SLUG: ModelConfig(
         slug=ANTHROPIC_MODEL_SLUG,
@@ -42,17 +65,18 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider_model="claude-sonnet-4-6",
         label="Claude Sonnet 4.6",
     ),
-    GEMINI_MODEL_SLUG: ModelConfig(
-        slug=GEMINI_MODEL_SLUG,
-        provider="google",
-        provider_model="gemini-2.5-flash",
-        label="Google Gemini 2.5 Flash",
-    ),
+    # ---- Google Gemini ----
     GEMINI_LITE_MODEL_SLUG: ModelConfig(
         slug=GEMINI_LITE_MODEL_SLUG,
         provider="google",
         provider_model="gemini-3.1-flash-lite",
         label="Google Gemini 3.1 Flash Lite",
+    ),
+    GEMINI_MODEL_SLUG: ModelConfig(
+        slug=GEMINI_MODEL_SLUG,
+        provider="google",
+        provider_model="gemini-2.5-flash",
+        label="Google Gemini 2.5 Flash",
     ),
     GEMINI_PRO_MODEL_SLUG: ModelConfig(
         slug=GEMINI_PRO_MODEL_SLUG,
@@ -61,15 +85,6 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         label="Google Gemini 3.5 Flash",
     ),
 }
-
-# Internal-only model configs used by task-based routing. Not exposed in
-# `SUPPORTED_MODELS` so the UI selector is unchanged.
-_ANTHROPIC_HAIKU = ModelConfig(
-    slug=ANTHROPIC_HAIKU_SLUG,
-    provider="anthropic",
-    provider_model="claude-haiku-4-5",
-    label="Claude Haiku 4.5",
-)
 
 
 # Task-based routing table for the Anthropic provider.
@@ -81,11 +96,14 @@ _ANTHROPIC_HAIKU = ModelConfig(
 #   "digest"    — subscription summary, short analytical task → Haiku
 #
 # Anything not in this table falls through to the user-selected base
-# config (Sonnet).
+# config. Note: Haiku is now also a user-facing model — task routing is
+# only applied when the user selected Sonnet but the call is a
+# lightweight background task. If the user selected Haiku directly, we
+# respect that choice (see resolve_model_config below).
 _ANTHROPIC_TASK_ROUTING: dict[str, ModelConfig] = {
     "qa": SUPPORTED_MODELS[ANTHROPIC_MODEL_SLUG],
-    "classify": _ANTHROPIC_HAIKU,
-    "digest": _ANTHROPIC_HAIKU,
+    "classify": SUPPORTED_MODELS[ANTHROPIC_HAIKU_SLUG],
+    "digest": SUPPORTED_MODELS[ANTHROPIC_HAIKU_SLUG],
 }
 
 
@@ -104,17 +122,22 @@ def resolve_model_config(
     Resolve a user-facing model slug + task hint into the concrete
     model config to use for the actual API call.
 
-    - OpenAI provider has a single model, so `task` is effectively
-      ignored — we always return the user-selected config.
-    - Anthropic provider applies task-based routing so high-frequency
-      lightweight tasks (classify, digest) use Haiku while nuanced
-      tasks (qa) use Sonnet. This is transparent to the user: they
-      still see "Claude Sonnet 4.6" in the UI.
+    - OpenAI / Google providers: `task` is ignored — we always return
+      the user-selected config.
+    - Anthropic provider: applies task-based routing only when the user
+      picked SONNET. Background tasks (classify, digest) drop to Haiku
+      to save cost. If the user EXPLICITLY picked Haiku (now a public
+      option), we never upgrade them to Sonnet — respect the choice.
     """
     normalized = normalize_ai_model(value)
     base = SUPPORTED_MODELS[normalized]
 
     if base.provider == "anthropic" and task:
+        # Never upgrade above the user's explicit choice. If they picked
+        # Haiku, all tasks stay on Haiku.
+        if base.slug == ANTHROPIC_HAIKU_SLUG:
+            return base
+
         routed = _ANTHROPIC_TASK_ROUTING.get(task)
         if routed is not None:
             return routed
