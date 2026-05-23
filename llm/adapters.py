@@ -306,11 +306,37 @@ class GoogleGeminiAdapter:
                 "GEMINI_API_KEY or GOOGLE_API_KEY)"
             )
 
-        config = _google_genai_types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        )
+        # IMPORTANT: Gemini 2.5+ models (`gemini-2.5-flash`, `gemini-3.5-flash`,
+        # etc.) have *reasoning / thinking* enabled by default. Thinking tokens
+        # count against `max_output_tokens`, so if we leave it on the model will
+        # eat most of the budget on hidden chain-of-thought and the visible
+        # answer gets truncated mid-sentence. We disable thinking explicitly
+        # to keep behaviour parity with OpenAI/Claude (where `max_tokens` means
+        # visible output) and to avoid paying for hidden tokens we don't need
+        # for summarization. If we later want reasoning for a deep-analysis
+        # tier, expose it via task-based routing — do not flip it globally.
+        thinking_config = None
+        if _google_genai_types is not None and hasattr(
+            _google_genai_types, "ThinkingConfig"
+        ):
+            try:
+                thinking_config = _google_genai_types.ThinkingConfig(
+                    thinking_budget=0
+                )
+            except Exception:
+                # Older SDK versions may not accept thinking_budget=0 — fall
+                # back to leaving thinking_config unset rather than crashing.
+                thinking_config = None
+
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system_prompt,
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        }
+        if thinking_config is not None:
+            config_kwargs["thinking_config"] = thinking_config
+
+        config = _google_genai_types.GenerateContentConfig(**config_kwargs)
 
         response = await _gemini_client.aio.models.generate_content(
             model=provider_model,

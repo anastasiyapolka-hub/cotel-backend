@@ -10,6 +10,8 @@ from typing import Optional
 OPENAI_MODEL_SLUG = "openai:gpt-4.1-mini"
 ANTHROPIC_MODEL_SLUG = "anthropic:claude-sonnet-4-6"
 GEMINI_MODEL_SLUG = "google:gemini-2.5-flash"
+GEMINI_LITE_MODEL_SLUG = "google:gemini-3.1-flash-lite"
+GEMINI_PRO_MODEL_SLUG = "google:gemini-3.5-flash"
 
 # Internal-only slug (not exposed to users). Used by task-based routing
 # inside the Anthropic provider to serve high-frequency lightweight tasks
@@ -45,6 +47,18 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider="google",
         provider_model="gemini-2.5-flash",
         label="Google Gemini 2.5 Flash",
+    ),
+    GEMINI_LITE_MODEL_SLUG: ModelConfig(
+        slug=GEMINI_LITE_MODEL_SLUG,
+        provider="google",
+        provider_model="gemini-3.1-flash-lite",
+        label="Google Gemini 3.1 Flash Lite",
+    ),
+    GEMINI_PRO_MODEL_SLUG: ModelConfig(
+        slug=GEMINI_PRO_MODEL_SLUG,
+        provider="google",
+        provider_model="gemini-3.5-flash",
+        label="Google Gemini 3.5 Flash",
     ),
 }
 
