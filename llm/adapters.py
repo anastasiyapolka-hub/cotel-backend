@@ -124,46 +124,85 @@ class OpenAiAdapter:
         temperature: float,
         max_output_tokens: int,
     ) -> tuple[str, LlmUsage, Optional[str]]:
+        is_reasoning = _is_openai_reasoning_model(provider_model)
+
         call_kwargs: dict[str, Any] = {
             "model": provider_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": temperature,
-            "max_tokens": max_output_tokens,
         }
 
-        # Disable reasoning by default — only attempt on models that
-        # support it. If the SDK rejects the param (older SDK or model
-        # variant that doesn't accept it), retry without it rather than
-        # failing the whole request.
+        # ===== Output-length cap =====
+        # Reasoning models (GPT-5.x, o-series) deprecated `max_tokens` and
+        # require `max_completion_tokens` instead. Classic GPT-4.x still
+        # uses `max_tokens`. Picking the wrong one returns:
+        #   400 unsupported_parameter: 'max_tokens' is not supported
+        # so we MUST route on model name. If the API rejects our pick
+        # for some reason (older variant, edge case), the except clause
+        # below retries with the opposite key.
+        if is_reasoning:
+            call_kwargs["max_completion_tokens"] = max_output_tokens
+        else:
+            call_kwargs["max_tokens"] = max_output_tokens
+
+        # ===== Temperature =====
+        # Reasoning models often pin temperature to 1 and reject custom
+        # values. We try to pass it; the except clause below strips it
+        # if the API complains.
+        call_kwargs["temperature"] = temperature
+
+        # ===== Reasoning effort (disable by default on reasoning models) =====
+        # See class docstring: we don't want reasoning tokens for
+        # summarization. Set effort to minimal; fall back if SDK doesn't
+        # know the kwarg.
         used_reasoning_param = False
-        if _is_openai_reasoning_model(provider_model):
+        if is_reasoning:
             call_kwargs["reasoning_effort"] = "minimal"
             used_reasoning_param = True
 
+        async def _do_call(kwargs):
+            return await _openai_client.chat.completions.create(**kwargs)
+
         try:
-            completion = await _openai_client.chat.completions.create(**call_kwargs)
+            completion = await _do_call(call_kwargs)
         except TypeError:
-            # Older openai SDK doesn't know `reasoning_effort` as a kwarg.
+            # Older openai SDK doesn't know newer kwargs like
+            # `reasoning_effort` / `max_completion_tokens`. Strip them
+            # and retry with the legacy shape.
             if used_reasoning_param:
                 call_kwargs.pop("reasoning_effort", None)
-                completion = await _openai_client.chat.completions.create(**call_kwargs)
-            else:
-                raise
+            if "max_completion_tokens" in call_kwargs:
+                call_kwargs["max_tokens"] = call_kwargs.pop("max_completion_tokens")
+            completion = await _do_call(call_kwargs)
         except Exception as exc:
-            # OpenAI may also reject reasoning_effort at the API level on
-            # models that don't support it. The error class differs
-            # across SDK versions, so we sniff the message defensively.
+            # API-level rejection on a specific param. Sniff the message
+            # and retry without the offending kwarg. We chain retries
+            # (reasoning_effort → max_completion_tokens swap → temperature
+            # drop) because some 5.x variants reject more than one.
             msg = str(exc).lower()
-            if used_reasoning_param and (
-                "reasoning_effort" in msg or "reasoning" in msg
-            ):
+            retried = False
+
+            if used_reasoning_param and ("reasoning_effort" in msg or "reasoning" in msg):
                 call_kwargs.pop("reasoning_effort", None)
-                completion = await _openai_client.chat.completions.create(**call_kwargs)
-            else:
+                used_reasoning_param = False
+                retried = True
+            if "max_completion_tokens" in msg and "max_completion_tokens" in call_kwargs:
+                # Provider says it expects max_tokens after all.
+                call_kwargs["max_tokens"] = call_kwargs.pop("max_completion_tokens")
+                retried = True
+            elif "max_tokens" in msg and "max_tokens" in call_kwargs:
+                # Provider says it expects max_completion_tokens.
+                call_kwargs["max_completion_tokens"] = call_kwargs.pop("max_tokens")
+                retried = True
+            if "temperature" in msg and "temperature" in call_kwargs:
+                call_kwargs.pop("temperature", None)
+                retried = True
+
+            if not retried:
                 raise
+            completion = await _do_call(call_kwargs)
 
         # Text
         text = ""
