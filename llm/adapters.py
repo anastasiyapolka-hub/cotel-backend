@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Optional, Protocol
 
@@ -66,6 +67,8 @@ class LlmProviderAdapter(Protocol):
 # ---------------------------------------------------------------------------
 
 _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+log = logging.getLogger(__name__)
 
 
 def _coerce_int(value: Any) -> int:
@@ -223,6 +226,32 @@ class OpenAiAdapter:
             total_tokens = _coerce_int(
                 getattr(usage_obj, "total_tokens", input_tokens + output_tokens)
             )
+
+            # Diagnostic: pull reasoning_tokens out of details (GPT-5 / o-series).
+            # These DO count against billing and against max_completion_tokens,
+            # but OpenAI keeps them out of the visible output stream. Logging
+            # them separately helps explain why reasoning models are slow or
+            # expensive on workloads that look simple from the visible output.
+            # TODO: surface reasoning_tokens through LlmUsage so the admin
+            # observability panel can show it as its own column.
+            reasoning_tokens = 0
+            details = getattr(usage_obj, "completion_tokens_details", None)
+            if details is not None:
+                reasoning_tokens = _coerce_int(
+                    getattr(details, "reasoning_tokens", 0)
+                )
+            if reasoning_tokens > 0:
+                log.info(
+                    "openai.reasoning_tokens model=%s reasoning_tokens=%d "
+                    "visible_output_tokens=%d total_output_tokens=%d "
+                    "input_tokens=%d",
+                    provider_model,
+                    reasoning_tokens,
+                    max(output_tokens - reasoning_tokens, 0),
+                    output_tokens,
+                    input_tokens,
+                )
+
             usage = LlmUsage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
