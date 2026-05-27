@@ -220,6 +220,7 @@ async def _record_subscription_run_success_same_session(
         input_tokens=llm_usage.input_tokens,
         output_tokens=llm_usage.output_tokens,
         tokens_source=llm_usage.tokens_source,
+        thinking_tokens=llm_usage.thinking_tokens,
     )
 
     metrics["duration_ms_total"] = _ms_since(metrics["run_t0"])

@@ -1375,6 +1375,7 @@ async def tg_analyze_chat(
         input_tokens=llm_usage.input_tokens,
         output_tokens=llm_usage.output_tokens,
         tokens_source=llm_usage.tokens_source,
+        thinking_tokens=llm_usage.thinking_tokens,
     )
 
     # -------- Chat history + success event --------
@@ -1711,6 +1712,7 @@ async def tg_analyze_chats_group(
         input_tokens=llm_usage.input_tokens,
         output_tokens=llm_usage.output_tokens,
         tokens_source=llm_usage.tokens_source,
+        thinking_tokens=llm_usage.thinking_tokens,
     )
 
     ok_rows = [r for r in per_chat if r["status"] == "ok"]

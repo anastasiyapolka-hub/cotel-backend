@@ -36,11 +36,24 @@ class LlmUsage:
       - "estimated_chars": values were estimated from character counts
         because the provider did not return usage (or we short-circuited)
       - "empty": no API call was made (e.g. empty context); all counts 0
+
+    `thinking_tokens` are reasoning / chain-of-thought tokens that the
+    model generates internally and never surfaces in the visible answer.
+    They are billed at the OUTPUT token rate by every provider that
+    exposes them (OpenAI GPT-5/o-series via
+    `completion_tokens_details.reasoning_tokens`, Google Gemini reasoning
+    models via `usage_metadata.thoughts_token_count`). Storing them
+    separately is critical because `output_tokens` only reflects what the
+    user actually sees — using it alone for cost calc systematically
+    under-bills reasoning models. For non-reasoning models or when the
+    provider doesn't expose this field, leave at 0.
+    Defaults to 0 so all existing call sites continue to work unchanged.
     """
     input_tokens: int
     output_tokens: int
     total_tokens: int
     tokens_source: str
+    thinking_tokens: int = 0
 
     @classmethod
     def empty(cls) -> "LlmUsage":
@@ -49,6 +62,7 @@ class LlmUsage:
             output_tokens=0,
             total_tokens=0,
             tokens_source=TOKENS_SOURCE_EMPTY,
+            thinking_tokens=0,
         )
 
 
@@ -145,12 +159,19 @@ def split_usage_for_meta(usage: LlmUsage) -> dict:
     route code stays compact and free of branching.
     """
     if usage.tokens_source == TOKENS_SOURCE_API:
-        return {
+        result = {
             "input_tokens": int(usage.input_tokens),
             "output_tokens": int(usage.output_tokens),
             "total_tokens": int(usage.total_tokens),
             "tokens_source": usage.tokens_source,
         }
+        # Only emit thinking_tokens when actually present — keeps the
+        # meta_json payload clean for non-reasoning models. Stored as a
+        # top-level field (meta_json is JSONB so no schema migration
+        # needed; the admin observability panel can read it directly).
+        if int(usage.thinking_tokens or 0) > 0:
+            result["thinking_tokens"] = int(usage.thinking_tokens)
+        return result
     if usage.tokens_source == TOKENS_SOURCE_ESTIMATED:
         return {
             "estimated_input_tokens": int(usage.input_tokens),

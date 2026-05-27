@@ -188,6 +188,7 @@ async def estimate_llm_cost_usd(
     input_tokens: Optional[int],
     output_tokens: Optional[int],
     tokens_source: str,
+    thinking_tokens: Optional[int] = None,
 ) -> CostResult:
     """
     Compute the estimated USD cost of a single LLM call.
@@ -197,6 +198,14 @@ async def estimate_llm_cost_usd(
       - "estimated_chars"  — tokens were estimated from char counts
       - "empty"            — no LLM call was made (empty context)
 
+    `thinking_tokens` (optional, defaults to 0) are hidden reasoning /
+    chain-of-thought tokens emitted by reasoning models (OpenAI
+    GPT-5/o-series, Google Gemini reasoning tier). Providers bill them
+    at the OUTPUT token rate but do NOT include them in the visible
+    `output_tokens` count. Pass the value from LlmUsage.thinking_tokens
+    so the cost reflects what the provider will actually charge. For
+    non-reasoning models leave at 0 (the default).
+
     Behavior:
       - "empty"         → cost = 0.0, method = "no_llm_call"
       - table missing   → cost = None, method = "pricing_unavailable"
@@ -205,7 +214,9 @@ async def estimate_llm_cost_usd(
                           snapshot of prices included
     """
     if tokens_source == "empty" or (
-        not int(input_tokens or 0) and not int(output_tokens or 0)
+        not int(input_tokens or 0)
+        and not int(output_tokens or 0)
+        and not int(thinking_tokens or 0)
     ):
         return CostResult(
             estimated_cost_usd=0.0,
@@ -234,10 +245,16 @@ async def estimate_llm_cost_usd(
 
     in_tok = int(input_tokens or 0)
     out_tok = int(output_tokens or 0)
+    think_tok = int(thinking_tokens or 0)
+
+    # Reasoning ("thinking") tokens are billed at the output price by both
+    # OpenAI (GPT-5/o-series) and Google (Gemini reasoning tier). Folding
+    # them into the output side of the formula is correct for both providers.
+    billable_output_tok = out_tok + think_tok
 
     cost = (
         (in_tok / 1_000_000.0) * row.input_price_per_1m_usd
-        + (out_tok / 1_000_000.0) * row.output_price_per_1m_usd
+        + (billable_output_tok / 1_000_000.0) * row.output_price_per_1m_usd
     )
     cost = round(cost, 6)
 

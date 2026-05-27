@@ -227,13 +227,13 @@ class OpenAiAdapter:
                 getattr(usage_obj, "total_tokens", input_tokens + output_tokens)
             )
 
-            # Diagnostic: pull reasoning_tokens out of details (GPT-5 / o-series).
-            # These DO count against billing and against max_completion_tokens,
-            # but OpenAI keeps them out of the visible output stream. Logging
-            # them separately helps explain why reasoning models are slow or
-            # expensive on workloads that look simple from the visible output.
-            # TODO: surface reasoning_tokens through LlmUsage so the admin
-            # observability panel can show it as its own column.
+            # Reasoning tokens (GPT-5 / o-series). OpenAI bundles them inside
+            # `completion_tokens` (the total visible+hidden output count) and
+            # exposes the hidden subset under
+            # `completion_tokens_details.reasoning_tokens`. They are billed at
+            # the output token rate, so cost calc has to include them — we
+            # carry them through LlmUsage.thinking_tokens. For non-reasoning
+            # models or when the SDK doesn't expose the field, this stays 0.
             reasoning_tokens = 0
             details = getattr(usage_obj, "completion_tokens_details", None)
             if details is not None:
@@ -257,6 +257,7 @@ class OpenAiAdapter:
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 tokens_source=TOKENS_SOURCE_API,
+                thinking_tokens=reasoning_tokens,
             )
         else:
             usage = estimate_chars_usage(
@@ -492,10 +493,23 @@ class GoogleGeminiAdapter:
                     # than crashing.
                     thinking_config = None
 
+        # For reasoning-tier Gemini models we auto-raise the output budget
+        # to the deep-tier floor (8000). Reason: thinking tokens compete
+        # with the visible answer for max_output_tokens; on the default
+        # light budget (2000) the model can spend it all on hidden chain-
+        # of-thought and the visible response gets cut off mid-sentence.
+        # 8000 gives reasoning room to breathe while still leaving plenty
+        # for the visible answer. Callers can override by passing a higher
+        # explicit budget — we only bump UP, never down.
+        effective_max_output = max_output_tokens
+        if _is_gemini_reasoning_model(provider_model):
+            REASONING_MIN_OUTPUT = 8000
+            effective_max_output = max(max_output_tokens, REASONING_MIN_OUTPUT)
+
         config_kwargs: dict[str, Any] = {
             "system_instruction": system_prompt,
             "temperature": temperature,
-            "max_output_tokens": max_output_tokens,
+            "max_output_tokens": effective_max_output,
         }
         if thinking_config is not None:
             config_kwargs["thinking_config"] = thinking_config
@@ -525,11 +539,32 @@ class GoogleGeminiAdapter:
             total_t = _coerce_int(
                 getattr(usage_meta, "total_token_count", in_t + out_t)
             )
+            # Reasoning ("thoughts") tokens are reported separately. They
+            # are NOT in candidates_token_count but ARE included in
+            # total_token_count, so total = input + visible_output + thinking.
+            # Defensive fallback: if SDK doesn't expose the field, derive
+            # by subtraction. Billed at the output token rate.
+            thinking_t = _coerce_int(
+                getattr(usage_meta, "thoughts_token_count", 0)
+            )
+            if thinking_t == 0 and total_t > in_t + out_t:
+                thinking_t = max(total_t - in_t - out_t, 0)
+            if thinking_t > 0:
+                log.info(
+                    "gemini.thinking_tokens model=%s thinking_tokens=%d "
+                    "visible_output_tokens=%d input_tokens=%d total=%d",
+                    provider_model,
+                    thinking_t,
+                    out_t,
+                    in_t,
+                    total_t,
+                )
             usage = LlmUsage(
                 input_tokens=in_t,
                 output_tokens=out_t,
                 total_tokens=total_t,
                 tokens_source=TOKENS_SOURCE_API,
+                thinking_tokens=thinking_t,
             )
         else:
             usage = estimate_chars_usage(
