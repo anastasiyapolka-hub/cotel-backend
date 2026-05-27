@@ -127,6 +127,16 @@ def _empty_json_result(*, ai_model: str, data: dict) -> LlmJsonResult:
 # Q&A — summarize_chat_messages
 # ---------------------------------------------------------------------------
 
+# Output-token caps per analysis tier. Light is the default;
+# balanced and deep tiers will be wired through routing later.
+TIER_OUTPUT_LIMITS: dict[str, int] = {
+    "light":    2000,
+    "balanced": 4000,
+    "deep":     8000,
+}
+DEFAULT_TIER = "light"
+
+
 _EMPTY_CHAT_MESSAGES: dict[str, str] = {
     "en": "No text messages available for analysis.",
     "ru": "В чате нет текстовых сообщений для анализа.",
@@ -140,6 +150,7 @@ async def summarize_chat_messages(
     text_messages: list[dict],
     fallback_language: str = "en",
     ai_model: str = DEFAULT_AI_MODEL,
+    tier: str = DEFAULT_TIER,
     return_usage: bool = False,
 ) -> Union[str, LlmTextResult]:
     """
@@ -238,6 +249,13 @@ async def summarize_chat_messages(
         "5. If relevant messages are sparse (e.g. only 3 out of 400 are "
         "actually relevant), say so up front so the user calibrates "
         "expectations.\n\n"
+        "CITATIONS\n"
+        "- No more than 3 citations per sub-topic. If more relevant "
+        "messages exist, pick the most representative ones.\n"
+        "- For the remaining (un-cited) relevant messages on the same "
+        "sub-topic, summarize what they add in the conclusion or "
+        "wrap-up of that sub-topic — so the user knows what the "
+        "uncited messages say without seeing each one quoted.\n\n"
         "RULES\n"
         "- Ground every claim in the provided messages. Never invent "
         "participants, dates, events, or details that are not in the "
@@ -249,9 +267,13 @@ async def summarize_chat_messages(
         "user's question. If the language of the question is ambiguous "
         "(one word, only emoji, mixed languages, too short to tell), "
         f"respond in {fallback_lang_name}.\n"
-        "- Keep the answer tight: 3–6 short paragraphs OR a bulleted "
-        "list of 3–8 items, whichever better suits the question.\n"
         "- No preamble. Do not restate the question.\n\n"
+        "LENGTH\n"
+        "- Target: 1000-1500 characters. HARD LIMIT: 2000 characters.\n"
+        "- If you would exceed the limit, prioritize: direct answer "
+        "first, citations second, context-setting last.\n"
+        "- Structure: 3–6 short paragraphs OR a bulleted list of 3–8 "
+        "items, whichever better suits the question.\n\n"
         "OUTPUT FORMAT: plain text. No Markdown headings, no JSON "
         "wrapper."
     )
@@ -268,7 +290,7 @@ async def summarize_chat_messages(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=0.2,
-        max_output_tokens=1500,
+        max_output_tokens=TIER_OUTPUT_LIMITS.get(tier, TIER_OUTPUT_LIMITS[DEFAULT_TIER]),
     )
 
     if return_usage:
