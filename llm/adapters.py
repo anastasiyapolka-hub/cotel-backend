@@ -389,6 +389,25 @@ def _extract_gemini_text(response: Any) -> str:
     return "\n".join(parts_out).strip()
 
 
+def _is_gemini_reasoning_model(provider_model: str) -> bool:
+    """
+    Detect Gemini models where we WANT reasoning ("thinking") enabled.
+
+    Light and balanced Gemini variants run with thinking_budget=0 to keep
+    behaviour parity with OpenAI/Claude (visible-only output) and to avoid
+    silent truncation when reasoning tokens eat the output budget. The
+    'pro' tier (currently gemini-3.5-flash) is a reasoning model by design,
+    so we let it think — otherwise we're paying for a reasoning model
+    while disabling its main feature.
+
+    Keep this list explicit and conservative. Add a model only after you
+    verify (a) it benefits from thinking on our workloads, (b) the budget
+    impact is acceptable.
+    """
+    name = (provider_model or "").lower()
+    return name == "gemini-3.5-flash"
+
+
 class GoogleGeminiAdapter:
     """
     Google Gemini adapter using the google-genai SDK.
@@ -433,23 +452,45 @@ class GoogleGeminiAdapter:
         # etc.) have *reasoning / thinking* enabled by default. Thinking tokens
         # count against `max_output_tokens`, so if we leave it on the model will
         # eat most of the budget on hidden chain-of-thought and the visible
-        # answer gets truncated mid-sentence. We disable thinking explicitly
-        # to keep behaviour parity with OpenAI/Claude (where `max_tokens` means
-        # visible output) and to avoid paying for hidden tokens we don't need
-        # for summarization. If we later want reasoning for a deep-analysis
-        # tier, expose it via task-based routing — do not flip it globally.
+        # answer gets truncated mid-sentence.
+        #
+        # Default policy: disable thinking (`thinking_budget=0`) so behaviour
+        # is on par with OpenAI/Claude (where `max_tokens` means visible
+        # output only) and we don't pay for hidden tokens.
+        #
+        # Exception: for models explicitly marked as reasoning-tier in
+        # `_is_gemini_reasoning_model` we leave thinking on with a dynamic
+        # budget (`thinking_budget=-1` → model picks how much to think).
+        # Reasoning is the main feature of that tier — disabling it would
+        # mean paying premium price for a crippled model. Be aware: thinking
+        # tokens still count against `max_output_tokens`, so the visible
+        # answer can come up short if the budget is tight. Bump tier output
+        # limits accordingly if you observe truncation.
         thinking_config = None
         if _google_genai_types is not None and hasattr(
             _google_genai_types, "ThinkingConfig"
         ):
-            try:
-                thinking_config = _google_genai_types.ThinkingConfig(
-                    thinking_budget=0
-                )
-            except Exception:
-                # Older SDK versions may not accept thinking_budget=0 — fall
-                # back to leaving thinking_config unset rather than crashing.
-                thinking_config = None
+            if _is_gemini_reasoning_model(provider_model):
+                try:
+                    thinking_config = _google_genai_types.ThinkingConfig(
+                        thinking_budget=-1
+                    )
+                except Exception:
+                    # Older SDKs may not accept negative budgets. Leave
+                    # thinking_config unset so the model uses its API
+                    # default — for reasoning-tier models that is still
+                    # thinking-enabled.
+                    thinking_config = None
+            else:
+                try:
+                    thinking_config = _google_genai_types.ThinkingConfig(
+                        thinking_budget=0
+                    )
+                except Exception:
+                    # Older SDK versions may not accept thinking_budget=0
+                    # — fall back to leaving thinking_config unset rather
+                    # than crashing.
+                    thinking_config = None
 
         config_kwargs: dict[str, Any] = {
             "system_instruction": system_prompt,
