@@ -326,8 +326,18 @@ async def ensure_join_and_access(client: TelegramClient, chat_ref: str, entity):
     # обычный Chat / уже известный dialog
     return entity
 
-async def read_messages_from_entity(client: TelegramClient, entity, days: int) -> list[dict]:
-    since_dt = utcnow() - timedelta(days=int(days))
+async def read_messages_from_entity(
+    client: TelegramClient,
+    entity,
+    days: int,
+    *,
+    period_seconds: Optional[int] = None,
+) -> list[dict]:
+    # period_seconds приоритетнее days — поддерживает минуты/часы.
+    if period_seconds is not None and int(period_seconds) > 0:
+        since_dt = utcnow() - timedelta(seconds=int(period_seconds))
+    else:
+        since_dt = utcnow() - timedelta(days=int(days))
     collected: list[dict] = []
 
     async for msg in client.iter_messages(entity, limit=SERVICE_ACCOUNT_MAX_FETCH_MESSAGES):
@@ -766,6 +776,7 @@ async def fetch_public_chat_messages(
     service_account_id: int,
     chat_ref: str,
     days: int,
+    period_seconds: Optional[int] = None,
 ) -> Tuple[object, list[dict]]:
     client = await get_service_tg_client(db, service_account_id)
 
@@ -780,7 +791,9 @@ async def fetch_public_chat_messages(
         # новая логика: пробуем вступить / подписаться, если это нужно для чтения
         entity = await ensure_join_and_access(client, normalized_ref, entity)
 
-        messages = await read_messages_from_entity(client, entity, days)
+        messages = await read_messages_from_entity(
+            client, entity, days, period_seconds=period_seconds
+        )
         return entity, messages
 
     except ServiceAccountError:
@@ -1262,6 +1275,7 @@ async def analyze_chat_via_service_account(
     days: int,
     ai_model: str,
     fallback_language: str = "en",
+    period_seconds: Optional[int] = None,
 ) -> dict:
     import time as _time  # local import to avoid touching module header
 
@@ -1287,6 +1301,7 @@ async def analyze_chat_via_service_account(
                 service_account_id=account.id,
                 chat_ref=normalized_ref,
                 days=days,
+                period_seconds=period_seconds,
             )
             fetch_duration_ms = int((_time.perf_counter() - _fetch_t0) * 1000)
 

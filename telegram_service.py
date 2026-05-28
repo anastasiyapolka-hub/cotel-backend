@@ -349,11 +349,24 @@ async def get_current_user(db: AsyncSession, owner_user_id: int):
     return await client.get_me()
 
 
-async def fetch_chat_messages(db: AsyncSession, owner_user_id: int, chat_link: str, days: int = 7):
+async def fetch_chat_messages(
+    db: AsyncSession,
+    owner_user_id: int,
+    chat_link: str,
+    days: int = 7,
+    *,
+    period_seconds: Optional[int] = None,
+):
     """
     Возвращает:
       entity: объект чата/канала (Telethon entity)
       messages: список в формате [{date, from, text}, ...] для LLM
+
+    Период анализа задаётся одним из двух способов:
+      - period_seconds (новый, в секундах) — приоритетный, поддерживает
+        минуты/часы/дни через единый seconds-параметр.
+      - days (старый) — fallback для совместимости, если новый
+        параметр не передан.
     """
     client = await ensure_connected(db, owner_user_id)
 
@@ -370,8 +383,12 @@ async def fetch_chat_messages(db: AsyncSession, owner_user_id: int, chat_link: s
     if link.startswith("@"):
         link = link[1:].strip()
 
-    # Дата отсечения
-    since_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
+    # Дата отсечения. Если задан period_seconds — используем его
+    # (поддерживает минуты/часы); иначе fallback на days.
+    if period_seconds is not None and int(period_seconds) > 0:
+        since_dt = datetime.now(timezone.utc) - timedelta(seconds=int(period_seconds))
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
 
     # --- INVITE LINKS: t.me/+HASH or t.me/joinchat/HASH ---
     invite_hash = None

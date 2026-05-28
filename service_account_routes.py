@@ -20,6 +20,7 @@ from plan_limits import (
     record_qa_failure,
     build_usage_snapshot,
     resolve_ai_model_for_user,
+    parse_period_from_payload,
 )
 from llm import (
     estimate_llm_cost_usd,
@@ -35,7 +36,13 @@ router = APIRouter()
 class ServiceAnalyzeRequest(BaseModel):
     chat_link: str = Field(min_length=1)
     user_query: str = Field(default="")
+    # Legacy. Сохраняем для обратной совместимости со старыми клиентами.
     days: int = Field(default=7, ge=1, le=30)
+    # Новый контракт: единицы измерения времени. Если пришли — приоритет
+    # над days. Серверные границы и pe-планная проверка живут в
+    # plan_limits.parse_period_from_payload.
+    period_value: int | None = None
+    period_unit: str | None = None
     ai_model: str | None = None
 
 
@@ -48,13 +55,24 @@ async def tg_service_analyze_chat(
     if not user:
         raise HTTPException(status_code=401, detail="UNAUTHORIZED")
 
+    # Разбираем period: new {period_value, period_unit} → fallback на days.
+    # parse_period_from_payload работает с dict, поэтому собираем кросс-
+    # совместимый словарь из полей pydantic-модели.
+    period_value, period_unit, period_seconds = parse_period_from_payload({
+        "period_value": payload.period_value,
+        "period_unit": payload.period_unit,
+        "days": payload.days,
+    })
+    requested_days_for_log = period_value if period_unit == "days" else 1
+
     # enforce_qa_limits writes qa_request_rejected itself on 429.
     await enforce_qa_limits(
         db,
         user=user,
-        requested_days=payload.days,
+        requested_days=requested_days_for_log,
         source_mode="service",
         chat_ref=payload.chat_link,
+        skip_days_plan_check=(period_unit != "days"),
     )
 
     ai_model = resolve_ai_model_for_user(
@@ -72,9 +90,10 @@ async def tg_service_analyze_chat(
             db,
             chat_link=payload.chat_link,
             user_query=payload.user_query.strip(),
-            days=payload.days,
+            days=requested_days_for_log,
             ai_model=ai_model,
             fallback_language=user.language,
+            period_seconds=period_seconds,
         )
     except ServiceAccountError as e:
         # Telegram/service-account failure — no LLM call happened (or LLM

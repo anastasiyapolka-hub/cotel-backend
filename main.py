@@ -86,6 +86,7 @@ from plan_limits import (
     ensure_can_toggle_subscription,
     ensure_can_update_subscription,
     enforce_qa_limits,
+    parse_period_from_payload,
     record_qa_success,
     record_qa_failure,
     expire_trial_subscription_if_needed,
@@ -1249,7 +1250,14 @@ async def tg_analyze_chat(
 
     chat_link = (payload.get("chat_link") or "").strip()
     user_query = (payload.get("user_query") or "").strip()
-    days = int(payload.get("days") or 7)
+
+    # Период анализа: новый контракт {period_value, period_unit} либо
+    # legacy {days}. parse_period_from_payload бросает 400 на невалидный
+    # ввод (включая выход за общие границы минут/часов).
+    period_value, period_unit, period_seconds = parse_period_from_payload(payload)
+    # days — для логов и тарифного чека. Для минут/часов отдаём 1
+    # (под-суточный период) и просим пропустить days-проверку плана.
+    days = period_value if period_unit == "days" else 1
 
     requested_ai_model = payload.get("ai_model")
     ai_model = resolve_ai_model_for_user(
@@ -1271,6 +1279,7 @@ async def tg_analyze_chat(
         requested_days=days,
         source_mode="personal",
         chat_ref=chat_link,
+        skip_days_plan_check=(period_unit != "days"),
     )
 
     query_chars = len(user_query)
@@ -1279,7 +1288,9 @@ async def tg_analyze_chat(
     # -------- FETCH messages from Telegram --------
     fetch_t0 = time.perf_counter()
     try:
-        entity, messages = await fetch_chat_messages(db, owner_user_id, chat_link, days)
+        entity, messages = await fetch_chat_messages(
+            db, owner_user_id, chat_link, days, period_seconds=period_seconds
+        )
     except ValueError as ve:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
@@ -1492,7 +1503,9 @@ async def tg_analyze_chats_group(
         )
 
     user_query = (payload.get("user_query") or "").strip()
-    days = int(payload.get("days") or 7)
+    # Период анализа — общий помощник; см. plan_limits.parse_period_from_payload
+    period_value, period_unit, period_seconds = parse_period_from_payload(payload)
+    days = period_value if period_unit == "days" else 1
     requested_ai_model = payload.get("ai_model")
     ai_model = resolve_ai_model_for_user(
         user=user,
@@ -1531,6 +1544,7 @@ async def tg_analyze_chats_group(
         source_mode="personal",
         chat_ref=f"group:{group_size}",
         slots_required=group_size,
+        skip_days_plan_check=(period_unit != "days"),
     )
 
     query_chars = len(user_query)
@@ -1539,7 +1553,10 @@ async def tg_analyze_chats_group(
     # ---- Parallel fetch ----
     fetch_t0 = time.perf_counter()
     fetch_tasks = [
-        fetch_chat_messages(db, owner_user_id, link, days) for link in chat_links
+        fetch_chat_messages(
+            db, owner_user_id, link, days, period_seconds=period_seconds
+        )
+        for link in chat_links
     ]
     fetch_outcomes = await asyncio.gather(*fetch_tasks, return_exceptions=True)
     fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)

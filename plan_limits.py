@@ -151,6 +151,75 @@ def ensure_days_within_plan(*, requested_days: int, plan: Plan) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Период анализа: парсинг минут / часов / дней
+# ---------------------------------------------------------------------------
+# Минуты и часы не ограничены тарифом — это под-суточные окна и они всегда
+# меньше любого тарифного потолка по дням. Дни проверяются отдельно через
+# ensure_days_within_plan.
+PERIOD_UNIT_SECONDS = {
+    "minutes": 60,
+    "hours": 3600,
+    "days": 86400,
+}
+PERIOD_BOUNDS = {
+    "minutes": {"min": 5, "max": 180},   # 5 мин – 3 часа
+    "hours":   {"min": 1, "max": 72},    # 1 ч – 3 дня
+    "days":    {"min": 1, "max": None},  # max — из тарифа
+}
+
+
+def parse_period_from_payload(payload: dict) -> tuple[int, str, int]:
+    """
+    Возвращает (period_value, period_unit, period_seconds).
+
+    Принимает либо новый контракт {"period_value", "period_unit"}, либо
+    legacy {"days": int}. Делает серверную валидацию границ для минут
+    и часов (для дней проверка против тарифа делается отдельно после
+    получения плана пользователя).
+
+    Бросает HTTPException(400) на некорректный ввод.
+    """
+    if "period_value" in payload or "period_unit" in payload:
+        try:
+            value = int(payload.get("period_value") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail={"code": "PERIOD_VALUE_INVALID"})
+        unit = str(payload.get("period_unit") or "days").lower().strip()
+    else:
+        # Legacy путь — старые клиенты шлют только {"days": int}.
+        try:
+            value = int(payload.get("days") or 7)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail={"code": "DAYS_INVALID"})
+        unit = "days"
+
+    if unit not in PERIOD_UNIT_SECONDS:
+        raise HTTPException(status_code=400, detail={"code": "PERIOD_UNIT_INVALID"})
+
+    if value <= 0:
+        raise HTTPException(status_code=400, detail={"code": "PERIOD_VALUE_INVALID"})
+
+    bounds = PERIOD_BOUNDS.get(unit, {})
+    bmin = bounds.get("min")
+    bmax = bounds.get("max")
+    if bmin is not None and value < bmin:
+        raise HTTPException(status_code=400, detail={
+            "code": "PERIOD_OUT_OF_RANGE",
+            "message": f"Минимум для {unit}: {bmin}",
+            "unit": unit, "min": bmin, "max": bmax,
+        })
+    if bmax is not None and value > bmax:
+        raise HTTPException(status_code=400, detail={
+            "code": "PERIOD_OUT_OF_RANGE",
+            "message": f"Максимум для {unit}: {bmax}",
+            "unit": unit, "min": bmin, "max": bmax,
+        })
+
+    period_seconds = value * PERIOD_UNIT_SECONDS[unit]
+    return value, unit, period_seconds
+
+
 def ensure_frequency_within_plan(*, requested_frequency_minutes: int, plan: Plan) -> None:
     min_allowed = int(plan.min_subscription_interval_minutes)
     requested = int(requested_frequency_minutes)
@@ -269,6 +338,7 @@ async def enforce_qa_limits(
     source_mode: Optional[str],
     chat_ref: Optional[str],
     slots_required: int = 1,
+    skip_days_plan_check: bool = False,
 ) -> Plan:
     """
     Reject the request if it would exceed the user's daily / monthly QA
@@ -277,13 +347,19 @@ async def enforce_qa_limits(
     user "spends" N qa_request slots in one click (this is intentional;
     we'll likely switch to credits later, see TZ on credit architecture).
 
+    skip_days_plan_check=True — пропускает проверку плана по дням. Это
+    нужно для запросов в единицах "минуты" / "часы": сами по себе они
+    всегда меньше суток, и тарифный потолок по дням к ним не
+    применяется (как договорились в продуктовом решении).
+
     Note: this is a CHECK, not a reservation — we do not increment the
     counter here. record_qa_success/failure does that. If two group
     requests fire concurrently they could in theory both pass the check.
     Acceptable for v1; a strict atomic reservation is a v2 concern.
     """
     plan = await get_user_plan(db, user)
-    ensure_days_within_plan(requested_days=requested_days, plan=plan)
+    if not skip_days_plan_check:
+        ensure_days_within_plan(requested_days=requested_days, plan=plan)
 
     slots_required = max(1, int(slots_required))
 
