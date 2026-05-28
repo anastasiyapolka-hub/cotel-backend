@@ -485,6 +485,7 @@ def _build_qa_meta(
     input_tokens: Optional[int],
     output_tokens: Optional[int],
     total_tokens: Optional[int],
+    thinking_tokens: Optional[int],
     estimated_input_tokens: Optional[int],
     estimated_output_tokens: Optional[int],
     estimated_total_tokens: Optional[int],
@@ -503,6 +504,12 @@ def _build_qa_meta(
     Build a Q&A meta_json payload, dropping keys whose value is None
     so we don't store noise. Privacy guardrail: we do NOT accept the
     user's query text, chat content, or LLM answer here. Counters only.
+
+    `thinking_tokens` are hidden reasoning tokens emitted by reasoning
+    models (OpenAI GPT-5/o-series, Google Gemini reasoning tier). They
+    are billed at the output rate but are NOT included in `output_tokens`
+    (which counts only visible output). Stored separately so the admin
+    observability panel can show them as their own column.
     """
     raw: dict[str, Any] = {
         "days": int(requested_days) if requested_days is not None else None,
@@ -515,6 +522,7 @@ def _build_qa_meta(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "thinking_tokens": thinking_tokens,
         "estimated_input_tokens": estimated_input_tokens,
         "estimated_output_tokens": estimated_output_tokens,
         "estimated_total_tokens": estimated_total_tokens,
@@ -548,6 +556,7 @@ async def record_qa_success(
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    thinking_tokens: Optional[int] = None,
     estimated_input_tokens: Optional[int] = None,
     estimated_output_tokens: Optional[int] = None,
     estimated_total_tokens: Optional[int] = None,
@@ -606,6 +615,7 @@ async def record_qa_success(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        thinking_tokens=thinking_tokens,
         estimated_input_tokens=estimated_input_tokens,
         estimated_output_tokens=estimated_output_tokens,
         estimated_total_tokens=estimated_total_tokens,
@@ -670,6 +680,7 @@ async def record_qa_failure(
         input_tokens=None,
         output_tokens=None,
         total_tokens=None,
+        thinking_tokens=None,
         estimated_input_tokens=None,
         estimated_output_tokens=None,
         estimated_total_tokens=None,
