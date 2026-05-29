@@ -241,11 +241,14 @@ DEFAULT_AI_MODEL = "openai:gpt-4.1-mini"
 # of truth is llm/models.py SUPPORTED_MODELS).
 _OPENAI_BALANCED = "openai:gpt-5.4-mini"
 _OPENAI_PRO = "openai:gpt-4.1"
+_OPENAI_O3 = "openai:o3"
+_OPENAI_O4_MINI = "openai:o4-mini"
 _ANTHROPIC_HAIKU = "anthropic:claude-haiku-4-5"
 _ANTHROPIC_SONNET = "anthropic:claude-sonnet-4-6"
 _GEMINI_LITE = "google:gemini-3.1-flash-lite"
 _GEMINI_FLASH = "google:gemini-2.5-flash"
 _GEMINI_PRO = "google:gemini-3.5-flash"
+_GEMINI_PRO_25 = "google:gemini-2.5-pro"
 
 # Backwards-compat aliases (other modules may import these names).
 CLAUDE_AI_MODEL = _ANTHROPIC_SONNET
@@ -268,12 +271,24 @@ def resolve_ai_model_for_user(
     if plan_code == "free":
         allowed = {DEFAULT_AI_MODEL}
     else:
-        # Paid plans see all 8 models across 3 providers.
+        # Paid plans see the full model catalog across 3 providers.
+        # IMPORTANT: this allowlist must stay in sync with
+        # llm/models.py SUPPORTED_MODELS and with the frontend's
+        # normalizeAiModelUi allowed set. If a slug appears in the
+        # frontend dropdown but is missing here, the backend will
+        # SILENTLY fall back to the user's profile default (and from
+        # there to gpt-4.1-mini) instead of returning an error — so
+        # the user sees their selection in the UI but the request
+        # actually runs on a different model. We hit that bug when
+        # we added o3/o4-mini/gemini-2.5-pro to the frontend but
+        # forgot this allowlist.
         allowed = {
-            # OpenAI: light → balanced → deep
+            # OpenAI: light → balanced → deep (incl. reasoning models)
             DEFAULT_AI_MODEL,        # openai:gpt-4.1-mini
             _OPENAI_BALANCED,        # openai:gpt-5.4-mini
             _OPENAI_PRO,             # openai:gpt-4.1
+            _OPENAI_O3,              # openai:o3
+            _OPENAI_O4_MINI,         # openai:o4-mini
             # Anthropic: light → deep
             _ANTHROPIC_HAIKU,        # anthropic:claude-haiku-4-5
             _ANTHROPIC_SONNET,       # anthropic:claude-sonnet-4-6
@@ -281,6 +296,7 @@ def resolve_ai_model_for_user(
             _GEMINI_LITE,            # google:gemini-3.1-flash-lite
             _GEMINI_FLASH,           # google:gemini-2.5-flash
             _GEMINI_PRO,             # google:gemini-3.5-flash
+            _GEMINI_PRO_25,          # google:gemini-2.5-pro
         }
 
     if requested in allowed:

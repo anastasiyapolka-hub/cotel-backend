@@ -196,10 +196,28 @@ def _normalize_timezone(value: Optional[str]) -> str:
 
 
 def _normalize_ai_model(value: Optional[str]) -> str:
+    # Allowlist for profile-level default_ai_model (the model the user
+    # picks as "use by default for new analyses"). Must include any
+    # slug we want users to be able to set as default; otherwise the
+    # save endpoint silently rewrites their choice to gpt-4.1-mini.
+    # Keep in sync with frontend `AI_MODEL_OPTIONS` in js/auth.js and
+    # with llm.models.SUPPORTED_MODELS.
     raw = str(value or "").strip().lower()
     allowed = {
+        # OpenAI
         "openai:gpt-4.1-mini",
+        "openai:gpt-5.4-mini",
+        "openai:gpt-4.1",
+        "openai:o3",
+        "openai:o4-mini",
+        # Anthropic
+        "anthropic:claude-haiku-4-5",
         "anthropic:claude-sonnet-4-6",
+        # Google
+        "google:gemini-3.1-flash-lite",
+        "google:gemini-2.5-flash",
+        "google:gemini-3.5-flash",
+        "google:gemini-2.5-pro",
     }
     return raw if raw in allowed else "openai:gpt-4.1-mini"
 
