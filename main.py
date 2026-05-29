@@ -1352,6 +1352,7 @@ async def tg_analyze_chat(
             fallback_language=user.language,
             ai_model=ai_model,
             return_usage=True,
+            requested_period_days=days,
         )
     except Exception as e:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
@@ -1661,6 +1662,7 @@ async def tg_analyze_chats_group(
             fallback_language=user.language,
             ai_model=ai_model,
             return_usage=True,
+            requested_period_days=days,
         )
     except Exception as e:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)

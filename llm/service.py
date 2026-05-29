@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Optional, Union
 
 from .models import resolve_model_config, DEFAULT_AI_MODEL
@@ -12,6 +13,93 @@ from .usage import (
     LlmJsonResult,
     TOKENS_SOURCE_EMPTY,
 )
+
+
+# ---------------------------------------------------------------------------
+# Time-context block
+# ---------------------------------------------------------------------------
+#
+# Why this exists:
+# Without an explicit "today" reference, models interpret relative phrases
+# like «за последний месяц» / «last week» against the *data they see* —
+# which is just the fetched chat window. On Q4 we observed Gemini-family
+# models (2.5 Flash, 3.1 Flash Lite) report «период с 21 по 28 мая» when
+# the user actually asked for the last month — because the messages they
+# received were stamped in that window. OpenAI/Anthropic happen to be
+# more forgiving on this, but it's a real ambiguity, not a Gemini bug:
+# the prompt simply does not tell the model what "today" means or what
+# period was requested.
+#
+# Fix: prepend a small TIME CONTEXT block to the user prompt that states
+# (a) today's UTC date, (b) the fetch window in days the backend
+# actually pulled, (c) the actual oldest/newest message timestamps in
+# the data. The model can then either answer for the requested period
+# or, if data falls short, say so explicitly instead of silently
+# narrowing the question.
+# ---------------------------------------------------------------------------
+
+def _extract_message_date_window(
+    messages: list[dict],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return (oldest_date, newest_date) ISO strings from a list of cleaned
+    Telegram messages. Used to render the actual-data window in the
+    time-context block. Returns (None, None) if no usable dates.
+    """
+    dates: list[str] = []
+    for m in messages:
+        d = m.get("date") or m.get("message_ts")
+        if isinstance(d, str) and d.strip():
+            dates.append(d.strip())
+    if not dates:
+        return None, None
+    # Cleaned messages are already in chronological order, but defensive
+    # sort doesn't hurt and is cheap on the typical 100-500 msg payload.
+    dates_sorted = sorted(dates)
+    return dates_sorted[0], dates_sorted[-1]
+
+
+def _build_time_context_block(
+    *,
+    requested_period_days: Optional[int],
+    oldest_msg_date: Optional[str],
+    newest_msg_date: Optional[str],
+    fallback_lang_code: str,
+) -> str:
+    """
+    Render the time-context block that goes at the top of the user
+    prompt. Bilingual (RU/EN) because the model uses these as factual
+    anchors regardless of question language — keep them in plain English
+    so they tokenize cheaply on all providers and don't fight Cyrillic
+    tokenizers.
+    """
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    parts: list[str] = [
+        "TIME CONTEXT (use this to resolve relative time phrases like",
+        "«last week», «last month», «за последний месяц», «за неделю»",
+        "in the user's question):",
+        f"- Today's date (UTC): {today_iso}",
+    ]
+    if requested_period_days and requested_period_days > 0:
+        parts.append(
+            f"- Period the user requested: last {int(requested_period_days)} "
+            f"day(s) of chat history"
+        )
+    if oldest_msg_date and newest_msg_date:
+        parts.append(
+            f"- Actual data you have: messages from {oldest_msg_date} "
+            f"to {newest_msg_date}"
+        )
+    parts.append(
+        "If the data window is shorter than what the user asked for, "
+        "say so explicitly in your answer (e.g. «в чате найдены сообщения "
+        "только за период X-Y, более старая история отсутствует») — do "
+        "not silently narrow the question to the data you happen to "
+        "have. If the data window matches or exceeds the request, "
+        "interpret the question against the requested period, not the "
+        "raw message window."
+    )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +240,7 @@ async def summarize_chat_messages(
     ai_model: str = DEFAULT_AI_MODEL,
     tier: str = DEFAULT_TIER,
     return_usage: bool = False,
+    requested_period_days: Optional[int] = None,
 ) -> Union[str, LlmTextResult]:
     """
     Answer a user's question grounded in a Telegram chat fragment.
@@ -278,7 +367,16 @@ async def summarize_chat_messages(
         "wrapper."
     )
 
+    oldest_date, newest_date = _extract_message_date_window(cleaned_messages)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+
     user_prompt = (
+        f"{time_block}\n\n"
         f"Chat name: {chat_name}\n\n"
         f"Chat messages (oldest to newest):\n{context}\n\n"
         f"User question:\n{user_query}"
@@ -353,6 +451,7 @@ async def summarize_chat_messages_group(
     fallback_language: str = "en",
     ai_model: str = DEFAULT_AI_MODEL,
     return_usage: bool = True,
+    requested_period_days: Optional[int] = None,
 ) -> LlmTextResult:
     """
     Answer a user's question across multiple Telegram chats in a single
@@ -388,6 +487,7 @@ async def summarize_chat_messages_group(
     # can be added later if it proves useful.
     sections: list[str] = []
     chat_names: list[str] = []
+    all_cleaned: list[dict] = []  # for global time-window computation
     for idx, c in enumerate(chats, start=1):
         chat_name = (c.get("chat_name") or "").strip() or f"Chat {idx}"
         text_messages = c.get("text_messages") or []
@@ -400,6 +500,7 @@ async def summarize_chat_messages_group(
         if section:
             sections.append(section)
             chat_names.append(chat_name)
+            all_cleaned.extend(cleaned)
 
     if not sections:
         return _empty_text_result(
@@ -459,7 +560,16 @@ async def summarize_chat_messages_group(
         "section."
     )
 
+    oldest_date, newest_date = _extract_message_date_window(all_cleaned)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+
     user_prompt = (
+        f"{time_block}\n\n"
         f"Number of chats: {chat_count}\n"
         f"Chat names (in order): {'; '.join(chat_names)}\n\n"
         f"Chat history (each chat in its own labelled section):\n\n"

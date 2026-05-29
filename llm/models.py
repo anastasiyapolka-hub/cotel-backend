@@ -10,7 +10,9 @@ from typing import Optional
 # OpenAI tiers
 OPENAI_MODEL_SLUG = "openai:gpt-4.1-mini"           # Light  — fast + cheap
 OPENAI_BALANCED_MODEL_SLUG = "openai:gpt-5.4-mini"  # Balanced — reasoning model
-OPENAI_PRO_MODEL_SLUG = "openai:gpt-4.1"            # Deep — 1M context, premium
+OPENAI_PRO_MODEL_SLUG = "openai:gpt-4.1"            # Deep — 1M context, premium (TPM-prone)
+OPENAI_O3_SLUG = "openai:o3"                        # Deep — reasoning, 200K ctx, cheaper than Sonnet
+OPENAI_O4_MINI_SLUG = "openai:o4-mini"              # Deep budget — cheapest reasoning, 200K ctx
 
 # Anthropic tiers
 ANTHROPIC_HAIKU_SLUG = "anthropic:claude-haiku-4-5"  # Light — fast + cheap
@@ -19,7 +21,8 @@ ANTHROPIC_MODEL_SLUG = "anthropic:claude-sonnet-4-6"  # Balanced/Deep
 # Google Gemini tiers
 GEMINI_LITE_MODEL_SLUG = "google:gemini-3.1-flash-lite"  # Light — cheapest
 GEMINI_MODEL_SLUG = "google:gemini-2.5-flash"            # Balanced
-GEMINI_PRO_MODEL_SLUG = "google:gemini-3.5-flash"        # Deep — premium
+GEMINI_PRO_MODEL_SLUG = "google:gemini-3.5-flash"        # Deep — DEPRECATED (thinking-waste)
+GEMINI_PRO_25_SLUG = "google:gemini-2.5-pro"             # Deep — 1M ctx, controllable thinking, ~½ Sonnet price
 
 DEFAULT_AI_MODEL = OPENAI_MODEL_SLUG
 
@@ -52,6 +55,18 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider_model="gpt-4.1",
         label="OpenAI GPT-4.1",
     ),
+    OPENAI_O3_SLUG: ModelConfig(
+        slug=OPENAI_O3_SLUG,
+        provider="openai",
+        provider_model="o3",
+        label="OpenAI o3",
+    ),
+    OPENAI_O4_MINI_SLUG: ModelConfig(
+        slug=OPENAI_O4_MINI_SLUG,
+        provider="openai",
+        provider_model="o4-mini",
+        label="OpenAI o4-mini",
+    ),
     # ---- Anthropic ----
     ANTHROPIC_HAIKU_SLUG: ModelConfig(
         slug=ANTHROPIC_HAIKU_SLUG,
@@ -83,6 +98,12 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider="google",
         provider_model="gemini-3.5-flash",
         label="Google Gemini 3.5 Flash",
+    ),
+    GEMINI_PRO_25_SLUG: ModelConfig(
+        slug=GEMINI_PRO_25_SLUG,
+        provider="google",
+        provider_model="gemini-2.5-pro",
+        label="Google Gemini 2.5 Pro",
     ),
 }
 

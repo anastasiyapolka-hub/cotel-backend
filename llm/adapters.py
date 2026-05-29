@@ -396,17 +396,51 @@ def _is_gemini_reasoning_model(provider_model: str) -> bool:
 
     Light and balanced Gemini variants run with thinking_budget=0 to keep
     behaviour parity with OpenAI/Claude (visible-only output) and to avoid
-    silent truncation when reasoning tokens eat the output budget. The
-    'pro' tier (currently gemini-3.5-flash) is a reasoning model by design,
-    so we let it think — otherwise we're paying for a reasoning model
-    while disabling its main feature.
+    silent truncation when reasoning tokens eat the output budget.
+
+    Reasoning-tier Gemini variants are routed through the alternate
+    branch (`_gemini_thinking_budget`) so we control HOW MUCH they think.
+    On Q4 we saw `gemini-3.5-flash` waste 7681 thinking tokens for 315
+    visible — the auto budget is unbounded. For new candidates we use
+    a small fixed budget instead of `-1`.
 
     Keep this list explicit and conservative. Add a model only after you
     verify (a) it benefits from thinking on our workloads, (b) the budget
     impact is acceptable.
     """
     name = (provider_model or "").lower()
-    return name == "gemini-3.5-flash"
+    if name == "gemini-3.5-flash":
+        return True
+    if name == "gemini-2.5-pro":
+        return True
+    return False
+
+
+def _gemini_thinking_budget(provider_model: str) -> int:
+    """
+    Per-model thinking budget (tokens of hidden chain-of-thought we
+    allow). Used by GoogleGeminiAdapter when reasoning is enabled.
+
+    Per user policy: keep reasoning at MINIMUM or disabled. Notes:
+      - `gemini-2.5-pro` supports values in {0, or >= 128}. We use 128
+        (smallest legal "on" value) — model gets a tiny reasoning budget
+        for filter/rank tasks where some reasoning materially helps, but
+        we don't bleed cost on hidden tokens.
+      - `gemini-3.5-flash` is on its way out (see test-analysis-Q4.md).
+        Until it's removed from the catalog, we cap its budget at 512
+        instead of leaving it at -1 (unbounded). This is the fix for
+        Q4's 7681-token thinking-waste incident.
+
+    Returns -1 ONLY if we genuinely want the SDK default; that's no
+    longer recommended for any model in our catalog.
+    """
+    name = (provider_model or "").lower()
+    if name == "gemini-2.5-pro":
+        return 128
+    if name == "gemini-3.5-flash":
+        return 512
+    # Fallback for any future reasoning model we add later: small budget.
+    return 256
 
 
 class GoogleGeminiAdapter:
@@ -472,15 +506,25 @@ class GoogleGeminiAdapter:
             _google_genai_types, "ThinkingConfig"
         ):
             if _is_gemini_reasoning_model(provider_model):
+                # Use a CAPPED per-model budget instead of -1 (unbounded).
+                # See `_gemini_thinking_budget` for rationale per model;
+                # this is the fix for the Q4 incident where the SDK
+                # default (-1) let gemini-3.5-flash burn 7681 hidden
+                # tokens for 315 visible.
+                budget = _gemini_thinking_budget(provider_model)
                 try:
                     thinking_config = _google_genai_types.ThinkingConfig(
-                        thinking_budget=-1
+                        thinking_budget=budget
                     )
                 except Exception:
-                    # Older SDKs may not accept negative budgets. Leave
-                    # thinking_config unset so the model uses its API
-                    # default — for reasoning-tier models that is still
-                    # thinking-enabled.
+                    # Older SDK doesn't accept this exact value — fall
+                    # back to API default (still thinking-enabled). Log
+                    # so we notice if it ever happens.
+                    log.warning(
+                        "gemini.thinking_config_setup_failed model=%s budget=%d",
+                        provider_model,
+                        budget,
+                    )
                     thinking_config = None
             else:
                 try:

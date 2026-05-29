@@ -813,11 +813,17 @@ async def summarize_chat(
     ai_model: str,
     fallback_language: str = "en",
     return_usage: bool = False,
+    requested_period_days: Optional[int] = None,
 ):
     """
     Thin wrapper. `return_usage=True` returns the full LlmTextResult
     so the caller can read .usage / .provider / .provider_model for
     UsageEvent logging. Default behavior is unchanged (returns str).
+
+    `requested_period_days` is passed through so the LLM time-context
+    block can resolve «last month» / «за последний месяц» correctly
+    instead of letting Gemini-family models narrow to the raw data
+    window (see Q4 incident in test-analysis-Q4.md).
     """
     return await summarize_chat_messages(
         user_query=user_query,
@@ -826,6 +832,7 @@ async def summarize_chat(
         fallback_language=fallback_language,
         ai_model=ai_model,
         return_usage=return_usage,
+        requested_period_days=requested_period_days,
     )
 
 async def validate_service_subscription_target(
@@ -1331,6 +1338,7 @@ async def analyze_chat_via_service_account(
                 ai_model=ai_model,
                 fallback_language=fallback_language,
                 return_usage=True,
+                requested_period_days=days,
             )
             llm_duration_ms = int((_time.perf_counter() - _llm_t0) * 1000)
 
