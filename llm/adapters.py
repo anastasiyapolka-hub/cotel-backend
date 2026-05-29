@@ -151,10 +151,16 @@ class OpenAiAdapter:
             call_kwargs["max_tokens"] = max_output_tokens
 
         # ===== Temperature =====
-        # Reasoning models often pin temperature to 1 and reject custom
-        # values. We try to pass it; the except clause below strips it
-        # if the API complains.
-        call_kwargs["temperature"] = temperature
+        # Reasoning models (o3, o4-mini, GPT-5.x with reasoning) pin
+        # temperature to 1 and HARD-reject any other value with a 400:
+        #   "Unsupported value: 'temperature' does not support 0.2"
+        # We previously relied on the except-clause retry below to strip
+        # it on the second attempt, but that's wasteful (extra round
+        # trip + risk of double-billing on partial completions) and we
+        # observed it fail to recover on some o4-mini calls. Better to
+        # never send the field for known-reasoning models.
+        if not is_reasoning:
+            call_kwargs["temperature"] = temperature
 
         # ===== Reasoning effort (disable by default on reasoning models) =====
         # See class docstring: we don't want reasoning tokens for
