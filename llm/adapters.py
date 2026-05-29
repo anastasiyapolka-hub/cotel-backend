@@ -248,7 +248,7 @@ class OpenAiAdapter:
                 )
             if reasoning_tokens > 0:
                 log.info(
-                    "openai.reasoning_tokens model=%s reasoning_tokens=%d "
+                    "openai.reasoning_tokens  model=%s reasoning_tokens=%d "
                     "visible_output_tokens=%d total_output_tokens=%d "
                     "input_tokens=%d",
                     provider_model,
