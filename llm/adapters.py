@@ -145,10 +145,22 @@ class OpenAiAdapter:
         # so we MUST route on model name. If the API rejects our pick
         # for some reason (older variant, edge case), the except clause
         # below retries with the opposite key.
+        #
+        # Reasoning models also include hidden chain-of-thought tokens
+        # INSIDE the same output-token budget as the visible answer.
+        # We observed o4-mini on the Q4-v2 prompt: max=2000 → thinking
+        # ate all 2000 → visible answer length = 0. Same failure mode
+        # we documented for Gemini 3.5 Flash. Fix: floor the output
+        # budget at 8000 for any known reasoning model so reasoning has
+        # room to breathe AND there's still budget for a real answer.
+        # Callers can pass a larger value; we only bump UP.
+        effective_max_output = max_output_tokens
         if is_reasoning:
-            call_kwargs["max_completion_tokens"] = max_output_tokens
+            REASONING_MIN_OUTPUT = 8000
+            effective_max_output = max(max_output_tokens, REASONING_MIN_OUTPUT)
+            call_kwargs["max_completion_tokens"] = effective_max_output
         else:
-            call_kwargs["max_tokens"] = max_output_tokens
+            call_kwargs["max_tokens"] = effective_max_output
 
         # ===== Temperature =====
         # Reasoning models (o3, o4-mini, GPT-5.x with reasoning) pin
