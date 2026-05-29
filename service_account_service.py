@@ -336,11 +336,18 @@ async def read_messages_from_entity(
     # period_seconds приоритетнее days — поддерживает минуты/часы.
     if period_seconds is not None and int(period_seconds) > 0:
         since_dt = utcnow() - timedelta(seconds=int(period_seconds))
+        requested_days = max(int(period_seconds) // 86400, 1)
     else:
         since_dt = utcnow() - timedelta(days=int(days))
+        requested_days = max(int(days), 1)
     collected: list[dict] = []
 
-    async for msg in client.iter_messages(entity, limit=SERVICE_ACCOUNT_MAX_FETCH_MESSAGES):
+    # Масштабируемый limit для активных публичных чатов — иначе fetcher
+    # упирается в SERVICE_ACCOUNT_MAX_FETCH_MESSAGES (1000) задолго до
+    # since_dt, и модель получает только последние пару дней данных
+    # вместо запрошенного периода. См. ту же логику в telegram_service.py.
+    dynamic_limit = min(80_000, max(SERVICE_ACCOUNT_MAX_FETCH_MESSAGES, requested_days * 1_500))
+    async for msg in client.iter_messages(entity, limit=dynamic_limit):
         if not isinstance(msg, Message):
             continue
 

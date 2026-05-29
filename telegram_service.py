@@ -489,8 +489,26 @@ async def fetch_chat_messages(
 
     collected = []
     try:
-        # Telethon iter_messages возвращает от новых к старым
-        async for msg in client.iter_messages(entity, limit=5000):
+        # Telethon iter_messages возвращает от новых к старым.
+        # Масштабируемый limit: в активных чатах (например, «квартиры в
+        # тбилиси», ~750-1000 сообщений в день вместе с медиа/реакциями)
+        # фиксированный limit=5000 упирается в потолок раньше, чем мы
+        # доходим до since_dt. Симптом: фронт запрашивает 20 дней, а
+        # фактическое окно данных получается 7 (модель честно репортит
+        # «c 22 по 29 мая» вместо «за последний месяц»). Подняли потолок
+        # пропорционально периоду с разумным cap'ом сверху, чтобы случайный
+        # `days=365` не уронил систему.
+        #
+        # Эвристика: 1500 сообщений в день — это потолок плотности даже
+        # для самых активных русскоязычных чатов. Минимум 5000 для коротких
+        # периодов, максимум 80 000 для очень длинных. Telethon выгружает
+        # батчами по 100 — для 50K это ~500 round-trip к Telegram, ~30-60с.
+        if period_seconds is not None and int(period_seconds) > 0:
+            requested_days = max(int(period_seconds) // 86400, 1)
+        else:
+            requested_days = max(int(days), 1)
+        dynamic_limit = min(80_000, max(5_000, requested_days * 1_500))
+        async for msg in client.iter_messages(entity, limit=dynamic_limit):
             if not isinstance(msg, Message):
                 continue
 
