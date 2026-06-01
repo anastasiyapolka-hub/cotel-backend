@@ -14,7 +14,7 @@ from sqlalchemy import (
 )
 
 
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from .base import Base
 import sqlalchemy as sa
 
@@ -165,11 +165,33 @@ class BotLinkCode(Base):
 class Plan(Base):
     __tablename__ = "plans"
 
-    code = Column(String(32), primary_key=True)  # free / basic / pro
+    code = Column(String(32), primary_key=True)  # free / basic / pro / super_pro
 
     price_usd = Column(Numeric(10, 2), nullable=False, server_default="0")
     is_active = Column(Boolean, nullable=False, server_default=sa.text("true"))
 
+    # === Tокенная система (новая, см. architecture-router-and-credits.md) ===
+    # Месячный грант токенов на тариф. Источник цифр — раздел 2.3 архитектурного документа.
+    # free=300, basic=3600, pro=10000, super_pro=25000
+    monthly_tokens = Column(Integer, nullable=False, server_default="0")
+
+    # Какие tier'ы анализа доступны на этом тарифе.
+    # free → ['light'], остальные → ['light','balanced','deep']
+    allowed_tiers = Column(
+        ARRAY(String(16)),
+        nullable=False,
+        server_default=sa.text("ARRAY['light']::varchar[]"),
+    )
+
+    # Включена ли возможность докупки top-up токенов сверх месячного лимита.
+    # free → false, остальные → true
+    topup_enabled = Column(Boolean, nullable=False, server_default=sa.text("false"))
+
+    # === DEPRECATED: старая система счётчиков запросов ===
+    # Эти поля остаются в БД один релиз для backward compat. После того как
+    # токенная система отработает на проде ≥1 неделю — удалим их и поля,
+    # которые их используют (plan_limits.check_qa_quota и т.п.). Не читать
+    # их в новом коде — использовать monthly_tokens вместо.
     daily_qa_limit = Column(Integer, nullable=False)
     monthly_qa_limit = Column(Integer, nullable=False)
 
@@ -777,4 +799,184 @@ class ServiceAccountLog(Base):
     __table_args__ = (
         sa.Index("ix_service_account_logs_account_event_at", "service_account_id", "event_at"),
         sa.Index("ix_service_account_logs_account_started_at", "service_account_id", "started_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Токенная система (см. architecture-router-and-credits.md)
+# ---------------------------------------------------------------------------
+#
+# Архитектурно: 1 наш токен = $0,001 LLM-стоимости. Маркап 2.5× (маржа 60%).
+# Списание делается post-flight (после LLM-ответа) на основе фактических
+# input_tokens / output_tokens / thinking_tokens из API провайдера.
+#
+# Три таблицы:
+#   user_token_balances — текущий баланс пользователя (1 строка на пользователя)
+#   token_transactions  — журнал всех движений (грант, списание, top-up, refund)
+#   user_query_log      — тексты пользовательских запросов для аналитики/калибровки
+#                         роутера. Отдельная таблица из соображений privacy
+#                         (легко отключить или очистить).
+#
+# usage_events (LLM-вызовы) остаётся как есть — token_transactions
+# ссылается на него через related_event_id для LLM-списаний.
+# ---------------------------------------------------------------------------
+
+
+class UserTokenBalance(Base):
+    """
+    Баланс токенов пользователя — месячный (обновляется кроном на 1-е число)
+    + докупленный top-up (накапливается, не сгорает в конце месяца).
+
+    1 строка на пользователя. Соглашение: на регистрации пользователя
+    создаём запись с monthly_granted = plan.monthly_tokens.
+    """
+    __tablename__ = "user_token_balances"
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # Начало текущего расчётного периода (1-е число месяца UTC).
+    # Используется кроном для обнаружения, что пора ресетить monthly_used.
+    period_start = Column(Date, nullable=False, server_default=func.current_date())
+
+    # Сколько токенов начислено на этот период (из plan.monthly_tokens на
+    # момент гранта — снапшот, чтобы смена тарифа не пересчитывала задним
+    # числом текущий месяц).
+    monthly_granted = Column(Integer, nullable=False, server_default="0")
+
+    # Сколько токенов израсходовано за текущий период (сумма списаний
+    # qa_request + subscription_* минус возвраты).
+    monthly_used = Column(Integer, nullable=False, server_default="0")
+
+    # Купленные сверх тарифа top-up токены. Не сгорают в конце месяца.
+    # Списываются ПОСЛЕ исчерпания monthly (см. раздел 2.6 архитектуры).
+    topup_balance = Column(Integer, nullable=False, server_default="0")
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Примечание: поля daily_used / daily_reset_at сознательно не добавлены
+    # в MVP — daily-лимит включается только если увидим abuse (раздел 2.5).
+
+
+class TokenTransaction(Base):
+    """
+    Журнал всех движений токенов на счёте пользователя.
+
+    Источник истины для биллинга и пользовательской истории расхода.
+    На каждый LLM-вызов будет 1 запись (reason='qa_request' и т.п.) +
+    related_event_id на usage_events.id для двойного аудита.
+
+    Гранты, top-up, refund, admin adjustments — тоже сюда.
+    """
+    __tablename__ = "token_transactions"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Отрицательное = списание (расход), положительное = пополнение.
+    # Формула: списано в сумме = sum(delta WHERE delta<0).
+    delta = Column(Integer, nullable=False)
+
+    # Причина транзакции. Стандартные значения:
+    #   'qa_request'             — пользовательский Q&A запрос
+    #   'subscription_event'     — event-подписка (поиск совпадений)
+    #   'subscription_digest'    — digest-подписка
+    #   'classifier'             — LLM-классификатор категории (опц., если решим биллить)
+    #   'monthly_grant'          — начисление в начале месяца (cron)
+    #   'topup_purchase'         — докупка через Stripe
+    #   'refund'                 — возврат при ошибке
+    #   'admin_adjustment'       — ручная коррекция через админ-панель
+    reason = Column(String(64), nullable=False, index=True)
+
+    # Для LLM-списаний — ссылка на usage_events.id. NULL для грантов/топ-апов.
+    related_event_id = Column(
+        BigInteger,
+        ForeignKey("usage_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Свободная мета: snapshot цены модели, исходные input/output_tokens,
+    # Stripe payment_id для top-up, причина refund и т.д.
+    meta_json = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        sa.Index("ix_token_tx_user_created", "user_id", "created_at"),
+    )
+
+
+class UserQueryLog(Base):
+    """
+    Лог текстов запросов пользователя для аналитики и калибровки роутера.
+
+    Отдельная таблица от usage_events потому что:
+      - Privacy: легко отключить или удалить (TTL, GDPR-эрэз)
+      - Размер: query тексты могут быть длинными, не раздуваем основную таблицу
+      - Возможность опционально шифровать / анонимизировать в будущем
+
+    Используется для:
+      - Калибровки LLM-классификатора (видим где пользователь переопределил
+        категорию вручную → дотюнить промпт)
+      - Аналитики: какие категории чаще, какие tier'ы чаще
+      - Debug кейсов «модель плохо ответила»
+    """
+    __tablename__ = "user_query_log"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Связь с конкретным LLM-вызовом. NULL только если запрос отказан
+    # на этапе классификации (баланс кончился) и LLM не вызывался.
+    usage_event_id = Column(
+        BigInteger,
+        ForeignKey("usage_events.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+
+    # Сам текст запроса пользователя (без preprocessing'a, как ввёл).
+    query_text = Column(Text, nullable=False)
+
+    # Что LLM-классификатор определил автоматически.
+    detected_category = Column(String(32), nullable=True)
+
+    # Уверенность классификатора 0.00–1.00.
+    detected_confidence = Column(Numeric(3, 2), nullable=True)
+
+    # Что в итоге было использовано: либо detected, либо то, на что
+    # пользователь переопределил вручную (override через категорию-чипс в UI).
+    # Если совпадает с detected_category — авто-классификатор сработал.
+    # Если отличается — это сигнал для дотюна промпта классификатора.
+    final_category = Column(String(32), nullable=True)
+
+    # Выбранный пользователем tier: 'light' / 'balanced' / 'deep'.
+    selected_tier = Column(String(16), nullable=False)
+
+    # Какая модель в итоге попала в роутер (после fallback, если был).
+    # Slug формата 'google:gemini-2.5-flash' и т.д.
+    selected_model = Column(String(64), nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        sa.Index("ix_query_log_user_created", "user_id", "created_at"),
+        sa.Index("ix_query_log_final_category", "final_category"),
     )

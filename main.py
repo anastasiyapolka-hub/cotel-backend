@@ -648,15 +648,20 @@ async def tg_bot_link_start(
     await db.commit()
 
     # 3) вернём код + deeplink (удобно для UI)
-    bot_username = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()  # например "CoTelBot"
-    deeplink = None
-    if bot_username:
-        deeplink = f"https://t.me/{bot_username}?start={code}"
+    bot_username = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+    if not bot_username:
+        # На случай, если переменная окружения не выставлена в проде, чтобы фронт не сломался.
+        # Фронт всегда получит рабочий deeplink, а мы увидим в логах, что env не выставлен.
+        print("WARN: TELEGRAM_BOT_USERNAME is not set, falling back to CoTel_AlertBot")
+        bot_username = "CoTel_AlertBot"
+
+    deeplink = f"https://t.me/{bot_username}?start={code}"
 
     return {
         "status": "ok",
         "code": code,
         "expires_at": expires_at.isoformat(),
+        "bot_username": bot_username,
         "deeplink": deeplink,
     }
 

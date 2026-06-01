@@ -272,6 +272,68 @@ async def estimate_llm_cost_usd(
     )
 
 
+# ---------------------------------------------------------------------------
+# Конвертация LLM-стоимости в наши токены приложения
+# ---------------------------------------------------------------------------
+#
+# Концепция (см. architecture-router-and-credits.md, раздел 2.1):
+#   1 наш токен = $0,001 LLM-стоимости (1 000 наших токенов = $1)
+#   Маркап TOKEN_MARKUP = 2,5× для маржи 60% (стандарт AI MVP)
+#
+# Формула: our_tokens_per_1k = llm_price_per_1m × TOKEN_MARKUP
+#   Sanity: Flash Lite input $0,25/1M × 2,5 = 0,625 наших токенов за 1K вх ✓
+#
+# Все списания округляются вверх (CEIL) до целого нашего токена,
+# минимум 1 токен за вызов (см. billing.py).
+# ---------------------------------------------------------------------------
+
+TOKEN_MARKUP = 2.5
+"""Маркап LLM-стоимости при конвертации в наши токены (маржа 60%)."""
+
+MIN_TOKENS_PER_REQUEST = 1
+"""Минимум наших токенов, списываемых за один LLM-вызов."""
+
+
+@dataclass(frozen=True)
+class TokenRates:
+    """
+    Тарификация модели в наших токенах приложения.
+
+    Используется billing.py для расчёта списания после LLM-вызова:
+        in_tokens  = ceil(usage.input_tokens  * rates.in_per_1k  / 1000)
+        out_tokens = ceil(usage.output_tokens * rates.out_per_1k / 1000)
+        think_tokens = ceil(usage.thinking_tokens * rates.out_per_1k / 1000)
+                       — thinking-токены биллятся по output-цене (так берут OpenAI и Google)
+    """
+    ai_model: str
+    in_per_1k: float
+    out_per_1k: float
+
+
+async def get_token_rates(
+    db: AsyncSession,
+    ai_model: str,
+) -> Optional[TokenRates]:
+    """
+    Вернуть тарифы модели в наших токенах приложения.
+
+    Возвращает None если для модели нет активной строки в llm_pricing —
+    в этом случае биллинг должен либо использовать fallback (например,
+    тариф самой дорогой модели как защита), либо отказать в запросе с
+    понятной ошибкой. См. billing.py для реальной логики.
+
+    Кэшируется тем же кэшем, что и pricing rows (60 секунд).
+    """
+    row, status = await get_active_pricing(db, ai_model)
+    if row is None:
+        return None
+    return TokenRates(
+        ai_model=ai_model,
+        in_per_1k=float(row.input_price_per_1m_usd) * TOKEN_MARKUP,
+        out_per_1k=float(row.output_price_per_1m_usd) * TOKEN_MARKUP,
+    )
+
+
 def cost_kwargs_for_meta(cost: CostResult) -> dict:
     """
     Map a CostResult into the cost-related kwargs of `record_qa_success`
