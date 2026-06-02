@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional, Protocol
@@ -636,6 +637,276 @@ class GoogleGeminiAdapter:
             )
 
         return text, usage, finish_reason
+
+
+# ---------------------------------------------------------------------------
+# Error classification + retry-with-backoff (для роутера с fallback-chain)
+# ---------------------------------------------------------------------------
+#
+# См. architecture-router-and-credits.md, разделы 1.2 (fallback chain) и
+# Q6 incident в test-analysis-Q6.md (503 UNAVAILABLE от Gemini 2.5 Pro
+# 6 раз подряд за час — это серверная перегрузка Google, не наша квота).
+#
+# Логика:
+#   1) Каждый вызов адаптера может выкинуть provider-specific exception
+#   2) `_classify_error()` смотрит status_code / текст ошибки и решает:
+#         - retryable  (429/500/502/503/504, timeout, "overloaded")
+#                     → попробовать снова через backoff
+#         - fatal      (400/401/403/404, неверный API-ключ, неверный
+#                       параметр) → не повторять, поднять LlmFatalError
+#         - unknown    → не повторять (на всякий случай), поднять оригинал
+#   3) `complete_with_retry()` пробует адаптер max_retries+1 раз с
+#         экспоненциальным backoff (1с → 3с). Если все попытки упали на
+#         retryable error → поднимает LlmRetryableError. Вызывающий код
+#         (service.py / routing.py) ловит её и переключается на следующую
+#         модель в fallback-цепочке.
+# ---------------------------------------------------------------------------
+
+
+class LlmRetryableError(Exception):
+    """
+    Все попытки исчерпаны, провайдер до сих пор возвращает retryable error
+    (429/503/504/timeout). Вызывающий код должен попробовать следующую
+    модель в fallback-цепочке (см. routing.get_fallback_chain).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        provider_model: str,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.provider = provider
+        self.provider_model = provider_model
+        self.status_code = status_code
+
+
+class LlmFatalError(Exception):
+    """
+    Провайдер вернул non-retryable ошибку (400 bad request, 401 unauthorized,
+    403 forbidden, 404 not found). Повторять бессмысленно — лучше сразу
+    провалить запрос пользователя или попробовать совсем другую модель.
+
+    Отличается от LlmRetryableError тем, что fallback-chain тут НЕ помогает —
+    проблема, скорее всего, в нашей конфигурации (нет ключа, неверный
+    параметр), а не в недоступности конкретной модели.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        provider_model: str,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.provider = provider
+        self.provider_model = provider_model
+        self.status_code = status_code
+
+
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_FATAL_STATUS_CODES = frozenset({400, 401, 403, 404})
+
+# Подстроки в тексте ошибки, по которым определяем retryable когда у
+# исключения нет численного status_code (например, провайдерные обёртки
+# с разной структурой).
+_RETRYABLE_MESSAGE_HINTS = (
+    "rate limit",
+    "rate_limit",
+    "resource_exhausted",
+    "resource exhausted",
+    "unavailable",
+    "overloaded",
+    "service is currently overloaded",
+    "timeout",
+    "timed out",
+    "deadline exceeded",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+)
+
+# Подстроки в тексте, указывающие на fatal-ошибку конфигурации/контента.
+_FATAL_MESSAGE_HINTS = (
+    "invalid_api_key",
+    "permission_denied",
+    "permission denied",
+    "not_found",
+    "invalid_request_error",
+    "model_not_found",
+    "unsupported_parameter",
+)
+
+
+def _extract_status_code(exc: Exception) -> Optional[int]:
+    """
+    Достать численный HTTP-статус из исключения, если есть.
+
+    Поддерживает openai SDK (status_code), anthropic SDK (status_code),
+    google.api_core / google.genai (code/grpc_status). Возвращает None
+    если не удалось определить.
+    """
+    for attr in ("status_code", "code", "http_status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int) and 100 <= v < 600:
+            return v
+        # Иногда code приходит как enum/строка с цифрами.
+        if v is not None:
+            try:
+                iv = int(getattr(v, "value", v))
+                if 100 <= iv < 600:
+                    return iv
+            except (TypeError, ValueError):
+                pass
+
+    # Google genai иногда кладёт {'error': {'code': 503}} в args[0]
+    args = getattr(exc, "args", ())
+    for a in args:
+        if isinstance(a, dict):
+            for key in ("code", "status", "status_code"):
+                v = a.get(key) or a.get("error", {}).get(key) if isinstance(a.get("error"), dict) else None
+                if isinstance(v, int) and 100 <= v < 600:
+                    return v
+    return None
+
+
+def _classify_error(exc: Exception) -> str:
+    """
+    Вернуть 'retryable' / 'fatal' / 'unknown'.
+
+    Сначала пробуем числовой status_code (надёжнее), потом подстроки.
+    """
+    code = _extract_status_code(exc)
+    if code in _RETRYABLE_STATUS_CODES:
+        return "retryable"
+    if code in _FATAL_STATUS_CODES:
+        return "fatal"
+
+    msg = str(exc).lower()
+    for hint in _RETRYABLE_MESSAGE_HINTS:
+        if hint in msg:
+            return "retryable"
+    for hint in _FATAL_MESSAGE_HINTS:
+        if hint in msg:
+            return "fatal"
+    return "unknown"
+
+
+# Параметры retry — мягкие, чтобы не растягивать ожидание пользователя.
+# Итого худший случай: 1с + 3с = 4с задержки перед тем как переключиться
+# на следующую модель fallback-цепочки.
+_RETRY_MAX_ATTEMPTS = 2  # это additional попытки сверх первой, итого 3 вызова
+_RETRY_BASE_DELAY_SEC = 1.0
+_RETRY_BACKOFF_MULTIPLIER = 3.0
+
+
+async def complete_with_retry(
+    *,
+    provider: str,
+    provider_model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    max_output_tokens: int,
+) -> tuple[str, LlmUsage, Optional[str]]:
+    """
+    Вызвать adapter.complete() с retry-on-5xx логикой.
+
+    Поведение:
+      - 1 первичная попытка + до _RETRY_MAX_ATTEMPTS повторов на retryable
+        ошибки (429/500/502/503/504, timeout, "overloaded")
+      - backoff: 1с, потом 3с
+      - на fatal ошибку (400/401/403/404, неверный ключ) → LlmFatalError
+        сразу, без retry
+      - на неизвестную ошибку → пробрасываем оригинал (паника логируется
+        выше по стеку)
+      - если все retries исчерпаны на retryable → LlmRetryableError, чтобы
+        вызывающий код переключился на следующую модель в цепочке
+
+    Сама retry-логика тут отдельная от внутренней обработки kwargs внутри
+    OpenAiAdapter — у того свои retries на 400 (несовместимые параметры).
+    Никакого двойного retry не получается: param-fix кейс не классифицируется
+    как retryable.
+    """
+    adapter = get_adapter(provider)
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return await adapter.complete(
+                provider_model=provider_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+        except (LlmRetryableError, LlmFatalError):
+            # Уже классифицировано ниже — пробрасываем без повторной
+            # классификации (защита от двойной обёртки если адаптер сам
+            # пользуется этими типами в будущем).
+            raise
+        except Exception as exc:  # noqa: BLE001
+            kind = _classify_error(exc)
+            last_exc = exc
+            status = _extract_status_code(exc)
+
+            if kind == "fatal":
+                log.warning(
+                    "llm.fatal provider=%s model=%s status=%s err=%s",
+                    provider, provider_model, status, exc,
+                )
+                raise LlmFatalError(
+                    str(exc),
+                    provider=provider,
+                    provider_model=provider_model,
+                    status_code=status,
+                ) from exc
+
+            if kind == "retryable" and attempt < _RETRY_MAX_ATTEMPTS:
+                delay = _RETRY_BASE_DELAY_SEC * (_RETRY_BACKOFF_MULTIPLIER ** attempt)
+                log.warning(
+                    "llm.retry attempt=%d/%d provider=%s model=%s status=%s "
+                    "delay=%.1fs err=%s",
+                    attempt + 1, _RETRY_MAX_ATTEMPTS + 1,
+                    provider, provider_model, status, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if kind == "retryable":
+                # Все попытки исчерпаны — сигнал «переключайтесь на fallback».
+                log.warning(
+                    "llm.retryable_exhausted provider=%s model=%s status=%s err=%s",
+                    provider, provider_model, status, exc,
+                )
+                raise LlmRetryableError(
+                    str(exc),
+                    provider=provider,
+                    provider_model=provider_model,
+                    status_code=status,
+                ) from exc
+
+            # 'unknown' — пробрасываем оригинал, чтобы не маскировать новый
+            # тип ошибки от провайдера. Логируем для последующего расширения
+            # _RETRYABLE_/_FATAL_ списков.
+            log.error(
+                "llm.unknown_error provider=%s model=%s status=%s err=%s",
+                provider, provider_model, status, exc,
+            )
+            raise
+
+    # Сюда не должны попасть (выход из цикла только через return/raise),
+    # но на всякий случай.
+    raise LlmRetryableError(
+        str(last_exc) if last_exc else "retry loop ended without resolution",
+        provider=provider,
+        provider_model=provider_model,
+    )
 
 
 # ---------------------------------------------------------------------------

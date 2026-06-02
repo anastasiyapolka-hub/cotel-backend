@@ -187,6 +187,12 @@ class Plan(Base):
     # free → false, остальные → true
     topup_enabled = Column(Boolean, nullable=False, server_default=sa.text("false"))
 
+    # Максимум чатов в одном групповом запросе/подписке.
+    # Free=1 (только single-chat), Basic=5, Pro=10, Power=20.
+    # Логика проверки: if num_chats > plan.max_chats_per_group_request → reject.
+    # Применяется одинаково к Q&A и подпискам (общий лимит групповой обработки).
+    max_chats_per_group_request = Column(Integer, nullable=False, server_default="1")
+
     # === DEPRECATED: старая система счётчиков запросов ===
     # Эти поля остаются в БД один релиз для backward compat. После того как
     # токенная система отработает на проде ≥1 неделю — удалим их и поля,
