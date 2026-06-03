@@ -463,9 +463,10 @@ async def enforce_qa_limits(
 # ---------------------------------------------------------------------------
 
 GROUP_CHATS_LIMIT_BY_PLAN: dict[str, int] = {
-    "free": 3,
-    "basic": 10,
-    "pro": 20,
+    "free": 1,
+    "basic": 5,
+    "pro": 10,
+    "power": 20,
 }
 DEFAULT_GROUP_CHATS_LIMIT = 20  # any paid plan we haven't named explicitly
 

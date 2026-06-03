@@ -114,7 +114,7 @@ from llm import (
 )
 
 class ChangePlanRequest(BaseModel):
-    target_plan: Literal["free", "basic", "pro"]
+    target_plan: Literal["free", "basic", "pro", "power"]
 
 app = FastAPI()
 
@@ -312,6 +312,95 @@ async def get_account_plan_usage(
     db: AsyncSession = Depends(get_db),
 ):
     return await build_usage_snapshot(db, user=user)
+
+
+@app.get("/account/usage-history")
+async def get_account_usage_history(
+    limit: int = 50,
+    offset: int = 0,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    История запросов пользователя для страницы «Мои запросы» в профиле.
+
+    Возвращает список UsageEvent (Q&A + подписки), отсортированных
+    от свежих к старым. Для каждой записи отдаём минимальный набор полей,
+    нужных UI: дата, tokens_charged, модель, tier, категория, тип события,
+    chat_ref (без полного текста запроса — приватность).
+
+    Параметры:
+      limit  — макс. 100 записей за один вызов (defaults 50)
+      offset — пагинация
+
+    Подгружается фронтом ТОЛЬКО при переходе на вкладку (не на каждый
+    запрос плана). См. UX-обсуждение в архитектурном документе.
+    """
+    # Жёсткий потолок на limit — защита от случайных полных вытяжек
+    limit = max(1, min(int(limit or 50), 100))
+    offset = max(0, int(offset or 0))
+
+    stmt = (
+        select(UsageEvent)
+        .where(UsageEvent.user_id == user.id)
+        .where(UsageEvent.event_type.in_([
+            "qa_request_success",
+            "qa_request_failure",
+            "subscription_run_success",
+        ]))
+        .order_by(UsageEvent.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    rows = (await db.execute(stmt)).scalars().all()
+
+    items: list[dict] = []
+    for ev in rows:
+        meta = ev.meta_json or {}
+        items.append({
+            "id": int(ev.id),
+            "created_at": ev.created_at.isoformat() if ev.created_at else None,
+            "event_type": ev.event_type,
+            "status": ev.status,
+            "source_mode": ev.source_mode,
+            "chat_ref": ev.chat_ref,
+            "subscription_id": ev.subscription_id,
+            # Поля из meta_json (могут отсутствовать на старых записях)
+            "tokens_charged": meta.get("tokens_charged"),
+            "used_model": (
+                meta.get("used_model")
+                or meta.get("ai_model")  # legacy fallback
+            ),
+            "tier": meta.get("tier") or meta.get("depth"),
+            "category": meta.get("category") or meta.get("final_category"),
+            "was_fallback": meta.get("was_fallback"),
+            "requested_days": meta.get("requested_days"),
+            "messages_fetched_count": meta.get("messages_fetched_count"),
+            "duration_ms_total": meta.get("duration_ms_total"),
+            "duration_ms_llm": meta.get("duration_ms_llm"),
+            "error_code": meta.get("error_code"),
+        })
+
+    # Сколько всего записей у пользователя — нужно для UI «показано N из M»
+    total_stmt = (
+        select(sa.func.count())
+        .select_from(UsageEvent)
+        .where(UsageEvent.user_id == user.id)
+        .where(UsageEvent.event_type.in_([
+            "qa_request_success",
+            "qa_request_failure",
+            "subscription_run_success",
+        ]))
+    )
+    total = int((await db.execute(total_stmt)).scalar_one() or 0)
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 @app.post("/account/change-plan")
 async def change_account_plan(
