@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Plan, UsageCounter, UsageEvent, Subscription, User
+from db.models import Plan, UsageCounter, UsageEvent, Subscription, User, UserTokenBalance
 
 
 def utc_now() -> datetime:
@@ -471,10 +471,84 @@ DEFAULT_GROUP_CHATS_LIMIT = 20  # any paid plan we haven't named explicitly
 
 
 def resolve_group_chats_limit(plan_code: Optional[str]) -> int:
-    """Return the maximum number of chats a user can include in a single
-    group-analysis request, based on their plan code."""
+    """
+    Return the maximum number of chats a user can include in a single
+    group-analysis request, based on their plan code.
+
+    DEPRECATED: используется только в админ-endpoint'ах и при отсутствии
+    plan-объекта. Endpoint'ы Q&A после cutover'а используют
+    `Plan.max_chats_per_group_request` напрямую через get_user_plan().
+    Удалим в этапе 4 рефакторинга.
+    """
     code = str(plan_code or "").strip().lower()
     return GROUP_CHATS_LIMIT_BY_PLAN.get(code, DEFAULT_GROUP_CHATS_LIMIT)
+
+
+# ---------------------------------------------------------------------------
+# Token-system gating: проверка глубины анализа и размера группового запроса
+# ---------------------------------------------------------------------------
+#
+# Используются endpoint'ами (main.tg_analyze_chat / tg_analyze_chats_group)
+# ПЕРЕД вызовом billing.check_can_spend и LLM. Бросают HTTPException с
+# понятным JSON для фронта.
+#
+# Ловит ситуации:
+#   - free-пользователь выбрал «balanced» / «deep»
+#   - basic-пользователь шлёт групповой запрос на 10 чатов (лимит 5)
+# ---------------------------------------------------------------------------
+
+
+def check_tier_allowed_or_raise(plan: Plan, depth: str) -> None:
+    """
+    Проверка: разрешена ли выбранная глубина анализа на текущем тарифе.
+
+    На free доступен только light, на остальных — все три.
+    Источник истины: plan.allowed_tiers (ARRAY varchar). Заполняется в
+    миграции; см. MIGRATION_NOTES_token_system.md.
+
+    На несоответствии — HTTPException 403 с понятным сообщением и
+    списком доступных tier'ов для фронта.
+    """
+    allowed = list(plan.allowed_tiers or ["light"])
+    depth_normalized = str(depth or "").strip().lower()
+    if depth_normalized not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TIER_NOT_ALLOWED",
+                "message": (
+                    f"Глубина анализа «{depth_normalized}» не доступна на "
+                    f"вашем тарифе. Доступно: {', '.join(allowed)}."
+                ),
+                "requested_tier": depth_normalized,
+                "allowed_tiers": allowed,
+            },
+        )
+
+
+def check_max_chats_or_raise(plan: Plan, num_chats: int) -> None:
+    """
+    Проверка: не превышает ли число чатов в запросе тарифный лимит.
+
+    Используется в /tg/analyze_chats_group и потенциально в подписочной
+    логике. Free=1 (только single-chat), Basic=5, Pro=10, Power=20.
+
+    На превышении — HTTPException 400 с понятным сообщением.
+    """
+    plan_limit = int(plan.max_chats_per_group_request or 1)
+    if num_chats > plan_limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_CHATS_LIMIT_EXCEEDED",
+                "message": (
+                    f"Ваш тариф разрешает не более {plan_limit} чатов "
+                    f"в одном запросе."
+                ),
+                "max_chats_per_group_request": plan_limit,
+                "requested_chats": num_chats,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -943,12 +1017,41 @@ async def build_usage_snapshot(
 
     free_trial_expired = free_trial_limit_reached and live_trial_count == 0
 
+    # === Токенная система (новая) — snapshot из user_token_balances ===
+    token_balance_row = (await db.execute(
+        select(UserTokenBalance).where(UserTokenBalance.user_id == user.id)
+    )).scalar_one_or_none()
+
+    if token_balance_row is not None:
+        token_monthly_granted = int(token_balance_row.monthly_granted)
+        token_monthly_used = int(token_balance_row.monthly_used)
+        token_topup_balance = int(token_balance_row.topup_balance)
+    else:
+        # Аномалия — баланса нет. Логируем выше по стеку через main.py
+        # endpoint при first-failure. Здесь возвращаем плановые значения,
+        # чтобы UI не показал «0 / 0» и не пугал пользователя.
+        token_monthly_granted = int(plan.monthly_tokens or 0)
+        token_monthly_used = 0
+        token_topup_balance = 0
+
+    token_monthly_remaining = max(0, token_monthly_granted - token_monthly_used)
+    token_total_remaining = token_monthly_remaining + max(0, token_topup_balance)
+
     return {
         "plan": {
             "code": plan.code,
             "price_usd": float(plan.price_usd),
+
+            # === Токенная система ===
+            "monthly_tokens": int(plan.monthly_tokens or 0),
+            "allowed_tiers": list(plan.allowed_tiers or []),
+            "topup_enabled": bool(plan.topup_enabled),
+            "max_chats_per_group_request": int(plan.max_chats_per_group_request or 1),
+
+            # === DEPRECATED (старая система счётчиков, удалим в этапе 4) ===
             "daily_qa_limit": int(plan.daily_qa_limit),
             "monthly_qa_limit": int(plan.monthly_qa_limit),
+
             "qa_history_days": int(plan.qa_history_days),
             "max_active_subscriptions": int(plan.max_active_subscriptions),
             "min_subscription_interval_minutes": int(plan.min_subscription_interval_minutes),
@@ -957,8 +1060,19 @@ async def build_usage_snapshot(
             "has_chat_history": bool(plan.has_chat_history),
         },
         "usage": {
+            # === Токенный баланс (новое) — что показывать в карточке профиля ===
+            "tokens": {
+                "monthly_granted": token_monthly_granted,
+                "monthly_used": token_monthly_used,
+                "monthly_remaining": token_monthly_remaining,
+                "topup_balance": token_topup_balance,
+                "total_remaining": token_total_remaining,
+            },
+
+            # === DEPRECATED (старые счётчики qa-запросов) ===
             "daily_used": int(daily_used),
             "monthly_used": int(monthly_used),
+
             "active_subscriptions": int(active_subscriptions),
             "trial_subscriptions_total": int(trial_total),
             "free_trial_limit_reached": bool(free_trial_limit_reached),

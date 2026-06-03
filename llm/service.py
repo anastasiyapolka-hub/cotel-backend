@@ -6,13 +6,27 @@ from typing import Any, Optional, Union
 
 from .models import resolve_model_config, DEFAULT_AI_MODEL
 from .adapters import get_adapter
+from .classifier import (
+    ALL_CATEGORIES,
+    ClassificationResult,
+    DEFAULT_CATEGORY,
+    classify_query,
+)
+from .orchestrator import LlmRunResult, run as orchestrator_run
 from .preprocessing import clean_telegram_messages
+from .routing import (
+    RoutingDecision,
+    TIER_LIGHT,
+    normalize_tier,
+    route,
+)
 from .usage import (
     LlmUsage,
     LlmTextResult,
     LlmJsonResult,
     TOKENS_SOURCE_EMPTY,
 )
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -833,3 +847,406 @@ async def build_subscription_digest(
             raw_finish_reason=rich.raw_finish_reason,
         )
     return parsed
+
+
+# ===========================================================================
+# NEW: маршрутизированный Q&A pipeline (classifier → routing → orchestrator)
+# ===========================================================================
+#
+# Эти функции — публичный API нового pipeline'а. Используются endpoint'ами
+# (main.tg_analyze_chat / tg_analyze_chats_group) после миграции на токены.
+#
+# Старые `summarize_chat_messages` / `summarize_chat_messages_group` пока
+# оставлены — на них завязаны подписочный runner и admin/service endpoint'ы.
+# Удалим в этапе 4 рефакторинга.
+# ===========================================================================
+
+
+@dataclass
+class QaRunResult:
+    """
+    Результат высокоуровневого Q&A вызова через router + orchestrator.
+
+    Endpoint использует:
+      - .text                — текст ответа (рендер пользователю)
+      - .is_empty            — True если LLM не вызывался (пустой чат)
+                               → billing не списывает, usage_event без счётчиков
+      - .llm.used_model      — фактическая модель (для pricing.get_token_rates)
+      - .llm.usage           — input/output/thinking tokens (для billing.debit)
+      - .llm.finish_reason   — для diagnostics
+      - .classification      — для записи в user_query_log
+      - .decision            — для логирования в meta_json usage_event
+      - .llm.was_fallback    — для метрик/админки
+    """
+    text: str
+    is_empty: bool
+    llm: Optional[LlmRunResult]
+    classification: Optional[ClassificationResult]
+    decision: Optional[RoutingDecision]
+
+
+def _resolve_category(
+    classification: Optional[ClassificationResult],
+    explicit_category: Optional[str],
+) -> tuple[str, bool]:
+    """
+    Определить финальную категорию для роутера.
+
+    Если пользователь явно переопределил через UI (chip-override) →
+    explicit_category побеждает. Иначе берём из classification.
+    Если ни того, ни того нет → DEFAULT_CATEGORY (simple_qa).
+
+    Возвращает (final_category, was_overridden).
+    """
+    if explicit_category and explicit_category.strip() in ALL_CATEGORIES:
+        detected = classification.category if classification else None
+        was_overridden = detected is not None and detected != explicit_category.strip()
+        return explicit_category.strip(), was_overridden
+    if classification is not None:
+        return classification.category, False
+    return DEFAULT_CATEGORY, False
+
+
+async def run_qa(
+    *,
+    user_query: str,
+    chat_name: str,
+    text_messages: list[dict],
+    fallback_language: str = "en",
+    depth: str = TIER_LIGHT,
+    requested_period_days: Optional[int] = None,
+    explicit_category: Optional[str] = None,
+) -> QaRunResult:
+    """
+    Высокоуровневый Q&A вызов с автоматическим выбором модели.
+
+    Шаги:
+      1. Препроцессинг сообщений (drop emoji/short reactions, compact ts)
+      2. Если контекст пуст → ранний выход с QaRunResult(is_empty=True)
+      3. classifier.classify_query(user_query) → category
+      4. routing.route(tier=depth, category, needs_structured) → decision
+      5. Сборка system_prompt + user_prompt (тот же, что в старой
+         summarize_chat_messages — те же системные инструкции про цитаты,
+         msg-id, time-context, и т.д.)
+      6. orchestrator.run(decision, ...) → LlmRunResult с фактической моделью
+         после fallback'а если был
+
+    Не делает billing — это ответственность endpoint'а:
+      tokens = compute_tokens_for_llm_call(usage, rates)
+      billing.debit(reason='qa_request', related_event_id=usage_event.id)
+    """
+    tier = normalize_tier(depth)
+    fallback_lang_name = _lang_name(fallback_language)
+
+    cleaned_messages, _stats = clean_telegram_messages(text_messages)
+    context = _format_qa_chat_context(cleaned_messages)
+
+    if not context:
+        empty_text = _EMPTY_CHAT_MESSAGES[_normalize_lang_code(fallback_language)]
+        return QaRunResult(
+            text=empty_text,
+            is_empty=True,
+            llm=None,
+            classification=None,
+            decision=None,
+        )
+
+    classification = await classify_query(user_query)
+    final_category, _was_overridden = _resolve_category(classification, explicit_category)
+
+    decision = route(
+        tier=tier,
+        category=final_category,
+        needs_structured_format=classification.needs_structured_format,
+    )
+
+    system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
+    oldest_date, newest_date = _extract_message_date_window(cleaned_messages)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+    user_prompt = (
+        f"{time_block}\n\n"
+        f"Chat name: {chat_name}\n\n"
+        f"Chat messages (oldest to newest):\n{context}\n\n"
+        f"User question:\n{user_query}"
+    )
+
+    llm_result = await orchestrator_run(
+        decision=decision,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+    )
+
+    return QaRunResult(
+        text=llm_result.text,
+        is_empty=False,
+        llm=llm_result,
+        classification=classification,
+        decision=decision,
+    )
+
+
+async def run_qa_group(
+    *,
+    user_query: str,
+    chats: list[dict],
+    fallback_language: str = "en",
+    depth: str = TIER_LIGHT,
+    requested_period_days: Optional[int] = None,
+    explicit_category: Optional[str] = None,
+) -> QaRunResult:
+    """
+    Высокоуровневый групповой Q&A вызов (несколько чатов в одном запросе).
+
+    chats — список dict'ов формата {"chat_name": str, "text_messages": list[dict]}.
+
+    Логика system_prompt'а на multi-chat ответ (## Chat: <name> + ## Summary)
+    сохранена из старой summarize_chat_messages_group.
+    """
+    tier = normalize_tier(depth)
+    fallback_lang_name = _lang_name(fallback_language)
+
+    if not chats:
+        return QaRunResult(
+            text=_EMPTY_GROUP_MESSAGE[_normalize_lang_code(fallback_language)],
+            is_empty=True,
+            llm=None,
+            classification=None,
+            decision=None,
+        )
+
+    sections: list[str] = []
+    chat_names: list[str] = []
+    all_cleaned: list[dict] = []
+    for idx, c in enumerate(chats, start=1):
+        chat_name = (c.get("chat_name") or "").strip() or f"Chat {idx}"
+        text_messages = c.get("text_messages") or []
+        cleaned, _stats = clean_telegram_messages(text_messages)
+        section = _build_group_chat_section(
+            chat_index=idx,
+            chat_name=chat_name,
+            cleaned_messages=cleaned,
+        )
+        if section:
+            sections.append(section)
+            chat_names.append(chat_name)
+            all_cleaned.extend(cleaned)
+
+    if not sections:
+        return QaRunResult(
+            text=_EMPTY_GROUP_MESSAGE[_normalize_lang_code(fallback_language)],
+            is_empty=True,
+            llm=None,
+            classification=None,
+            decision=None,
+        )
+
+    classification = await classify_query(user_query)
+    final_category, _was_overridden = _resolve_category(classification, explicit_category)
+
+    # Safety-net для группового: если классификатор почему-то выдал simple_qa,
+    # а реально пользователь шлёт N≥2 чатов — это явно cross_chat_analysis.
+    if final_category == DEFAULT_CATEGORY and len(sections) >= 2:
+        from .classifier import CATEGORY_CROSS_CHAT_ANALYSIS
+        final_category = CATEGORY_CROSS_CHAT_ANALYSIS
+
+    decision = route(
+        tier=tier,
+        category=final_category,
+        needs_structured_format=classification.needs_structured_format,
+    )
+
+    system_prompt = _build_qa_group_system_prompt(fallback_lang_name)
+    combined_context = "\n\n".join(sections)
+    oldest_date, newest_date = _extract_message_date_window(all_cleaned)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+    user_prompt = (
+        f"{time_block}\n\n"
+        f"Number of chats: {len(sections)}\n"
+        f"Chat names (in order): {'; '.join(chat_names)}\n\n"
+        f"Chat history (each chat in its own labelled section):\n\n"
+        f"{combined_context}\n\n"
+        f"User question:\n{user_query}"
+    )
+
+    llm_result = await orchestrator_run(
+        decision=decision,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+    )
+
+    return QaRunResult(
+        text=llm_result.text,
+        is_empty=False,
+        llm=llm_result,
+        classification=classification,
+        decision=decision,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers для нового pipeline'а (используются run_qa и run_qa_group)
+# ---------------------------------------------------------------------------
+
+
+def _format_qa_chat_context(cleaned_messages: list[dict]) -> str:
+    """
+    Сформировать context-строку «по строке на сообщение».
+    Формат: `[date] [msg:ID] [reply→msg:PID] sender: text`.
+    Идентичен логике в старой summarize_chat_messages.
+    """
+    lines: list[str] = []
+    for msg in cleaned_messages:
+        date = msg.get("date") or ""
+        sender = msg.get("from") or "Unknown"
+        text = msg.get("text") or ""
+        msg_id = msg.get("message_id")
+        reply_to = msg.get("reply_to")
+        prefix_parts = [f"[{date}]"]
+        if msg_id is not None:
+            prefix_parts.append(f"[msg:{int(msg_id)}]")
+        if reply_to:
+            try:
+                prefix_parts.append(f"[reply→msg:{int(reply_to)}]")
+            except (TypeError, ValueError):
+                pass
+        prefix = " ".join(prefix_parts)
+        lines.append(f"{prefix} {sender}: {text}")
+    return "\n".join(lines)
+
+
+def _build_qa_single_system_prompt(fallback_lang_name: str) -> str:
+    """
+    System-prompt для одиночного Q&A. Идентичен тексту в старой
+    summarize_chat_messages — извлечён для переиспользования.
+    Менять разрешено только синхронно с регрессионными тестами Q1-Q10.
+    """
+    return (
+        "You are CoTel, an expert analyst of Telegram chat conversations. "
+        "Users come to you to find specific information, patterns, or "
+        "insights in their chat history that would be tedious to find "
+        "manually.\n\n"
+        "For this query: read the provided chat fragment, find messages "
+        "that are semantically relevant to the user's question, and "
+        "produce a focused answer grounded in those messages.\n\n"
+        "HOW TO ANSWER\n"
+        "1. Identify messages that are semantically relevant (not just "
+        "keyword matches). Consider synonyms, paraphrases, emoji, "
+        "transliteration.\n"
+        "2. Organize findings by theme or timeline — whichever better "
+        "fits the question.\n"
+        "3. When referencing a specific message, cite it with this "
+        "format:\n"
+        "       @username: \"short verbatim quote\" [msg:ID]\n"
+        "   - ID is the exact numeric id taken from the [msg:ID] token "
+        "that precedes the message in the chat fragment below. Copy it "
+        "verbatim. Do NOT invent ids and do NOT cite a message that has "
+        "no [msg:ID] token.\n"
+        "   - Place the [msg:ID] token AT THE END of the citation, "
+        "immediately after the closing quote — not before the username "
+        "and not before the quote itself.\n"
+        "   - If the same message is referenced multiple times in your "
+        "answer, repeat the same [msg:ID] each time.\n"
+        "   - Keep quotes short and in the original language of the "
+        "message.\n"
+        "   - Some messages have an extra [reply→msg:PARENT_ID] token "
+        "after their own [msg:ID]. This means the message is a reply "
+        "to the message with that PARENT_ID. Use this to reconstruct "
+        "conversation threads when relevant, but do NOT cite the "
+        "[reply→msg:...] token itself — only the message's own "
+        "[msg:ID].\n"
+        "4. If the chat contains conflicting information (different "
+        "people say different things), surface the conflict — do not "
+        "flatten it.\n"
+        "5. If relevant messages are sparse (e.g. only 3 out of 400 are "
+        "actually relevant), say so up front so the user calibrates "
+        "expectations.\n\n"
+        "CITATIONS\n"
+        "- No more than 3 citations per sub-topic. If more relevant "
+        "messages exist, pick the most representative ones.\n"
+        "- For the remaining (un-cited) relevant messages on the same "
+        "sub-topic, summarize what they add in the conclusion or "
+        "wrap-up of that sub-topic — so the user knows what the "
+        "uncited messages say without seeing each one quoted.\n\n"
+        "RULES\n"
+        "- Ground every claim in the provided messages. Never invent "
+        "participants, dates, events, or details that are not in the "
+        "input.\n"
+        "- If the input is insufficient, say so plainly. Do not "
+        "speculate.\n"
+        "- Quote messages verbatim in their original language. Write "
+        "your own analysis and conclusions in the SAME LANGUAGE as the "
+        "user's question. If the language of the question is ambiguous "
+        "(one word, only emoji, mixed languages, too short to tell), "
+        f"respond in {fallback_lang_name}.\n"
+        "- No preamble. Do not restate the question.\n\n"
+        "LENGTH\n"
+        "- Target: 1000-1500 characters. HARD LIMIT: 2000 characters.\n"
+        "- If you would exceed the limit, prioritize: direct answer "
+        "first, citations second, context-setting last.\n"
+        "- Structure: 3–6 short paragraphs OR a bulleted list of 3–8 "
+        "items, whichever better suits the question.\n\n"
+        "OUTPUT FORMAT: plain text. No Markdown headings, no JSON "
+        "wrapper."
+    )
+
+
+def _build_qa_group_system_prompt(fallback_lang_name: str) -> str:
+    """
+    System-prompt для группового (multi-chat) Q&A.
+    Идентичен тексту в старой summarize_chat_messages_group.
+    """
+    return (
+        "You are CoTel, an expert analyst of Telegram chat "
+        "conversations. The user has selected MULTIPLE chats and asked "
+        "one question. Your job: answer the question SEPARATELY for "
+        "each chat, plus give a short overall conclusion.\n\n"
+        "INPUT FORMAT\n"
+        "The chat history below is divided into sections, each starting "
+        "with a marker line of the form:\n"
+        "    === CHAT N: «chat name» ===\n"
+        "Each section contains messages from that single chat, in the "
+        "same per-message format as single-chat analysis: "
+        "[date] [msg:ID] [reply→msg:PARENT_ID] sender: text.\n\n"
+        "OUTPUT FORMAT (markdown)\n"
+        "Produce one section per chat, in the same order they appear in "
+        "the input, using THIS EXACT heading format:\n"
+        "    ## Chat: <chat name>\n"
+        "Use the chat name verbatim from the «...» marker. After all "
+        "chat sections, add a final section:\n"
+        "    ## Summary\n"
+        "with a 2-3 sentence overall conclusion across all chats.\n\n"
+        "If the user's question is in Russian, translate the section "
+        "labels accordingly: use `## Чат: ...` and `## Общий вывод`.\n\n"
+        "ANSWER RULES (per chat section)\n"
+        "- 200-400 words per chat. Be concrete, not generic.\n"
+        "- Ground every claim in messages from THAT chat only. Do not "
+        "mix evidence between chats.\n"
+        "- Cite using `[msg:ID]` exactly as it appears in the chat's "
+        "section. IDs are unique within a chat but may collide across "
+        "chats — never carry an ID from one chat into another section.\n"
+        "- If a chat has no information relevant to the question, "
+        "write a single short sentence saying so. Do not pad.\n"
+        "- Do not duplicate the same point across multiple chats; if "
+        "two chats discuss the same thing, say so in the Summary, not "
+        "in each chat section.\n\n"
+        "LANGUAGE\n"
+        "- Respond in the SAME LANGUAGE as the user's question. If the "
+        "question's language is ambiguous (one word, only emoji, mixed "
+        f"languages, too short to tell), respond in {fallback_lang_name}.\n"
+        "- Quote messages verbatim in their original language.\n\n"
+        "NO PREAMBLE. Do not restate the question. Do not list the "
+        "chats up front — just start with the first `## Chat: ...` "
+        "section."
+    )

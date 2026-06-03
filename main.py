@@ -6,6 +6,7 @@ from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 from diagnostics import router as diagnostics_router
 
 import os
+import logging
 import httpx
 import json
 import hashlib
@@ -28,7 +29,14 @@ from llm.service import (
     summarize_chat_messages_group,
     classify_subscription_matches,
     build_subscription_digest,
+    run_qa,
+    run_qa_group,
 )
+from llm.adapters import LlmFatalError, LlmRetryableError
+from llm.orchestrator import LlmAllModelsFailedError, routing_meta
+from llm.pricing import get_token_rates
+
+import billing
 
 from db.models import (
     User,
@@ -42,6 +50,7 @@ from db.models import (
     Plan,
     UsageCounter,
     UsageEvent,
+    UserQueryLog,
 )
 
 from db.session import get_db
@@ -81,11 +90,14 @@ from service_account_service import (
 )
 from plan_limits import (
     build_usage_snapshot,
+    check_max_chats_or_raise,
+    check_tier_allowed_or_raise,
     ensure_can_create_subscription,
     ensure_can_delete_subscription,
     ensure_can_toggle_subscription,
     ensure_can_update_subscription,
     enforce_qa_limits,
+    get_user_plan,
     parse_period_from_payload,
     record_qa_success,
     record_qa_failure,
@@ -1251,41 +1263,68 @@ async def tg_analyze_chat(
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Single-chat Q&A endpoint после cutover'а на токенную систему.
+
+    Pipeline:
+      1. depth (light/balanced/deep) от фронта — вместо ai_model
+      2. plan_limits.check_tier_allowed_or_raise (free → только light)
+      3. billing.check_can_spend — soft-блок по балансу
+      4. fetch из Telegram (без изменений)
+      5. llm.service.run_qa — classifier → router → orchestrator
+         с fallback-chain
+      6. pricing.get_token_rates(used_model) + billing.compute_tokens_for_llm_call
+      7. atomic: db.add(UsageEvent) + billing.debit(reason='qa_request') +
+                 db.add(UserQueryLog)
+
+    Старая система счётчиков qa-запросов (record_qa_success/_failure +
+    enforce_qa_limits + resolve_ai_model_for_user) больше не вызывается
+    из этого endpoint'а. Удалим в этапе 4 рефакторинга.
+    """
     owner_user_id = user.id
 
     chat_link = (payload.get("chat_link") or "").strip()
     user_query = (payload.get("user_query") or "").strip()
 
     # Период анализа: новый контракт {period_value, period_unit} либо
-    # legacy {days}. parse_period_from_payload бросает 400 на невалидный
-    # ввод (включая выход за общие границы минут/часов).
+    # legacy {days}. parse_period_from_payload бросает 400 на невалидный.
     period_value, period_unit, period_seconds = parse_period_from_payload(payload)
-    # days — для логов и тарифного чека. Для минут/часов отдаём 1
-    # (под-суточный период) и просим пропустить days-проверку плана.
+    # days — для логов. Для минут/часов отдаём 1 (под-суточный период).
     days = period_value if period_unit == "days" else 1
 
-    requested_ai_model = payload.get("ai_model")
-    ai_model = resolve_ai_model_for_user(
-        user=user,
-        requested_ai_model=requested_ai_model,
-        fallback_ai_model=getattr(user, "default_ai_model", None),
-    )
+    # === НОВОЕ: depth вместо ai_model ===
+    depth = str(payload.get("depth") or "light").strip().lower()
+    # Опциональный override категории от фронта (chip «изменить категорию»)
+    explicit_category = payload.get("category")
 
     me = await tg_get_current_user(db, owner_user_id)
     if not me:
-        # Pre-condition: no Telegram link. Not a Q&A failure to log —
-        # the request never actually started consuming anything.
+        # Pre-condition: no Telegram link. Не Q&A failure — никаких
+        # токенов не тратилось.
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
-    # enforce_qa_limits writes qa_request_rejected itself on 429.
-    await enforce_qa_limits(
-        db,
-        user=user,
-        requested_days=days,
-        source_mode="personal",
-        chat_ref=chat_link,
-        skip_days_plan_check=(period_unit != "days"),
+    # === Tier check (free → только light) ===
+    plan = await get_user_plan(db, user)
+    check_tier_allowed_or_raise(plan, depth)
+
+    # === Soft-block по балансу токенов ===
+    can_spend, balance = await billing.check_can_spend(
+        db, user_id=user.id, tier=depth,
     )
+    if not can_spend:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "INSUFFICIENT_TOKENS",
+                "message": (
+                    "Недостаточно токенов на балансе. Дождитесь начала "
+                    "следующего месяца или докупите токены."
+                ),
+                "monthly_used": balance.monthly_used,
+                "monthly_granted": balance.monthly_granted,
+                "topup_balance": balance.topup_balance,
+            },
+        )
 
     query_chars = len(user_query)
     total_t0 = time.perf_counter()
@@ -1299,44 +1338,32 @@ async def tg_analyze_chat(
     except ValueError as ve:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
-        await record_qa_failure(
-            db,
-            user=user,
-            source_mode="personal",
-            chat_ref=chat_link,
-            requested_days=days,
-            ai_model=ai_model,
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
             error_code="TELEGRAM_FETCH_FAILED",
             error_message=(str(ve) or "")[:300] or None,
             query_chars=query_chars or None,
-            duration_ms_total=total_ms,
-            duration_ms_fetch=fetch_ms,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         )
         await db.commit()
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
-        await record_qa_failure(
-            db,
-            user=user,
-            source_mode="personal",
-            chat_ref=chat_link,
-            requested_days=days,
-            ai_model=ai_model,
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
             error_code="TELEGRAM_FETCH_FAILED",
             error_message=(str(e) or "")[:300] or None,
             query_chars=query_chars or None,
-            duration_ms_total=total_ms,
-            duration_ms_fetch=fetch_ms,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="TELEGRAM_FETCH_FAILED")
     fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
 
     messages_fetched_count = len(messages)
-    # Approximate the LLM context size. The provider returns exact
-    # input_tokens via .usage, so this number is informational only.
     context_chars = sum(
         len(m.get("text") or "")
         + len(m.get("from") or "")
@@ -1345,57 +1372,83 @@ async def tg_analyze_chat(
         for m in messages
     )
 
-    chat_name = getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
+    chat_name = (
+        getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
+    )
 
-    # -------- LLM call --------
+    # -------- LLM call через новый pipeline --------
     llm_t0 = time.perf_counter()
     try:
-        llm_result = await summarize_chat_messages(
+        qa_result = await run_qa(
             user_query=user_query,
             chat_name=chat_name,
             text_messages=messages,
             fallback_language=user.language,
-            ai_model=ai_model,
-            return_usage=True,
+            depth=depth,
             requested_period_days=days,
+            explicit_category=explicit_category,
+        )
+    except LlmFatalError as exc:
+        # 400/401/403 — наша конфиг-ошибка, fallback не помог бы
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            error_code="LLM_FATAL_ERROR",
+            error_message=f"{exc.provider}:{exc.provider_model} {exc}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="LLM_ERROR")
+    except LlmAllModelsFailedError as exc:
+        # Все модели в fallback-chain недоступны (редкий, но критичный кейс)
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            error_code="LLM_ALL_MODELS_FAILED",
+            error_message=f"attempted={exc.attempted_models}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "LLM_TEMPORARILY_UNAVAILABLE",
+                "message": "Временные проблемы с AI-провайдерами, попробуйте через минуту.",
+            },
         )
     except Exception as e:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
-        await record_qa_failure(
-            db,
-            user=user,
-            source_mode="personal",
-            chat_ref=chat_link,
-            requested_days=days,
-            ai_model=ai_model,
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
             error_code="LLM_ERROR",
             error_message=(str(e) or "")[:300] or None,
             query_chars=query_chars or None,
+            requested_days=days, depth=depth,
             messages_fetched_count=messages_fetched_count,
             context_chars=context_chars,
-            duration_ms_total=total_ms,
-            duration_ms_fetch=fetch_ms,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
             duration_ms_llm=llm_ms,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="LLM_ERROR")
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
-    summary = llm_result.text
-    llm_usage: LlmUsage = llm_result.usage
+    summary = qa_result.text
 
-    # -------- Cost estimation (safe to missing llm_pricing table) --------
-    cost = await estimate_llm_cost_usd(
-        db,
-        ai_model=ai_model,
-        input_tokens=llm_usage.input_tokens,
-        output_tokens=llm_usage.output_tokens,
-        tokens_source=llm_usage.tokens_source,
-        thinking_tokens=llm_usage.thinking_tokens,
-    )
-
-    # -------- Chat history + success event --------
+    # -------- Chat history (всегда, даже если is_empty) --------
     await upsert_user_chat_history(
         db,
         owner_user_id=owner_user_id,
@@ -1408,32 +1461,233 @@ async def tg_analyze_chat(
 
     total_ms = int((time.perf_counter() - total_t0) * 1000)
 
-    await record_qa_success(
-        db,
-        user=user,
-        source_mode="personal",
-        chat_ref=chat_link,
-        requested_days=days,
-        ai_model=ai_model,
-        query_chars=query_chars or None,
+    # -------- Empty-chat short-circuit (LLM не вызывался, токены не списываем) --------
+    if qa_result.is_empty:
+        await _record_qa_success_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            depth=depth, requested_days=days, query_chars=query_chars,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars, answer_chars=len(summary or ""),
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+            qa_result=qa_result, tokens_charged=0,
+        )
+        await db.commit()
+        return _build_qa_response(
+            summary=summary, chat_name=chat_name,
+            messages_fetched_count=messages_fetched_count,
+            qa_result=qa_result, tokens_charged=0, entity=entity, messages=messages,
+            usage_snapshot=await build_usage_snapshot(db, user=user),
+        )
+
+    # -------- Расчёт стоимости запроса в наших токенах --------
+    used_model_slug = qa_result.llm.used_model.slug
+    rates = await get_token_rates(db, used_model_slug)
+    if rates is None:
+        # llm_pricing не настроен для этой модели — биллим минимум,
+        # но логируем для админа. На проде такого быть не должно.
+        log = logging.getLogger(__name__)
+        log.error("billing.no_pricing_row used_model=%s — отсутствует строка в llm_pricing",
+                  used_model_slug)
+        tokens_charged = 1
+    else:
+        tokens_charged = billing.compute_tokens_for_llm_call(
+            input_tokens=qa_result.llm.usage.input_tokens or 0,
+            output_tokens=qa_result.llm.usage.output_tokens or 0,
+            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
+            in_per_1k=rates.in_per_1k,
+            out_per_1k=rates.out_per_1k,
+        )
+
+    # -------- UsageEvent + billing.debit + UserQueryLog (атомарно) --------
+    usage_event_id = await _record_qa_success_event(
+        db, user=user, source_mode="personal", chat_ref=chat_link,
+        depth=depth, requested_days=days, query_chars=query_chars,
         messages_fetched_count=messages_fetched_count,
-        messages_sent_to_llm_count=messages_fetched_count,
-        context_chars=context_chars,
-        answer_chars=len(summary or ""),
-        duration_ms_total=total_ms,
-        duration_ms_fetch=fetch_ms,
+        context_chars=context_chars, answer_chars=len(summary or ""),
+        duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         duration_ms_llm=llm_ms,
-        **split_usage_for_meta(llm_usage),
-        **cost_kwargs_for_meta(cost),
+        qa_result=qa_result, tokens_charged=tokens_charged,
     )
+
+    await billing.debit(
+        db,
+        user_id=user.id,
+        amount=tokens_charged,
+        reason=billing.REASON_QA_REQUEST,
+        related_event_id=usage_event_id,
+        meta={
+            "used_model": used_model_slug,
+            "input_tokens": qa_result.llm.usage.input_tokens,
+            "output_tokens": qa_result.llm.usage.output_tokens,
+            "thinking_tokens": qa_result.llm.usage.thinking_tokens,
+            "tokens_charged": tokens_charged,
+            "in_per_1k": float(rates.in_per_1k) if rates else None,
+            "out_per_1k": float(rates.out_per_1k) if rates else None,
+        },
+    )
+
+    # UserQueryLog — для аналитики и калибровки роутера
+    db.add(UserQueryLog(
+        user_id=user.id,
+        usage_event_id=usage_event_id,
+        query_text=user_query or "",
+        detected_category=(
+            qa_result.classification.category if qa_result.classification else None
+        ),
+        detected_confidence=(
+            qa_result.classification.confidence if qa_result.classification else None
+        ),
+        final_category=qa_result.decision.category if qa_result.decision else None,
+        selected_tier=depth,
+        selected_model=used_model_slug,
+    ))
 
     await db.commit()
 
-    # Карта {message_id: permalink} — даёт фронту возможность подставить
-    # кликабельные ссылки на конкретные сообщения вместо токенов [msg:ID]
-    # в тексте ответа LLM. Если ссылка для сообщения построиться не может
-    # (приватная группа / личка) — значение будет None, и фронт просто
-    # уберёт токен из текста.
+    return _build_qa_response(
+        summary=summary, chat_name=chat_name,
+        messages_fetched_count=messages_fetched_count,
+        qa_result=qa_result, tokens_charged=tokens_charged,
+        entity=entity, messages=messages,
+        usage_snapshot=await build_usage_snapshot(db, user=user),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers для нового Q&A pipeline (используются tg_analyze_chat и группой)
+# ---------------------------------------------------------------------------
+
+
+async def _record_qa_success_event(
+    db: AsyncSession,
+    *,
+    user: User,
+    source_mode: str,
+    chat_ref: str,
+    depth: str,
+    requested_days: int,
+    query_chars: int,
+    messages_fetched_count: int,
+    context_chars: int,
+    answer_chars: int,
+    duration_ms_total: int,
+    duration_ms_fetch: int,
+    duration_ms_llm: int,
+    qa_result,
+    tokens_charged: int,
+) -> int:
+    """
+    Записать UsageEvent об успешном Q&A запросе в новой схеме.
+
+    Возвращает id созданной записи (нужен для token_transactions.related_event_id).
+
+    Отличия от старого record_qa_success:
+      - Не инкрементит deprecated UsageCounter
+      - Кладёт в meta_json новые поля роутера (через orchestrator.routing_meta)
+      - Не требует ai_model отдельным параметром — берёт из qa_result.llm.used_model
+    """
+    meta: dict = {
+        "depth": depth,
+        "requested_days": requested_days,
+        "query_chars": query_chars,
+        "messages_fetched_count": messages_fetched_count,
+        "messages_sent_to_llm_count": messages_fetched_count,
+        "context_chars": context_chars,
+        "answer_chars": answer_chars,
+        "duration_ms_total": duration_ms_total,
+        "duration_ms_fetch": duration_ms_fetch,
+        "duration_ms_llm": duration_ms_llm,
+        "tokens_charged": tokens_charged,
+    }
+
+    if qa_result.llm is not None:
+        meta["ai_model"] = qa_result.llm.used_model.slug
+        meta["input_tokens"] = qa_result.llm.usage.input_tokens
+        meta["output_tokens"] = qa_result.llm.usage.output_tokens
+        meta["total_tokens"] = qa_result.llm.usage.total_tokens
+        meta["thinking_tokens"] = qa_result.llm.usage.thinking_tokens
+        meta["tokens_source"] = qa_result.llm.usage.tokens_source
+        meta["raw_finish_reason"] = qa_result.llm.finish_reason
+        # routing info
+        if qa_result.decision is not None:
+            meta.update(routing_meta(qa_result.llm, qa_result.decision))
+    if qa_result.is_empty:
+        meta["is_empty"] = True
+
+    event = UsageEvent(
+        user_id=user.id,
+        event_type="qa_request_success",
+        status="success_counted",
+        source_mode=source_mode,
+        chat_ref=chat_ref,
+        meta_json=_drop_none(meta),
+    )
+    db.add(event)
+    await db.flush()  # нужен id для token_transactions.related_event_id
+    return int(event.id)
+
+
+async def _record_qa_failure_event(
+    db: AsyncSession,
+    *,
+    user: User,
+    source_mode: str,
+    chat_ref: str,
+    error_code: str,
+    error_message: Optional[str],
+    query_chars: Optional[int],
+    requested_days: int,
+    depth: str,
+    messages_fetched_count: Optional[int] = None,
+    context_chars: Optional[int] = None,
+    duration_ms_total: Optional[int] = None,
+    duration_ms_fetch: Optional[int] = None,
+    duration_ms_llm: Optional[int] = None,
+) -> None:
+    """
+    Записать UsageEvent о failed Q&A запросе. Биллинг НЕ списывается на
+    ошибках (LLM-вызов не состоялся или вернул мусор).
+    """
+    meta = _drop_none({
+        "depth": depth,
+        "requested_days": requested_days,
+        "query_chars": query_chars,
+        "messages_fetched_count": messages_fetched_count,
+        "context_chars": context_chars,
+        "duration_ms_total": duration_ms_total,
+        "duration_ms_fetch": duration_ms_fetch,
+        "duration_ms_llm": duration_ms_llm,
+        "error_code": error_code,
+        "error_message": error_message,
+    })
+    db.add(UsageEvent(
+        user_id=user.id,
+        event_type="qa_request_failure",
+        status="failed_not_counted",
+        source_mode=source_mode,
+        chat_ref=chat_ref,
+        meta_json=meta,
+    ))
+
+
+def _drop_none(d: dict) -> dict:
+    """Убрать ключи с None-значениями (чтобы не раздувать meta_json)."""
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def _build_qa_response(
+    *,
+    summary: str,
+    chat_name: str,
+    messages_fetched_count: int,
+    qa_result,
+    tokens_charged: int,
+    entity,
+    messages: list,
+    usage_snapshot: dict,
+) -> dict:
+    """Собрать JSON-ответ endpoint'а tg_analyze_chat."""
     from telegram_service import build_message_permalink as _build_permalink
     message_links: dict[int, str | None] = {}
     for _m in messages:
@@ -1442,16 +1696,29 @@ async def tg_analyze_chat(
             continue
         message_links[int(_mid)] = _build_permalink(entity, _mid)
 
-    return {
+    body = {
         "status": "ok",
         "summary": summary,
         "chat_name": chat_name,
         "messages_count": messages_fetched_count,
         "source_mode": "personal",
-        "ai_model": ai_model,
         "message_links": message_links,
-        "usage": await build_usage_snapshot(db, user=user),
+        "tokens_charged": tokens_charged,
+        "usage": usage_snapshot,
     }
+
+    # Расширенный набор полей для UI «Расшифровка ▾» и фронт-логов.
+    if qa_result.llm is not None:
+        body["used_model"] = qa_result.llm.used_model.slug
+        body["was_fallback"] = qa_result.llm.was_fallback
+    if qa_result.decision is not None:
+        body["category"] = qa_result.decision.category
+        body["tier"] = qa_result.decision.tier
+    if qa_result.classification is not None:
+        body["detected_category"] = qa_result.classification.category
+        body["detected_confidence"] = qa_result.classification.confidence
+
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -1512,46 +1779,41 @@ async def tg_analyze_chats_group(
     # Период анализа — общий помощник; см. plan_limits.parse_period_from_payload
     period_value, period_unit, period_seconds = parse_period_from_payload(payload)
     days = period_value if period_unit == "days" else 1
-    requested_ai_model = payload.get("ai_model")
-    ai_model = resolve_ai_model_for_user(
-        user=user,
-        requested_ai_model=requested_ai_model,
-        fallback_ai_model=getattr(user, "default_ai_model", None),
-    )
 
-    # ---- Per-plan group size limit ----
-    plan_code = str(getattr(user, "plan", "") or "").strip().lower()
-    group_limit = resolve_group_chats_limit(plan_code)
-    if len(chat_links) > group_limit:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "GROUP_CHATS_LIMIT_EXCEEDED",
-                "message": (
-                    f"Ваш тариф разрешает не более {group_limit} чатов "
-                    f"в одном групповом запросе."
-                ),
-                "group_chats_limit": group_limit,
-                "requested": len(chat_links),
-            },
-        )
+    # === НОВОЕ: depth вместо ai_model ===
+    depth = str(payload.get("depth") or "light").strip().lower()
+    explicit_category = payload.get("category")
 
     me = await tg_get_current_user(db, owner_user_id)
     if not me:
         raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
 
-    # ---- Quota check (N slots) ----
-    # enforce_qa_limits writes qa_request_rejected itself on 429.
+    # === Tier check (free → только light) ===
+    plan = await get_user_plan(db, user)
+    check_tier_allowed_or_raise(plan, depth)
+
+    # === Per-plan group size limit (новое поле max_chats_per_group_request) ===
     group_size = len(chat_links)
-    await enforce_qa_limits(
-        db,
-        user=user,
-        requested_days=days,
-        source_mode="personal",
-        chat_ref=f"group:{group_size}",
-        slots_required=group_size,
-        skip_days_plan_check=(period_unit != "days"),
+    check_max_chats_or_raise(plan, group_size)
+
+    # === Soft-block по балансу токенов ===
+    can_spend, balance = await billing.check_can_spend(
+        db, user_id=user.id, tier=depth,
     )
+    if not can_spend:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "INSUFFICIENT_TOKENS",
+                "message": (
+                    "Недостаточно токенов на балансе. Дождитесь начала "
+                    "следующего месяца или докупите токены."
+                ),
+                "monthly_used": balance.monthly_used,
+                "monthly_granted": balance.monthly_granted,
+                "topup_balance": balance.topup_balance,
+            },
+        )
 
     query_chars = len(user_query)
     total_t0 = time.perf_counter()
@@ -1637,61 +1899,87 @@ async def tg_analyze_chats_group(
     # failure (502, mirrors single-chat behaviour on TELEGRAM_FETCH_FAILED).
     if not chats_for_llm:
         total_ms = int((time.perf_counter() - total_t0) * 1000)
-        await record_qa_failure(
-            db,
-            user=user,
-            source_mode="personal",
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal",
             chat_ref=f"group:{group_size}",
-            requested_days=days,
-            ai_model=ai_model,
             error_code="TELEGRAM_FETCH_FAILED",
             error_message="All chats in group failed to fetch.",
             query_chars=query_chars or None,
-            duration_ms_total=total_ms,
-            duration_ms_fetch=fetch_ms,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="TELEGRAM_FETCH_FAILED")
 
-    # ---- LLM call ----
-    # Strip the bookkeeping `_idx` key before handing chats to the service.
+    # ---- LLM call через новый pipeline ----
     chats_for_service = [
         {k: v for k, v in c.items() if k != "_idx"} for c in chats_for_llm
     ]
 
     llm_t0 = time.perf_counter()
     try:
-        llm_result = await summarize_chat_messages_group(
+        qa_result = await run_qa_group(
             user_query=user_query,
             chats=chats_for_service,
             fallback_language=user.language,
-            ai_model=ai_model,
-            return_usage=True,
+            depth=depth,
             requested_period_days=days,
+            explicit_category=explicit_category,
+        )
+    except LlmFatalError as exc:
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            error_code="LLM_FATAL_ERROR",
+            error_message=f"{exc.provider}:{exc.provider_model} {exc}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="LLM_ERROR")
+    except LlmAllModelsFailedError as exc:
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            error_code="LLM_ALL_MODELS_FAILED",
+            error_message=f"attempted={exc.attempted_models}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "LLM_TEMPORARILY_UNAVAILABLE",
+                "message": "Временные проблемы с AI-провайдерами, попробуйте через минуту.",
+            },
         )
     except Exception as e:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
-        await record_qa_failure(
-            db,
-            user=user,
-            source_mode="personal",
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal",
             chat_ref=f"group:{group_size}",
-            requested_days=days,
-            ai_model=ai_model,
             error_code="LLM_ERROR",
             error_message=(str(e) or "")[:300] or None,
             query_chars=query_chars or None,
-            duration_ms_total=total_ms,
-            duration_ms_fetch=fetch_ms,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
             duration_ms_llm=llm_ms,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="LLM_ERROR")
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
-    group_summary = llm_result.text
-    llm_usage: LlmUsage = llm_result.usage
+    group_summary = qa_result.text
 
     # ---- Per-chat permalink maps ----
     # Build a {message_id: permalink} dict for each ok-chat. The
@@ -1721,57 +2009,136 @@ async def tg_analyze_chats_group(
 
     total_ms = int((time.perf_counter() - total_t0) * 1000)
 
-    # ---- Quota accounting: N success events ----
-    # We write one qa_request_success per chat that actually went through
-    # the LLM (status=ok). Empty and fetch_failed chats do NOT count
-    # against quota — same rule as single-chat: failed requests must not
-    # eat into the user's quota.
-    #
-    # The LLM cost is paid once but logged on the FIRST ok-chat to keep
-    # admin accounting consistent; the remaining ok-chats are logged
-    # with token/cost fields = None to avoid double-counting cost.
-    cost = await estimate_llm_cost_usd(
-        db,
-        ai_model=ai_model,
-        input_tokens=llm_usage.input_tokens,
-        output_tokens=llm_usage.output_tokens,
-        tokens_source=llm_usage.tokens_source,
-        thinking_tokens=llm_usage.thinking_tokens,
+    # === ОДИН UsageEvent + ОДИН debit на групповой запрос ===
+    # LLM-вызов был один (combined context), стоимость считается один раз.
+    # Это исправляет старый баг с N×списанием за групповой запрос.
+    total_messages_in_group = sum(
+        len(c.get("text_messages") or []) for c in chats_for_service
     )
 
-    ok_rows = [r for r in per_chat if r["status"] == "ok"]
-    for i, row in enumerate(ok_rows):
-        is_first = (i == 0)
-        await record_qa_success(
-            db,
-            user=user,
-            source_mode="personal",
-            chat_ref=f"group:{row['chat_link']}",
-            requested_days=days,
-            ai_model=ai_model,
-            query_chars=query_chars or None,
-            messages_fetched_count=row["messages_count"],
-            messages_sent_to_llm_count=row["messages_count"],
-            context_chars=None,
-            answer_chars=len(group_summary or "") if is_first else None,
-            duration_ms_total=total_ms if is_first else None,
-            duration_ms_fetch=fetch_ms if is_first else None,
-            duration_ms_llm=llm_ms if is_first else None,
-            **(split_usage_for_meta(llm_usage) if is_first else {}),
-            **(cost_kwargs_for_meta(cost) if is_first else {}),
+    # is_empty branch — все чаты пустые, LLM не вызывался
+    if qa_result.is_empty:
+        usage_event_id = await _record_qa_success_event(
+            db, user=user, source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            depth=depth, requested_days=days,
+            query_chars=query_chars,
+            messages_fetched_count=total_messages_in_group,
+            context_chars=0,
+            answer_chars=len(group_summary or ""),
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+            qa_result=qa_result, tokens_charged=0,
         )
+        await db.commit()
+        return _build_group_response(
+            group_summary=group_summary, per_chat=per_chat,
+            group_size=group_size,
+            qa_result=qa_result, tokens_charged=0,
+            usage_snapshot=await build_usage_snapshot(db, user=user),
+        )
+
+    used_model_slug = qa_result.llm.used_model.slug
+    rates = await get_token_rates(db, used_model_slug)
+    if rates is None:
+        log = logging.getLogger(__name__)
+        log.error("billing.no_pricing_row used_model=%s — отсутствует строка в llm_pricing",
+                  used_model_slug)
+        tokens_charged = 1
+    else:
+        tokens_charged = billing.compute_tokens_for_llm_call(
+            input_tokens=qa_result.llm.usage.input_tokens or 0,
+            output_tokens=qa_result.llm.usage.output_tokens or 0,
+            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
+            in_per_1k=rates.in_per_1k,
+            out_per_1k=rates.out_per_1k,
+        )
+
+    usage_event_id = await _record_qa_success_event(
+        db, user=user, source_mode="personal",
+        chat_ref=f"group:{group_size}",
+        depth=depth, requested_days=days,
+        query_chars=query_chars,
+        messages_fetched_count=total_messages_in_group,
+        context_chars=0,  # для группы context_chars не считаем — sum по секциям бесполезен
+        answer_chars=len(group_summary or ""),
+        duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+        duration_ms_llm=llm_ms,
+        qa_result=qa_result, tokens_charged=tokens_charged,
+    )
+
+    await billing.debit(
+        db,
+        user_id=user.id,
+        amount=tokens_charged,
+        reason=billing.REASON_QA_REQUEST,
+        related_event_id=usage_event_id,
+        meta={
+            "group_size": group_size,
+            "used_model": used_model_slug,
+            "input_tokens": qa_result.llm.usage.input_tokens,
+            "output_tokens": qa_result.llm.usage.output_tokens,
+            "thinking_tokens": qa_result.llm.usage.thinking_tokens,
+            "tokens_charged": tokens_charged,
+            "in_per_1k": float(rates.in_per_1k) if rates else None,
+            "out_per_1k": float(rates.out_per_1k) if rates else None,
+        },
+    )
+
+    db.add(UserQueryLog(
+        user_id=user.id,
+        usage_event_id=usage_event_id,
+        query_text=user_query or "",
+        detected_category=(
+            qa_result.classification.category if qa_result.classification else None
+        ),
+        detected_confidence=(
+            qa_result.classification.confidence if qa_result.classification else None
+        ),
+        final_category=qa_result.decision.category if qa_result.decision else None,
+        selected_tier=depth,
+        selected_model=used_model_slug,
+    ))
 
     await db.commit()
 
-    return {
+    return _build_group_response(
+        group_summary=group_summary, per_chat=per_chat,
+        group_size=group_size,
+        qa_result=qa_result, tokens_charged=tokens_charged,
+        usage_snapshot=await build_usage_snapshot(db, user=user),
+    )
+
+
+def _build_group_response(
+    *,
+    group_summary: str,
+    per_chat: list,
+    group_size: int,
+    qa_result,
+    tokens_charged: int,
+    usage_snapshot: dict,
+) -> dict:
+    """Собрать JSON-ответ endpoint'а tg_analyze_chats_group."""
+    body = {
         "status": "ok",
-        "ai_model": ai_model,
         "group_size": group_size,
-        "results": per_chat,        # per-chat status array with links
-        "summary": group_summary,    # full markdown — frontend parses it
+        "results": per_chat,
+        "summary": group_summary,
         "source_mode": "personal",
-        "usage": await build_usage_snapshot(db, user=user),
+        "tokens_charged": tokens_charged,
+        "usage": usage_snapshot,
     }
+    if qa_result.llm is not None:
+        body["used_model"] = qa_result.llm.used_model.slug
+        body["was_fallback"] = qa_result.llm.was_fallback
+    if qa_result.decision is not None:
+        body["category"] = qa_result.decision.category
+        body["tier"] = qa_result.decision.tier
+    if qa_result.classification is not None:
+        body["detected_category"] = qa_result.classification.category
+        body["detected_confidence"] = qa_result.classification.confidence
+    return body
 
 
 @app.get("/tg/chats")

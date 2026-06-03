@@ -20,9 +20,12 @@ from llm.service import (
     classify_subscription_matches,
     build_subscription_digest,
 )
+from llm.routing import route_subscription
 from llm.usage import LlmUsage, split_usage_for_meta, TOKENS_SOURCE_EMPTY
-from llm.pricing import estimate_llm_cost_usd, cost_kwargs_for_meta
+from llm.pricing import estimate_llm_cost_usd, cost_kwargs_for_meta, get_token_rates
 from plan_limits import utc_now
+
+import billing
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 from service_account_service import fetch_service_chat_messages_for_subscription
 
@@ -207,22 +210,47 @@ async def _record_subscription_run_success_same_session(
 
     Computes cost on the same session (read-only). Cost helper is safe
     against missing llm_pricing table.
+
+    После cutover'а: также списывает токены с баланса пользователя через
+    billing.debit. Сумма и reason берутся из subscription_type:
+      - events  → reason='subscription_event'
+      - digest  → reason='subscription_digest'
     """
     owner = metrics.get("owner_user_id")
     if not owner:
         return
 
     llm_usage = metrics.get("llm_usage") or LlmUsage(0, 0, 0, TOKENS_SOURCE_EMPTY)
+    ai_model = metrics.get("ai_model") or ""
 
     cost = await estimate_llm_cost_usd(
         db,
-        ai_model=metrics.get("ai_model") or "",
+        ai_model=ai_model,
         input_tokens=llm_usage.input_tokens,
         output_tokens=llm_usage.output_tokens,
         tokens_source=llm_usage.tokens_source,
         thinking_tokens=llm_usage.thinking_tokens,
     )
 
+    # === Биллинг (cutover) ===
+    # Считаем стоимость одного вызова в наших токенах. Минимум 1 токен.
+    # На is_empty / failed_to_call_llm (нет llm_usage) сюда не попадаем —
+    # _process_one_subscription делает early return перед вызовом этой функции.
+    rates = await get_token_rates(db, ai_model)
+    if rates is None or not llm_usage.input_tokens and not llm_usage.output_tokens:
+        # Нет прайса для модели или пустой usage (трейс/сетевая ошибка
+        # вернула пустой ответ) — списываем минимум.
+        tokens_charged = 1
+    else:
+        tokens_charged = billing.compute_tokens_for_llm_call(
+            input_tokens=llm_usage.input_tokens or 0,
+            output_tokens=llm_usage.output_tokens or 0,
+            thinking_tokens=llm_usage.thinking_tokens or 0,
+            in_per_1k=rates.in_per_1k,
+            out_per_1k=rates.out_per_1k,
+        )
+
+    metrics["tokens_charged"] = tokens_charged
     metrics["duration_ms_total"] = _ms_since(metrics["run_t0"])
     meta = _build_run_success_meta(
         metrics,
@@ -230,16 +258,41 @@ async def _record_subscription_run_success_same_session(
         cost_kwargs=cost_kwargs_for_meta(cost),
     )
 
-    db.add(
-        UsageEvent(
-            user_id=int(owner),
-            event_type="subscription_run_success",
-            status="success_counted",
-            source_mode=metrics.get("source_mode"),
-            chat_ref=metrics.get("chat_ref"),
-            subscription_id=metrics.get("subscription_id"),
-            meta_json=meta,
-        )
+    # Создаём UsageEvent и flush'имся, чтобы получить id для FK в token_transactions.
+    usage_event = UsageEvent(
+        user_id=int(owner),
+        event_type="subscription_run_success",
+        status="success_counted",
+        source_mode=metrics.get("source_mode"),
+        chat_ref=metrics.get("chat_ref"),
+        subscription_id=metrics.get("subscription_id"),
+        meta_json=meta,
+    )
+    db.add(usage_event)
+    await db.flush()
+
+    # Определяем reason по subscription_type. После cutover'а:
+    #   events → subscription_event, digest → subscription_digest.
+    sub_type = (metrics.get("subscription_type") or "events").lower()
+    if sub_type == "digest":
+        reason = billing.REASON_SUBSCRIPTION_DIGEST
+    else:
+        reason = billing.REASON_SUBSCRIPTION_EVENT
+
+    await billing.debit(
+        db,
+        user_id=int(owner),
+        amount=tokens_charged,
+        reason=reason,
+        related_event_id=int(usage_event.id),
+        meta={
+            "used_model": ai_model,
+            "subscription_id": metrics.get("subscription_id"),
+            "input_tokens": llm_usage.input_tokens,
+            "output_tokens": llm_usage.output_tokens,
+            "thinking_tokens": llm_usage.thinking_tokens,
+            "tokens_charged": tokens_charged,
+        },
     )
 
 
@@ -305,13 +358,19 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
     # Cache sub fields into metrics ASAP so the failure path has them.
     metrics["owner_user_id"] = getattr(sub, "owner_user_id", None)
     metrics["chat_ref"] = getattr(sub, "chat_ref", None)
-    metrics["ai_model"] = getattr(sub, "ai_model", None)
     metrics["frequency_minutes"] = int(getattr(sub, "frequency_minutes", 60) or 60)
 
     sub_type = (getattr(sub, "subscription_type", None) or "events").lower()
     if sub_type == "summary":
         sub_type = "digest"
     metrics["subscription_type"] = sub_type
+
+    # === Routing-based модель для подписок (после cutover'а) ===
+    # Поле sub.ai_model в БД больше НЕ используется для выбора модели —
+    # вся подписочная нагрузка идёт на Flash Lite через routing.route_subscription.
+    # Само поле sub.ai_model дропнем в этапе 4 рефакторинга.
+    subscription_model = route_subscription(sub_type)
+    metrics["ai_model"] = subscription_model.slug
 
     metrics["source_mode"] = (getattr(sub, "source_mode", None) or "personal").lower()
 
@@ -369,6 +428,36 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         owner_language = getattr(owner, "language", None) or "en"
 
         source_mode = metrics["source_mode"]
+
+        # === Soft-block по балансу токенов (cutover) ===
+        # Подписки на каждом tick'е проверяют, есть ли у пользователя минимум
+        # токенов на запрос. Если нет — НЕ вызываем Telegram fetch и LLM,
+        # ставим sub.status='no_tokens'. Подписка не «ломается», просто бездействует.
+        # Когда баланс восстановится (top-up, monthly_grant) — следующий tick
+        # пройдёт проверку и подписка снова заработает. status вернётся в 'ok'.
+        can_spend, balance = await billing.check_can_spend(
+            db, user_id=owner_user_id, tier="light",
+        )
+        if not can_spend:
+            print(
+                f"[subscriptions_runner] SKIP sub_id={sub.id} reason=NO_TOKENS "
+                f"monthly_used={balance.monthly_used}/{balance.monthly_granted} "
+                f"topup={balance.topup_balance}"
+            )
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+            sub.status = "no_tokens"
+            sub.last_error = None  # не ошибка, нет токенов — это нормальная ситуация
+            st.last_checked_at = now_utc
+            # Обычная периодичность — на следующий tick проверим снова
+            st.next_run_at = now_utc + timedelta(minutes=metrics["frequency_minutes"])
+            return
+
+        # Если статус был 'no_tokens', а сейчас баланс восстановился —
+        # возвращаем подписку в нормальное состояние.
+        if sub.status == "no_tokens":
+            sub.status = "ok"
 
         # =====================================================================
         # DIGEST / SUMMARY
@@ -440,7 +529,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
                     chat_title=chat_title,
                     messages=msgs,
                     answer_language=owner_language,
-                    ai_model=sub.ai_model,
+                    ai_model=subscription_model.slug,
                     return_usage=True,
                 )
                 metrics["phase"] = "post_llm"
@@ -569,7 +658,7 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
                 chat_title=getattr(entity, "title", None) or getattr(entity, "username", None) or "Chat",
                 messages=msgs,
                 ux_language=owner_language,
-                ai_model=sub.ai_model,
+                ai_model=subscription_model.slug,
                 return_usage=True,
             )
             metrics["phase"] = "post_llm"
