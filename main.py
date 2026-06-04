@@ -318,20 +318,25 @@ async def get_account_plan_usage(
 async def get_account_usage_history(
     limit: int = 50,
     offset: int = 0,
+    include_subscriptions: bool = False,
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     История запросов пользователя для страницы «Мои запросы» в профиле.
 
-    Возвращает список UsageEvent (Q&A + подписки), отсортированных
+    Возвращает список UsageEvent (Q&A + опц. подписки), отсортированных
     от свежих к старым. Для каждой записи отдаём минимальный набор полей,
     нужных UI: дата, tokens_charged, модель, tier, категория, тип события,
     chat_ref (без полного текста запроса — приватность).
 
     Параметры:
-      limit  — макс. 100 записей за один вызов (defaults 50)
-      offset — пагинация
+      limit                  — макс. 100 записей за один вызов (default 50)
+      offset                 — пагинация
+      include_subscriptions  — включать ли срабатывания подписок (default False,
+                               чтобы не засорять основной список — у активных
+                               пользователей подписочные тики могут идти раз в
+                               15 минут и быстро забивают историю)
 
     Подгружается фронтом ТОЛЬКО при переходе на вкладку (не на каждый
     запрос плана). См. UX-обсуждение в архитектурном документе.
@@ -340,14 +345,14 @@ async def get_account_usage_history(
     limit = max(1, min(int(limit or 50), 100))
     offset = max(0, int(offset or 0))
 
+    event_types = ["qa_request_success", "qa_request_failure"]
+    if include_subscriptions:
+        event_types.append("subscription_run_success")
+
     stmt = (
         select(UsageEvent)
         .where(UsageEvent.user_id == user.id)
-        .where(UsageEvent.event_type.in_([
-            "qa_request_success",
-            "qa_request_failure",
-            "subscription_run_success",
-        ]))
+        .where(UsageEvent.event_type.in_(event_types))
         .order_by(UsageEvent.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -387,11 +392,7 @@ async def get_account_usage_history(
         select(sa.func.count())
         .select_from(UsageEvent)
         .where(UsageEvent.user_id == user.id)
-        .where(UsageEvent.event_type.in_([
-            "qa_request_success",
-            "qa_request_failure",
-            "subscription_run_success",
-        ]))
+        .where(UsageEvent.event_type.in_(event_types))
     )
     total = int((await db.execute(total_stmt)).scalar_one() or 0)
 
@@ -400,7 +401,125 @@ async def get_account_usage_history(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "include_subscriptions": include_subscriptions,
     }
+
+
+# ---------------------------------------------------------------------------
+# Top-up (докупка токенов) — STUB endpoint
+# ---------------------------------------------------------------------------
+#
+# Заглушка для интеграции с платёжной системой (Stripe / другой).
+# Сейчас возвращает 501 Not Implemented с описанием доступных пакетов.
+# Когда подключим платёжку — заменим реализацию на полную:
+#   1. Создать Stripe checkout session по выбранному пакету
+#   2. Вернуть URL для редиректа
+#   3. Stripe webhook на success → billing.apply_topup(...)
+#
+# Цены и количество токенов в пакетах — из architecture-router-and-credits.md
+# раздел 2.3 (Small $5/1600, Medium $15/5500, Large $40/16000).
+# ---------------------------------------------------------------------------
+
+TOPUP_PACKAGES = {
+    "small":  {"label": "Small",  "price_usd": 5.0,  "tokens": 1600,  "price_per_token_usd": 0.003125},
+    "medium": {"label": "Medium", "price_usd": 15.0, "tokens": 5500,  "price_per_token_usd": 0.002727},
+    "large":  {"label": "Large",  "price_usd": 40.0, "tokens": 16000, "price_per_token_usd": 0.002500},
+}
+
+
+@app.get("/account/tokens/topup-packages")
+async def get_topup_packages(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Список доступных пакетов докупки токенов.
+
+    Используется фронтом для построения страницы / модалки «Докупить».
+    Также проверяет, разрешена ли докупка для тарифа пользователя
+    (plan.topup_enabled) — на free возвращает 403.
+    """
+    from plan_limits import get_user_plan
+    plan = await get_user_plan(db, user)
+    if not bool(plan.topup_enabled):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TOPUP_NOT_AVAILABLE",
+                "message": (
+                    "Докупка токенов недоступна на вашем тарифе. "
+                    "Перейдите на платный тариф для доступа."
+                ),
+                "plan_code": plan.code,
+            },
+        )
+
+    return {
+        "packages": [
+            {"id": pkg_id, **info}
+            for pkg_id, info in TOPUP_PACKAGES.items()
+        ],
+    }
+
+
+@app.post("/account/tokens/topup")
+async def initiate_topup(
+    payload: dict,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    STUB: инициировать докупку выбранного пакета токенов.
+
+    Финальная реализация:
+      1. Validate package
+      2. Создать Stripe checkout session
+      3. Вернуть {checkout_url: "..."}
+
+    Сейчас (MVP без платёжки): возвращает 501 с понятным сообщением,
+    что функционал в разработке. Фронт показывает «Скоро будет доступно».
+
+    Когда подключим платёжку — заменим тело на реальную реализацию.
+    Структура endpoint'а и payload'а останется той же:
+      POST /account/tokens/topup
+        body: { "package": "small" | "medium" | "large" }
+    """
+    from plan_limits import get_user_plan
+
+    package_id = str(payload.get("package") or "").strip().lower()
+    if package_id not in TOPUP_PACKAGES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_PACKAGE",
+                "message": "Неизвестный пакет докупки.",
+                "available_packages": list(TOPUP_PACKAGES.keys()),
+            },
+        )
+
+    plan = await get_user_plan(db, user)
+    if not bool(plan.topup_enabled):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TOPUP_NOT_AVAILABLE",
+                "message": "Докупка токенов недоступна на вашем тарифе.",
+            },
+        )
+
+    # 501 Not Implemented — платёжная система ещё не подключена
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "code": "PAYMENT_PROVIDER_NOT_CONFIGURED",
+            "message": (
+                "Функционал докупки токенов находится в разработке. "
+                "Скоро будет доступно."
+            ),
+            "requested_package": package_id,
+            "package_info": TOPUP_PACKAGES[package_id],
+        },
+    )
 
 @app.post("/account/change-plan")
 async def change_account_plan(
