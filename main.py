@@ -112,6 +112,7 @@ from llm import (
     LlmUsage,
     TOKENS_SOURCE_EMPTY,
 )
+from media_filter import integration as mf_integration
 
 class ChangePlanRequest(BaseModel):
     target_plan: Literal["free", "basic", "pro", "power"]
@@ -1534,6 +1535,25 @@ async def tg_analyze_chat(
             },
         )
 
+    # -------- MEDIA FILTER branch (Этап 8) --------
+    # Если пользователь включил «Медиафильтр» в UI — идём отдельным
+    # пайплайном (Telethon messages.search + LLM-парсер/реранкер) и
+    # выходим раньше, не дёргая обычный fetch_chat_messages + run_qa.
+    media_filter_req = mf_integration.request_from_payload(payload)
+    if media_filter_req is not None:
+        return await _handle_media_filter_branch(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_links=[chat_link],
+            is_group=False,
+            period_seconds=period_seconds,
+            days=days,
+            depth=depth,
+            user_query=user_query,
+            request=media_filter_req,
+        )
+
     query_chars = len(user_query)
     total_t0 = time.perf_counter()
 
@@ -1817,6 +1837,25 @@ async def _record_qa_success_event(
         meta["thinking_tokens"] = qa_result.llm.usage.thinking_tokens
         meta["tokens_source"] = qa_result.llm.usage.tokens_source
         meta["raw_finish_reason"] = qa_result.llm.finish_reason
+        # Оценка стоимости запроса в USD (для колонки цены и админ-аналитики).
+        # Токенная система (tokens_charged) — это наша внутренняя валюта;
+        # estimated_cost_usd — фактическая стоимость LLM-вызова у провайдера.
+        try:
+            cost = await estimate_llm_cost_usd(
+                db,
+                ai_model=qa_result.llm.used_model.slug,
+                input_tokens=qa_result.llm.usage.input_tokens,
+                output_tokens=qa_result.llm.usage.output_tokens,
+                tokens_source=qa_result.llm.usage.tokens_source,
+                thinking_tokens=qa_result.llm.usage.thinking_tokens,
+            )
+            meta["estimated_cost_usd"] = cost.estimated_cost_usd
+            meta["cost_calculation_method"] = cost.cost_calculation_method
+            meta["input_price_per_1m_usd_snapshot"] = cost.input_price_per_1m_usd_snapshot
+            meta["output_price_per_1m_usd_snapshot"] = cost.output_price_per_1m_usd_snapshot
+        except Exception as e:  # noqa: BLE001
+            # Стоимость не критична для ответа — не валим запись события.
+            log.warning("estimate_llm_cost_usd failed: %s", e)
         # routing info
         if qa_result.decision is not None:
             meta.update(routing_meta(qa_result.llm, qa_result.decision))
@@ -1882,6 +1921,152 @@ async def _record_qa_failure_event(
 def _drop_none(d: dict) -> dict:
     """Убрать ключи с None-значениями (чтобы не раздувать meta_json)."""
     return {k: v for k, v in d.items() if v is not None}
+
+
+async def _handle_media_filter_branch(
+    db: AsyncSession,
+    *,
+    user: User,
+    source_mode: str,
+    chat_links: list[str],
+    is_group: bool,
+    period_seconds: Optional[int],
+    days: int,
+    depth: str,
+    user_query: str,
+    request,
+) -> dict:
+    """
+    Полная обработка одного запроса с включённым медиафильтром.
+
+    Не идёт через стандартный run_qa() — вместо этого вызывает
+    integration.run_and_build_response(), который сам тянет медиа
+    из Telegram, прогоняет через LLM-парсер/реранкер и форматирует
+    карточки.
+
+    Биллинг и UsageEvent оформляются ЗДЕСЬ (а не в integration), чтобы
+    логика учёта токенов осталась рядом с обычным Q&A. Используем тот
+    же reason=REASON_QA_REQUEST — фронт уже умеет показывать списания
+    в этой колонке.
+    """
+    total_t0 = time.perf_counter()
+
+    chat_ref = chat_links[0] if not is_group else f"group:{len(chat_links)}"
+    query_chars = len(user_query or "")
+
+    try:
+        result = await mf_integration.run_and_build_response(
+            db, user.id,
+            chat_links=chat_links,
+            is_group=is_group,
+            request=request,
+            period_seconds=period_seconds,
+            days=days,
+            user_query=user_query,
+        )
+    except Exception as e:
+        # Любой сбой пайплайна логируем и возвращаем 502.
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode=source_mode, chat_ref=chat_ref,
+            error_code="MEDIA_FILTER_ERROR",
+            error_message=(str(e) or "")[:300] or None,
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms,
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="MEDIA_FILTER_ERROR")
+
+    total_ms = int((time.perf_counter() - total_t0) * 1000)
+
+    # --- UsageEvent для media filter ---
+    # Используем event_type="qa_request_success", чтобы попасть в те же
+    # ленты аналитики. В meta_json кладём флаг и разбивку по моделям.
+    used_models = result.billing.used_models
+    primary_model_slug = used_models[0] if used_models else None
+
+    meta: dict = {
+        "depth": depth,
+        "requested_days": days,
+        "query_chars": query_chars,
+        "messages_fetched_count": sum(c.fetched_count for c in result.run.chats),
+        "tokens_charged": result.tokens_charged,
+        "duration_ms_total": total_ms,
+        "is_media_filter": True,
+        "media_filter_per_model": result.billing.per_model,
+        "input_tokens": result.billing.raw_input_tokens,
+        "output_tokens": result.billing.raw_output_tokens,
+        "thinking_tokens": result.billing.raw_thinking_tokens,
+        "parser_fallback": result.run.used_parser_fallback,
+        "reranker_fallback": result.run.used_reranker_fallback,
+        "selected_categories": [c.value for c in result.run.selected_categories],
+        "per_chat_after_filter": [
+            {
+                "chat_link": c.chat_link,
+                "fetched": c.fetched_count,
+                "after_structured": c.after_structured_count,
+                "after_semantic": c.after_semantic_count,
+                "error_code": c.error_code,
+            }
+            for c in result.run.chats
+        ],
+    }
+    if primary_model_slug:
+        meta["ai_model"] = primary_model_slug
+
+    event = UsageEvent(
+        user_id=user.id,
+        event_type="qa_request_success",
+        status="success_counted",
+        source_mode=source_mode,
+        chat_ref=chat_ref,
+        meta_json=_drop_none(meta),
+    )
+    db.add(event)
+    await db.flush()
+    usage_event_id = int(event.id)
+
+    # --- billing.debit (одна транзакция на запрос; токены суммированы
+    #     по всем LLM-вызовам через compute_billing) ---
+    if result.tokens_charged > 0:
+        await billing.debit(
+            db,
+            user_id=user.id,
+            amount=result.tokens_charged,
+            reason=billing.REASON_QA_REQUEST,
+            related_event_id=usage_event_id,
+            meta={
+                "is_media_filter": True,
+                "used_models": used_models,
+                "per_model_tokens": result.billing.per_model,
+                "input_tokens": result.billing.raw_input_tokens,
+                "output_tokens": result.billing.raw_output_tokens,
+                "thinking_tokens": result.billing.raw_thinking_tokens,
+                "tokens_charged": result.tokens_charged,
+            },
+        )
+
+    # --- UserQueryLog (как и обычный Q&A) ---
+    db.add(UserQueryLog(
+        user_id=user.id,
+        usage_event_id=usage_event_id,
+        query_text=user_query or "",
+        detected_category=None,
+        detected_confidence=None,
+        final_category="media_filter",
+        selected_tier=depth,
+        selected_model=primary_model_slug or "n/a",
+    ))
+
+    await db.commit()
+
+    # --- Финальный ответ ---
+    response = dict(result.response_dict)
+    response["status"] = "ok"
+    response["source_mode"] = source_mode
+    response["usage"] = await build_usage_snapshot(db, user=user)
+    return response
 
 
 def _build_qa_response(
@@ -2021,6 +2206,23 @@ async def tg_analyze_chats_group(
                 "monthly_granted": balance.monthly_granted,
                 "topup_balance": balance.topup_balance,
             },
+        )
+
+    # -------- MEDIA FILTER branch (Этап 8) --------
+    # См. /tg/analyze_chat выше — та же логика, но с is_group=True.
+    media_filter_req = mf_integration.request_from_payload(payload)
+    if media_filter_req is not None:
+        return await _handle_media_filter_branch(
+            db,
+            user=user,
+            source_mode="personal",
+            chat_links=chat_links,
+            is_group=True,
+            period_seconds=period_seconds,
+            days=days,
+            depth=depth,
+            user_query=user_query,
+            request=media_filter_req,
         )
 
     query_chars = len(user_query)
