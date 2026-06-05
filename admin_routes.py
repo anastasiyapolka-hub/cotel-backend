@@ -857,7 +857,8 @@ def _serialize_usage_event(ev: UsageEvent) -> dict[str, Any]:
         "subscription_id": int(ev.subscription_id) if ev.subscription_id is not None else None,
         "chat_ref_display": _mask_chat_ref_for_source(ev.chat_ref, ev.source_mode),
         "ai_model": m.get("ai_model"),
-        "days": m.get("days"),
+        # Новый Q&A-пайплайн пишет requested_days; старый писал days.
+        "days": m.get("days") if m.get("days") is not None else m.get("requested_days"),
         "frequency_minutes": m.get("frequency_minutes"),
         "messages_fetched_count": m.get("messages_fetched_count"),
         "messages_sent_to_llm_count": m.get("messages_sent_to_llm_count"),
