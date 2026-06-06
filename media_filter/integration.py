@@ -234,17 +234,46 @@ async def run_and_build_response(
 
     answer = format_run(run)
 
-    # Ответ endpoint'а. Поля, которые нужны фронту:
-    #   media_filter — основной payload рендера карточек.
-    #   tokens_charged — для chat-tail отображения.
-    # usage_snapshot заполнит main.py из своего helper'а.
+    # Поля для существующего appendChargeBreakdown(payload) на фронте:
+    # фронт собирает расшифровку из тех ключей, что уже есть в Q&A-ответе
+    # (used_model, tier, category, was_fallback). Добавляем их, чтобы
+    # пользователь видел такую же «Расшифровка ▾» секцию, как в Q&A.
+    primary_model_slug: Optional[str] = breakdown.used_models[0] if breakdown.used_models else None
+    parser_model_slug: Optional[str] = (
+        run.parser_llm.used_model.slug if run.parser_llm is not None else None
+    )
+    reranker_model_slugs = [r.used_model.slug for r in run.reranker_llms]
+    was_fallback = bool(run.used_parser_fallback or run.used_reranker_fallback)
+
     response_dict: dict = {
         "media_filter": answer.model_dump(mode="json"),
         "tokens_charged": breakdown.total_tokens,
-        # Удобные побочные метрики (фронт может игнорировать):
+        # Поля для appendChargeBreakdown — синтетические значения,
+        # помеченные как media_filter, чтобы фронт мог отличить их
+        # от обычного Q&A и нарисовать дополнительные строки.
+        "used_model": primary_model_slug,
+        "tier": "light",
+        "category": "media_filter",
+        "was_fallback": was_fallback,
+        # Расширенные данные именно для media-filter-блока расшифровки.
         "media_filter_meta": {
             "used_models": breakdown.used_models,
             "per_model_tokens": breakdown.per_model,
+            "parser_model": parser_model_slug,
+            "parser_input_tokens": (
+                (run.parser_llm.usage.input_tokens or 0) if run.parser_llm else 0
+            ),
+            "parser_output_tokens": (
+                (run.parser_llm.usage.output_tokens or 0) if run.parser_llm else 0
+            ),
+            "reranker_models": reranker_model_slugs,
+            "reranker_calls": len(run.reranker_llms),
+            "reranker_input_tokens": sum(
+                (r.usage.input_tokens or 0) for r in run.reranker_llms
+            ),
+            "reranker_output_tokens": sum(
+                (r.usage.output_tokens or 0) for r in run.reranker_llms
+            ),
             "parser_fallback": run.used_parser_fallback,
             "reranker_fallback": run.used_reranker_fallback,
             "effective_window": {
