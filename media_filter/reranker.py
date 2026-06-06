@@ -151,13 +151,36 @@ def _extract_json_payload(raw_text: str) -> str:
 
 def _candidate_caption(msg: MediaMessage) -> str:
     """
-    Текст для оценки релевантности. У URL-сообщений — text, у остальных — caption.
-    Обрезаем по _MAX_CAPTION_CHARS.
+    Текст для оценки релевантности — всё, что может нести смысл,
+    собирается в один блок. Идея: пользователь спросил «о еде»;
+    смысл может прятаться в подписи, в имени файла (для документа),
+    в названии трека (для аудио), в тексте ссылки. Не теряем ничего.
+
+    Что собираем по типам:
+      • Все: caption (подпись под медиа) если есть.
+      • URL: text (текст самого сообщения со ссылкой).
+      • Документ/Видео/Аудио: file_name если есть — это часто
+        полноценный носитель смысла («report-ужин-2026.pdf»).
+      • Аудио: performer и title (метаданные трека).
+
+    Все источники джойнятся через "; ", пустые пропускаются.
+    Обрезаем итог по _MAX_CAPTION_CHARS, чтобы не раздуть промпт.
     """
-    src = msg.text if msg.text else msg.caption
-    if not src:
+    parts: list[str] = []
+    if msg.caption:
+        parts.append(msg.caption.strip())
+    if msg.text and msg.text.strip() and msg.text.strip() not in parts:
+        parts.append(msg.text.strip())
+    if msg.file_name and msg.file_name.strip():
+        parts.append(msg.file_name.strip())
+    if msg.title and msg.title.strip():
+        parts.append(msg.title.strip())
+    if msg.performer and msg.performer.strip():
+        parts.append(msg.performer.strip())
+
+    if not parts:
         return ""
-    src = src.strip()
+    src = "; ".join(parts).strip()
     if len(src) > _MAX_CAPTION_CHARS:
         return src[: _MAX_CAPTION_CHARS - 1] + "…"
     return src

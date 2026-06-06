@@ -241,19 +241,26 @@ async def _record_subscription_run_success_same_session(
     # Считаем стоимость одного вызова в наших токенах. Минимум 1 токен.
     # На is_empty / failed_to_call_llm (нет llm_usage) сюда не попадаем —
     # _process_one_subscription делает early return перед вызовом этой функции.
-    rates = await get_token_rates(db, ai_model)
-    if rates is None or not llm_usage.input_tokens and not llm_usage.output_tokens:
-        # Нет прайса для модели или пустой usage (трейс/сетевая ошибка
-        # вернула пустой ответ) — списываем минимум.
-        tokens_charged = 1
+    # Media-filter ветка уже посчитала точные tokens_charged по разбивке
+    # моделей (парсер на одной, реранкер на другой) — уважаем её число
+    # и не пересчитываем по тарифам одной модели, что было бы неточно.
+    precomputed = metrics.get("mf_tokens_charged_precomputed")
+    if precomputed is not None:
+        tokens_charged = int(precomputed)
     else:
-        tokens_charged = billing.compute_tokens_for_llm_call(
-            input_tokens=llm_usage.input_tokens or 0,
-            output_tokens=llm_usage.output_tokens or 0,
-            thinking_tokens=llm_usage.thinking_tokens or 0,
-            in_per_1k=rates.in_per_1k,
-            out_per_1k=rates.out_per_1k,
-        )
+        rates = await get_token_rates(db, ai_model)
+        if rates is None or not llm_usage.input_tokens and not llm_usage.output_tokens:
+            # Нет прайса для модели или пустой usage (трейс/сетевая ошибка
+            # вернула пустой ответ) — списываем минимум.
+            tokens_charged = 1
+        else:
+            tokens_charged = billing.compute_tokens_for_llm_call(
+                input_tokens=llm_usage.input_tokens or 0,
+                output_tokens=llm_usage.output_tokens or 0,
+                thinking_tokens=llm_usage.thinking_tokens or 0,
+                in_per_1k=rates.in_per_1k,
+                out_per_1k=rates.out_per_1k,
+            )
 
     metrics["tokens_charged"] = tokens_charged
     metrics["duration_ms_total"] = _ms_since(metrics["run_t0"])
@@ -906,7 +913,12 @@ async def _run_media_filter_events_branch(
         survivors = reranker_outcome.survivors
     metrics["messages_after_semantic"] = len(survivors)
 
-    # 8) Биллинг: токены парсера + реранкеров
+    # 8) Биллинг: токены парсера + реранкеров.
+    # Складываем usage всех LLM-вызовов (парсер + N батчей реранкера),
+    # вычисляем стоимость по тарифам каждой модели и сохраняем сумму
+    # в metrics. Списание (billing.debit) делает дальше один общий вызов
+    # _record_subscription_run_success_same_session — там же создаётся
+    # UsageEvent. ВАЖНО: тут НИЧЕГО не списываем — иначе будет double-debit.
     llm_results = []
     if parser_outcome.llm_result is not None:
         llm_results.append(parser_outcome.llm_result)
@@ -943,6 +955,29 @@ async def _run_media_filter_events_branch(
                 in_per_1k=rates.in_per_1k,
                 out_per_1k=rates.out_per_1k,
             )
+
+    # Формируем LlmUsage из суммы и кладём в metrics. Так общая
+    # запись UsageEvent (в _record_subscription_run_success_same_session)
+    # увидит реальный usage, а не пустой → cost_calculation_method
+    # перестанет быть "no_llm_call". `ai_model` — primary (parser),
+    # его тарифы будут использованы для оценочной стоимости в USD;
+    # списание в наших токенах уже точное (мы посчитали выше по моделям).
+    if llm_results:
+        primary_slug = llm_results[0].used_model.slug
+        primary_source = llm_results[0].usage.tokens_source
+        metrics["ai_model"] = primary_slug
+        metrics["llm_usage"] = LlmUsage(
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            total_tokens=total_input_tokens + total_output_tokens,
+            tokens_source=primary_source,
+            thinking_tokens=total_thinking_tokens,
+        )
+        # Префикс mf_ — чтобы _build_run_success_meta при необходимости
+        # клал детали разбивки по моделям рядом, не перетирая ai_model.
+        metrics["mf_used_models"] = used_models
+        metrics["mf_tokens_charged_precomputed"] = tokens_charged_total
+        metrics["is_media_filter"] = True
 
     # 9) MatchEvent на каждое выжившее сообщение
     matches_written = 0
@@ -985,32 +1020,10 @@ async def _run_media_filter_events_branch(
             newest_id = int(m.message_id)
 
     metrics["matches_written"] = matches_written
-    metrics["llm_used_models"] = used_models
-    metrics["llm_input_tokens"] = total_input_tokens
-    metrics["llm_output_tokens"] = total_output_tokens
-    metrics["llm_thinking_tokens"] = total_thinking_tokens
-    metrics["tokens_charged"] = tokens_charged_total
 
-    # 10) Биллинг debit одной транзакцией
-    if tokens_charged_total > 0:
-        await billing.debit(
-            db,
-            user_id=owner_user_id,
-            amount=tokens_charged_total,
-            reason=billing.REASON_SUBSCRIPTION_EVENT,
-            related_event_id=None,  # subscription_run_success запишется ниже
-            meta={
-                "is_media_filter": True,
-                "used_models": used_models,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "thinking_tokens": total_thinking_tokens,
-                "tokens_charged": tokens_charged_total,
-                "subscription_id": sub.id,
-            },
-        )
-
-    # 11) Финал: курсор + расписание + UsageEvent
+    # 9) Финал: курсор + расписание. UsageEvent + billing.debit делает
+    # одним общим вызовом _record_subscription_run_success_same_session,
+    # читая llm_usage/ai_model/mf_tokens_charged_precomputed из metrics.
     st.last_message_id = int(newest_id) if newest_id else st.last_message_id
     st.last_success_at = now_utc
     st.last_checked_at = now_utc

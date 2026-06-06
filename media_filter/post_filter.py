@@ -18,7 +18,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .types import MediaMessage, StructuredFilters, TimeWindowOverride
+from .types import MediaItemKind, MediaMessage, StructuredFilters, TimeWindowOverride
+
+
+# Типы, у которых в принципе нет имени файла — Telegram не выдаёт
+# file_name для фото, голосовых, кружков и URL-сообщений. Если у такого
+# сообщения нет file_name, применять к нему `file_name_contains` —
+# гарантированный False, что отсекает ВСЕ кандидаты по типу. Поэтому для
+# таких kind'ов фильтр по имени файла игнорируется. То же про mime_type
+# для URL-сообщений (которые не несут файл).
+_KINDS_WITHOUT_FILENAME = {
+    MediaItemKind.PHOTO,
+    MediaItemKind.VOICE,
+    MediaItemKind.VIDEO_ROUND,
+    MediaItemKind.URL,
+}
+_KINDS_WITHOUT_MIME = {MediaItemKind.URL}
 
 
 log = logging.getLogger(__name__)
@@ -166,10 +181,16 @@ def message_passes_structured(
         return False
 
     # --- MIME / file_name ---
-    if not _match_substring(msg.mime_type, filters.mime_type_contains):
-        return False
-    if not _match_substring(msg.file_name, filters.file_name_contains):
-        return False
+    # Подстрочные фильтры на технические поля файла. Если у kind'а в
+    # принципе нет этого поля (фото без file_name, URL-сообщение без
+    # mime), фильтр игнорируется — иначе LLM-парсер мог бы случайно
+    # положить смысловое слово в эти поля и обнулить всю выборку.
+    if filters.mime_type_contains and msg.kind not in _KINDS_WITHOUT_MIME:
+        if not _match_substring(msg.mime_type, filters.mime_type_contains):
+            return False
+    if filters.file_name_contains and msg.kind not in _KINDS_WITHOUT_FILENAME:
+        if not _match_substring(msg.file_name, filters.file_name_contains):
+            return False
 
     return True
 
