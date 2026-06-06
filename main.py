@@ -319,7 +319,7 @@ async def get_account_plan_usage(
 async def get_account_usage_history(
     limit: int = 50,
     offset: int = 0,
-    include_subscriptions: bool = False,
+    mode: str = "chats",
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -332,12 +332,14 @@ async def get_account_usage_history(
     chat_ref (без полного текста запроса — приватность).
 
     Параметры:
-      limit                  — макс. 100 записей за один вызов (default 50)
-      offset                 — пагинация
-      include_subscriptions  — включать ли срабатывания подписок (default False,
-                               чтобы не засорять основной список — у активных
-                               пользователей подписочные тики могут идти раз в
-                               15 минут и быстро забивают историю)
+      limit   — макс. 100 записей за один вызов (default 50)
+      offset  — пагинация
+      mode    — режим списка (default "chats"):
+                  "chats"         — только запросы к чатам (Q&A: успех + ошибки)
+                  "subscriptions" — только срабатывания подписок
+                История работает в двух взаимоисключающих режимах, чтобы
+                длинный список было проще читать: подписочные тики могут идти
+                раз в 15 минут и иначе забивают ленту запросов к чатам.
 
     Подгружается фронтом ТОЛЬКО при переходе на вкладку (не на каждый
     запрос плана). См. UX-обсуждение в архитектурном документе.
@@ -346,9 +348,12 @@ async def get_account_usage_history(
     limit = max(1, min(int(limit or 50), 100))
     offset = max(0, int(offset or 0))
 
-    event_types = ["qa_request_success", "qa_request_failure"]
-    if include_subscriptions:
-        event_types.append("subscription_run_success")
+    mode = (mode or "chats").lower()
+    if mode == "subscriptions":
+        event_types = ["subscription_run_success"]
+    else:
+        mode = "chats"
+        event_types = ["qa_request_success", "qa_request_failure"]
 
     stmt = (
         select(UsageEvent)
@@ -402,7 +407,7 @@ async def get_account_usage_history(
         "total": total,
         "limit": limit,
         "offset": offset,
-        "include_subscriptions": include_subscriptions,
+        "mode": mode,
     }
 
 
