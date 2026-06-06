@@ -227,6 +227,39 @@ async def _load_match_events_with_subscriptions(db, event_ids: list[int]):
     return list((await db.execute(q)).all())
 
 
+# Маппинг kind → ключ в bot_i18n. Совпадает с MediaItemKind.value
+# (см. backend/media_filter/types.py). Если runner положит неизвестный
+# kind — вернём None, и блок отрисуется как обычно (без маркера).
+_MEDIA_KIND_I18N_KEYS = {
+    "video_file":  "media_kind_video_file",
+    "video_round": "media_kind_video_round",
+    "photo":       "media_kind_photo",
+    "audio_file":  "media_kind_audio_file",
+    "voice":       "media_kind_voice",
+    "document":    "media_kind_document",
+    "url":         "media_kind_url",
+}
+
+
+def _media_kind_marker(ev: "MatchEvent", language: str) -> str:
+    """
+    Если match_event пришёл из media-filter ветки подписки, runner
+    кладёт в `llm_payload` словарь с ключом 'kind'. Возвращаем
+    локализованный маркер (например, '🎥 Видеофайл'). Для текстовых
+    events (нет llm_payload или нет kind) возвращаем пустую строку.
+    """
+    payload = getattr(ev, "llm_payload", None)
+    if not isinstance(payload, dict):
+        return ""
+    kind = payload.get("kind")
+    if not isinstance(kind, str):
+        return ""
+    i18n_key = _MEDIA_KIND_I18N_KEYS.get(kind)
+    if not i18n_key:
+        return ""
+    return bot_t(i18n_key, language)
+
+
 def _format_match_events_message(
     sub: Subscription,
     events: list[MatchEvent],
@@ -263,6 +296,11 @@ def _format_match_events_message(
         if len(excerpt) > 300:
             excerpt = excerpt[:300].rstrip() + "…"
 
+        # Маркер типа медиа для events с media_filter — берётся из
+        # ev.llm_payload['kind'], который runner кладёт в subscriptions_runner.
+        # Если поля нет (классическая текстовая events-подписка) — None.
+        media_marker = _media_kind_marker(ev, language)
+
         url = build_tg_message_link(
             chat_ref=getattr(sub, "chat_ref", None),
             chat_id=getattr(sub, "chat_id", None),
@@ -270,7 +308,15 @@ def _format_match_events_message(
         )
         link_text = f"\n{url}" if url else ""
 
-        block = f"\n{idx}) {author} • {ts}\n{excerpt or '—'}{link_text}"
+        # Сборка тела сообщения. Если есть маркер — он идёт первой
+        # строкой; если есть и подпись — после маркера через перевод
+        # строки. Если подписи нет — маркер заменяет прочерк.
+        if media_marker:
+            body = f"{media_marker}\n{excerpt}" if excerpt else media_marker
+        else:
+            body = excerpt or "—"
+
+        block = f"\n{idx}) {author} • {ts}\n{body}{link_text}"
 
         # ограничение на подробную часть (оставляем запас под секцию ссылок)
         if used + len(block) <= DETAIL_TEXT_LIMIT:

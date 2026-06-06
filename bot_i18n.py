@@ -24,6 +24,16 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "digest_title": "Summary for your subscription: {name}",
         "digest_period": "Period: {period}",
         "digest_period_empty": "Period: —",
+        # Маркеры типа медиа для events-подписок с media_filter.
+        # Используются в начале блока сообщения, чтобы было видно тип
+        # «вслепую» (без перехода по ссылке).
+        "media_kind_video_file":  "🎥 Video",
+        "media_kind_video_round": "⚪ Video note",
+        "media_kind_photo":       "📷 Photo",
+        "media_kind_audio_file":  "🎵 Audio",
+        "media_kind_voice":       "🎙 Voice",
+        "media_kind_document":    "📎 Document",
+        "media_kind_url":         "🔗 Link",
         "months": [
             "January", "February", "March", "April", "May", "June",
             "July", "August", "September", "October", "November", "December",
@@ -41,6 +51,13 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "digest_title": "Резюме по подписке: {name}",
         "digest_period": "Период: {period}",
         "digest_period_empty": "Период: —",
+        "media_kind_video_file":  "🎥 Видеофайл",
+        "media_kind_video_round": "⚪ Видеокружок",
+        "media_kind_photo":       "📷 Фото",
+        "media_kind_audio_file":  "🎵 Аудиофайл",
+        "media_kind_voice":       "🎙 Голосовое",
+        "media_kind_document":    "📎 Документ",
+        "media_kind_url":         "🔗 Ссылка",
         "months": [
             "января", "февраля", "марта", "апреля", "мая", "июня",
             "июля", "августа", "сентября", "октября", "ноября", "декабря",
