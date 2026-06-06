@@ -165,13 +165,39 @@ def _format_chat_block(chat: MediaChatRun) -> MediaChatBlock:
 # ---------------------------------------------------------------------------
 
 
+_ERROR_LABELS_RU = {
+    "PRIVATE": "Чат приватный, нет доступа.",
+    "ADMIN_REQUIRED": "Для доступа к этому чату требуются права администратора.",
+    "NOT_FOUND": "Чат не найден.",
+    "FLOOD_WAIT": "Telegram временно ограничил запросы. Попробуйте через минуту.",
+    "RESOLVE_FAILED": "Не удалось определить чат.",
+    "NOT_AUTHORIZED": "Telegram не подключен.",
+    "FETCH_FAILED": "Ошибка загрузки сообщений из Telegram.",
+}
+
+
 def _build_headline(run: MediaFilterRun, total: int) -> str:
     """
     Короткий заголовок над списком карточек. Журналисту полезно увидеть
     общее число и понять, ходила ли LLM-фильтрация. Без эмоций и
     рекомендаций — нейтрально.
+
+    Если все чаты упали (в одиночном это один чат) — пишем причину,
+    а не голое «ничего не найдено».
     """
     if total == 0:
+        # Все чаты с ошибкой → даём пользователю реальную причину.
+        all_errored = bool(run.chats) and all(c.error_code for c in run.chats)
+        if all_errored:
+            codes = [c.error_code for c in run.chats if c.error_code]
+            # Если одна ошибка одного типа — берём её русский ярлык.
+            unique = list(dict.fromkeys(codes))
+            if len(unique) == 1:
+                code = unique[0]
+                msg = _ERROR_LABELS_RU.get(code, f"Ошибка: {code}.")
+                return msg
+            # Разные ошибки в разных чатах (group) → нейтральная сводка.
+            return "Не удалось получить данные из чатов: " + ", ".join(unique) + "."
         return "За указанный период по выбранным фильтрам ничего не найдено."
 
     base = f"Найдено медиа-сообщений: {total}."

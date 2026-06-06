@@ -343,6 +343,50 @@ def _build_forward_info(msg: Message) -> Optional[ForwardInfo]:
     )
 
 
+async def _resolve_chat_entity(client, chat_link: str):
+    """
+    Резолвинг entity по строке chat_link.
+
+    Поддерживает три формата (как в `fetch_chat_messages`):
+      • числовой ID из get_dialogs (`"1900836903"`) — ищем в кеше диалогов,
+        потом фоллбэк на `get_entity(int)`. Это нужно, потому что
+        `resolve_entity_with_invite` интерпретирует строку как username
+        и валится на чистых числах с `UsernameInvalidError`.
+      • t.me/+HASH, joinchat/HASH, t.me/<username>, @<username> — отдаём
+        в общий `resolve_entity_with_invite`.
+
+    Бросает то же, что и `client.get_entity`/`resolve_entity_with_invite`:
+    `UsernameInvalidError`, `UsernameNotOccupiedError`, `ChannelPrivateError`,
+    `ChatAdminRequiredError` и прочие Telethon-исключения. Вызывающий код
+    (fetch_chat_media) их перехватывает и маппит на error_code.
+    """
+    link = (chat_link or "").strip()
+    if not link:
+        raise ValueError("CHAT_LINK_REQUIRED")
+
+    # Числовая строка — chat_id из get_dialogs(). Telethon хранит
+    # положительные id даже для каналов/супергрупп (без -100 префикса),
+    # поэтому ищем по dialogs cache по точному совпадению.
+    if link.isdigit():
+        target_id = int(link)
+        try:
+            dialogs = await client.get_dialogs(limit=500)
+            for d in dialogs:
+                ent = d.entity
+                if getattr(ent, "id", None) == target_id:
+                    return ent
+        except Exception:
+            # Если перебор диалогов упал — попробуем прямой get_entity ниже.
+            pass
+        # Фоллбэк: get_entity(int). Telethon сам разберётся, для
+        # супергрупп/каналов может потребоваться -100 префикс — этот
+        # путь Telethon берёт через ResolvePhoneRequest/-ChannelRequest.
+        return await client.get_entity(target_id)
+
+    # Не число — отдаём общему резолверу (он умеет invite-ссылки и юзернеймы).
+    return await resolve_entity_with_invite(client, link)
+
+
 async def _sender_label(msg: Message) -> tuple[Optional[int], Optional[str], Optional[str]]:
     """
     Возвращает (sender_id, sender_username, sender_display_name).
@@ -599,9 +643,10 @@ async def fetch_chat_media(
         result.error_code = "NOT_AUTHORIZED"
         return result
 
-    # 2) Резолв entity
+    # 2) Резолв entity (через свой _resolve_chat_entity, чтобы
+    # обработать числовые chat_id из dialogs cache).
     try:
-        entity = await resolve_entity_with_invite(client, chat_link)
+        entity = await _resolve_chat_entity(client, chat_link)
     except (tg_errors.ChannelPrivateError,):
         result.error_code = "PRIVATE"
         return result
