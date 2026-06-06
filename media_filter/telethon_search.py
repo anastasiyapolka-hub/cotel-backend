@@ -497,6 +497,7 @@ async def _fetch_one_filter(
     kind: MediaItemKind,
     min_date: datetime,
     max_date: Optional[datetime],
+    min_id: Optional[int] = None,
 ) -> list[MediaMessage]:
     """
     Один проход iter_messages с одним фильтром. Возвращает список
@@ -507,16 +508,22 @@ async def _fetch_one_filter(
       • Когда max_date >= msg.date >= min_date — собираем.
       • Как только msg.date < min_date — break.
 
+    min_id (опц.) — курсор для подписок: брать только сообщения с id > min_id.
+    Telethon принимает min_id напрямую в iter_messages и фильтрует на стороне
+    Telegram. Когда min_id задан, проверка msg.date < min_date уже излишняя
+    (Telegram сам обрежет), но мы её оставляем как защиту от мусора.
+
     FloodWait ретраим до FLOOD_WAIT_RETRIES раз, если задержка
     <= FLOOD_WAIT_MAX_SLEEP_SEC. Дольше — RuntimeError("FLOOD_WAIT").
     """
     attempts = 0
+    iter_kwargs: dict = {"filter": filter_cls(), "limit": ITER_LIMIT}
+    if min_id is not None and min_id > 0:
+        iter_kwargs["min_id"] = int(min_id)
     while True:
         try:
             collected: list[MediaMessage] = []
-            async for msg in client.iter_messages(
-                entity, filter=filter_cls(), limit=ITER_LIMIT,
-            ):
+            async for msg in client.iter_messages(entity, **iter_kwargs):
                 if not isinstance(msg, Message):
                     continue
                 msg_dt = getattr(msg, "date", None)
@@ -569,6 +576,7 @@ async def fetch_chat_media(
     request: MediaFilterRequest,
     min_date: datetime,
     max_date: Optional[datetime] = None,
+    min_id: Optional[int] = None,
 ) -> ChatFetchResult:
     """
     Собрать все MediaMessage из одного чата по request за окно.
@@ -630,6 +638,7 @@ async def fetch_chat_media(
             client, entity,
             filter_cls=filter_cls, kind=kind,
             min_date=min_date, max_date=max_date,
+            min_id=min_id,
         )
         for filter_cls, kind in plan
     ]

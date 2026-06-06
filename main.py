@@ -2891,6 +2891,48 @@ async def get_subscription(
         raise HTTPException(status_code=403, detail="FORBIDDEN")
     return sub
 
+def _normalize_subscription_media_filter(
+    *,
+    subscription_type: str,
+    media_filter_raw: Optional[dict],
+    prompt: str,
+) -> Optional[dict]:
+    """
+    Привести payload.media_filter к финальному виду для записи в БД.
+
+    Правила:
+      • subscription_type='digest' → media_filter обнуляется
+        (фильтр не предусмотрен для саммари).
+      • если media_filter присутствует, но enabled=false или невалиден —
+        обнуляем.
+      • если медиафильтр не задан И prompt пуст → 422 (что-то одно
+        должно быть, иначе подписке нечего отслеживать).
+
+    Возвращает None или валидный dict для сохранения.
+    """
+    if subscription_type != "events":
+        return None
+
+    parsed = mf_integration.request_from_payload({"media_filter": media_filter_raw})
+    if parsed is None:
+        # Медиафильтра нет → классический режим. Текст обязателен.
+        if not (prompt or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "SUBSCRIPTION_EMPTY",
+                    "message": (
+                        "Заполните текст запроса или включите медиафильтр — "
+                        "подписке нужно что-то отслеживать."
+                    ),
+                },
+            )
+        return None
+
+    # Сохраняем в БД канонический model_dump, чтобы избежать гнили мусорных полей.
+    return parsed.model_dump(mode="json")
+
+
 @app.put("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
 async def update_subscription(
     subscription_id: int,
@@ -2929,13 +2971,21 @@ async def update_subscription(
         fallback_ai_model=getattr(user, "default_ai_model", None),
     )
 
+    sub_type = payload.subscription_type or "events"
+    media_filter_clean = _normalize_subscription_media_filter(
+        subscription_type=sub_type,
+        media_filter_raw=payload.media_filter,
+        prompt=payload.prompt,
+    )
+
     sub.name = payload.name
     sub.source_mode = payload.source_mode
-    sub.subscription_type = payload.subscription_type or "events"
+    sub.subscription_type = sub_type
     sub.chat_ref = normalized_chat_ref
     sub.chat_id = chat_id
     sub.frequency_minutes = payload.frequency_minutes
     sub.prompt = payload.prompt
+    sub.media_filter = media_filter_clean
     sub.ai_model = ai_model
     sub.is_active = payload.is_active
     sub.status = "active" if payload.is_active else "paused"
@@ -3055,15 +3105,23 @@ async def create_subscription(
         fallback_ai_model=getattr(user, "default_ai_model", None),
     )
 
+    sub_type = payload.subscription_type or "events"
+    media_filter_clean = _normalize_subscription_media_filter(
+        subscription_type=sub_type,
+        media_filter_raw=payload.media_filter,
+        prompt=payload.prompt,
+    )
+
     sub = Subscription(
         owner_user_id=user.id,
         name=payload.name,
         source_mode=payload.source_mode,
-        subscription_type=payload.subscription_type or "events",
+        subscription_type=sub_type,
         chat_ref=normalized_chat_ref,
         chat_id=chat_id,
         frequency_minutes=payload.frequency_minutes,
         prompt=payload.prompt,
+        media_filter=media_filter_clean,
         is_active=payload.is_active,
         status="active" if payload.is_active else "paused",
         last_error=None,

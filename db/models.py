@@ -36,6 +36,13 @@ class Subscription(Base):
     prompt = Column(Text, nullable=False)
     ai_model = Column(String(64), nullable=False, server_default="openai:gpt-4.1-mini")
 
+    # Медиафильтр (опционально, только для events-подписок).
+    # JSON-структура совпадает с backend/media_filter/types.py
+    # MediaFilterRequest: { enabled, categories, video_subtype, audio_subtype }.
+    # NULL = подписка работает в классическом текстовом режиме (через prompt).
+    # Для digest-подписок поле всегда NULL.
+    media_filter = Column(JSONB, nullable=True)
+
     # Главное поле для расчёта "активных подписок"
     is_active = Column(Boolean, nullable=False, default=True)
 

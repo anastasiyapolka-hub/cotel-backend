@@ -28,6 +28,11 @@ from plan_limits import utc_now
 import billing
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 from service_account_service import fetch_service_chat_messages_for_subscription
+from media_filter.types import MediaFilterRequest
+from media_filter.telethon_search import fetch_chat_media
+from media_filter.llm_parser import parse_user_query
+from media_filter.post_filter import apply_structured_filters, compute_effective_window
+from media_filter.reranker import rerank_messages
 
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
@@ -580,7 +585,32 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             return
 
         # =====================================================================
-        # EVENTS
+        # EVENTS — медиа-фильтр (новая ветка)
+        # =====================================================================
+        # Если подписка хранит media_filter — идём отдельным пайплайном:
+        #   • тянем через messages.search ТОЛЬКО выбранные типы медиа
+        #     (а не весь текст, как обычная events-подписка);
+        #   • опционально парсим sub.prompt через LLM (как user_query в Q&A);
+        #   • применяем структурный пост-фильтр;
+        #   • при наличии semantic_query — реранкер;
+        #   • каждое выжившее сообщение → MatchEvent.
+        sub_media_filter = getattr(sub, "media_filter", None)
+        if isinstance(sub_media_filter, dict) and sub_media_filter.get("enabled", True):
+            await _run_media_filter_events_branch(
+                db=db,
+                sub=sub,
+                st=st,
+                metrics=metrics,
+                now_utc=now_utc,
+                freq_min=freq_min,
+                last_message_id=last_message_id,
+                owner_user_id=owner_user_id,
+                sub_media_filter=sub_media_filter,
+            )
+            return
+
+        # =====================================================================
+        # EVENTS — классическая текстовая ветка
         # =====================================================================
         if last_message_id:
             since_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -754,6 +784,239 @@ def _approx_context_chars(msgs: list[dict]) -> int:
             + 4
         )
     return total
+
+
+async def _run_media_filter_events_branch(
+    *,
+    db,
+    sub,
+    st,
+    metrics: dict,
+    now_utc: datetime,
+    freq_min: int,
+    last_message_id: Optional[int],
+    owner_user_id: int,
+    sub_media_filter: dict,
+):
+    """
+    Медиа-ветка для events-подписок. Тянет ТОЛЬКО выбранные типы медиа
+    через messages.search, опционально применяет LLM-парсер/реранкер
+    по sub.prompt, и каждое выжившее сообщение пишет как MatchEvent.
+
+    Биллинг суммирует токены парсера + реранкеров и списывает одним
+    debit (как в Q&A-ветке).
+    """
+    # 1) Распарсить media_filter
+    try:
+        request = MediaFilterRequest.model_validate(sub_media_filter)
+    except Exception as e:
+        # Невалидный media_filter в БД — парковать подписку.
+        sub.status = "error"
+        sub.last_error = f"BAD_MEDIA_FILTER: {type(e).__name__}"
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        metrics["phase"] = "bad_media_filter"
+        return
+
+    # 2) Окно времени: при первом запуске = now − freq_min,
+    #    при последующих — будем полагаться на min_id курсор,
+    #    но min_date оставляем равным 1970 (Telegram min_id режет всё).
+    if last_message_id:
+        min_date_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        cursor_min_id: Optional[int] = int(last_message_id)
+    else:
+        min_date_dt = now_utc - timedelta(minutes=freq_min)
+        cursor_min_id = None
+
+    # 3) LLM-парсер sub.prompt (если есть)
+    prompt = (sub.prompt or "").strip()
+    metrics["phase"] = "media_filter_parsing"
+    parser_outcome = await parse_user_query(
+        user_query=prompt,
+        ui_window_from=min_date_dt,
+        ui_window_to=None,
+        selected_categories=[c.value for c in request.effective_categories()],
+        now=now_utc,
+    )
+    parsed = parser_outcome.parsed
+
+    # 4) Эффективное окно с учётом time_window_override
+    effective_window = compute_effective_window(
+        ui_window_from=min_date_dt,
+        ui_window_to=None,
+        override=parsed.structured_filters.time_window_override,
+    )
+
+    # 5) Telethon search
+    metrics["phase"] = "media_filter_fetching"
+    fetch_t0 = time.perf_counter()
+    try:
+        fetched = await fetch_chat_media(
+            db, owner_user_id, sub.chat_ref,
+            request=request,
+            min_date=effective_window.min_date,
+            max_date=effective_window.max_date,
+            min_id=cursor_min_id,
+        )
+    finally:
+        metrics["fetch_duration_ms"] = _ms_since(fetch_t0)
+    metrics["phase"] = "media_filter_fetched"
+
+    if fetched.error_code:
+        # Любая ошибка fetch — парковка с retry.
+        sub.status = "error"
+        sub.last_error = f"MEDIA_FETCH_FAILED: {fetched.error_code}"
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        metrics["phase"] = "media_fetch_failed"
+        return
+
+    if getattr(sub, "chat_id", None) is None:
+        ent_id = getattr(fetched.entity, "id", None)
+        if ent_id is not None:
+            sub.chat_id = int(ent_id)
+
+    raw_messages = fetched.messages
+    metrics["messages_fetched_count"] = len(raw_messages)
+
+    if not raw_messages:
+        # Нет новых медиа — обновляем счётчики, без LLM, без UsageEvent.
+        st.last_success_at = now_utc
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=freq_min)
+        return
+
+    # 6) Структурный пост-фильтр
+    after_structured = apply_structured_filters(raw_messages, parsed.structured_filters)
+    metrics["messages_after_structured"] = len(after_structured)
+
+    # 7) Семантический реранкер (опц.)
+    survivors = after_structured
+    reranker_outcome = None
+    if (
+        parsed.needs_semantic_rerank
+        and parsed.semantic_query
+        and after_structured
+    ):
+        metrics["phase"] = "media_filter_rerank"
+        reranker_outcome = await rerank_messages(
+            messages=after_structured,
+            semantic_query=parsed.semantic_query,
+        )
+        survivors = reranker_outcome.survivors
+    metrics["messages_after_semantic"] = len(survivors)
+
+    # 8) Биллинг: токены парсера + реранкеров
+    llm_results = []
+    if parser_outcome.llm_result is not None:
+        llm_results.append(parser_outcome.llm_result)
+    if reranker_outcome is not None:
+        llm_results.extend(reranker_outcome.llm_results)
+
+    used_models: list[str] = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_thinking_tokens = 0
+    tokens_charged_total = 0
+    for r in llm_results:
+        if r is None:
+            continue
+        slug = r.used_model.slug
+        used_models.append(slug)
+        in_tok = r.usage.input_tokens or 0
+        out_tok = r.usage.output_tokens or 0
+        think_tok = r.usage.thinking_tokens or 0
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        total_thinking_tokens += think_tok
+        rates = await get_token_rates(db, slug)
+        if rates is None:
+            print(
+                f"[subscriptions_runner] media_filter.no_pricing_row model={slug}"
+            )
+            tokens_charged_total += 1
+        else:
+            tokens_charged_total += billing.compute_tokens_for_llm_call(
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                thinking_tokens=think_tok,
+                in_per_1k=rates.in_per_1k,
+                out_per_1k=rates.out_per_1k,
+            )
+
+    # 9) MatchEvent на каждое выжившее сообщение
+    matches_written = 0
+    newest_id = last_message_id
+    for m in survivors:
+        excerpt_src = (m.caption or m.text or "").strip()
+        if len(excerpt_src) > 300:
+            excerpt_src = excerpt_src[:300].rstrip() + "…"
+        kind_label = m.kind.value
+        # reason формируем самостоятельно — фронт/бот сможет показать тип медиа.
+        reason = f"media:{kind_label}"
+        if m.file_size:
+            reason += f"|size={m.file_size}"
+        if m.duration_sec:
+            reason += f"|dur={m.duration_sec}s"
+        db.add(
+            MatchEvent(
+                subscription_id=sub.id,
+                message_id=int(m.message_id),
+                message_ts=m.date,
+                author_id=m.sender_id,
+                author_display=m.sender_username or m.sender_display_name,
+                excerpt=excerpt_src,
+                reason=reason,
+                notify_status="queued",
+                llm_payload={
+                    "kind": kind_label,
+                    "permalink": m.permalink,
+                    "file_size": m.file_size,
+                    "duration_sec": m.duration_sec,
+                    "mime_type": m.mime_type,
+                    "file_name": m.file_name,
+                    "forwarded": bool(m.forward_info),
+                    "ttl_period_sec": m.ttl_period_sec,
+                },
+            )
+        )
+        matches_written += 1
+        if m.message_id and (newest_id is None or m.message_id > newest_id):
+            newest_id = int(m.message_id)
+
+    metrics["matches_written"] = matches_written
+    metrics["llm_used_models"] = used_models
+    metrics["llm_input_tokens"] = total_input_tokens
+    metrics["llm_output_tokens"] = total_output_tokens
+    metrics["llm_thinking_tokens"] = total_thinking_tokens
+    metrics["tokens_charged"] = tokens_charged_total
+
+    # 10) Биллинг debit одной транзакцией
+    if tokens_charged_total > 0:
+        await billing.debit(
+            db,
+            user_id=owner_user_id,
+            amount=tokens_charged_total,
+            reason=billing.REASON_SUBSCRIPTION_EVENT,
+            related_event_id=None,  # subscription_run_success запишется ниже
+            meta={
+                "is_media_filter": True,
+                "used_models": used_models,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "thinking_tokens": total_thinking_tokens,
+                "tokens_charged": tokens_charged_total,
+                "subscription_id": sub.id,
+            },
+        )
+
+    # 11) Финал: курсор + расписание + UsageEvent
+    st.last_message_id = int(newest_id) if newest_id else st.last_message_id
+    st.last_success_at = now_utc
+    st.last_checked_at = now_utc
+    st.next_run_at = now_utc + timedelta(minutes=freq_min)
+
+    await _record_subscription_run_success_same_session(db, metrics)
 
 
 # ---------------------------------------------------------------------------
