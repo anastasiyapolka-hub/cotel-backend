@@ -1006,10 +1006,17 @@ async def qr_login_recreate(db: AsyncSession, owner_user_id: int):
     return {"url": _qr_login.url, "expires": expires.isoformat() if expires else None}
 
 async def disconnect_tg_client():
-    global tg_client
-    if tg_client is not None:
-        try:
-            await tg_client.disconnect()
-        except Exception:
-            pass
-        tg_client = None
+    """Отключает все runtime-клиенты Telegram и очищает кэш tg_clients.
+
+    Вызывается в конце тика subscriptions_runner, чтобы освободить
+    соединения. Раньше функция обращалась к одиночной глобальной
+    tg_client, которой больше нет (перешли на пер-юзер словарь
+    tg_clients) — отсюда NameError 'tg_client' is not defined.
+    """
+    for owner_user_id, client in list(tg_clients.items()):
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        tg_clients.pop(owner_user_id, None)

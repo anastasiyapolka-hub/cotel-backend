@@ -2641,17 +2641,28 @@ async def tg_qr_status(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"TG_QR_STATUS_FAILED: {str(e)}")
 
-async def bot_send_message(chat_id: int, text: str):
+async def bot_send_message(chat_id: int, text: str, parse_mode: Optional[str] = None):
+    """
+    Отправить сообщение через нашего Telegram-бота.
+
+    parse_mode="HTML" — включаем разметку (<a href>, <b>, <i>, и т.д.).
+    None (по умолчанию) — обычный текст, обратная совместимость с
+    существующими вызовами (auth-flow, ручные пинги, и т.д.).
+    """
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN_MISSING")
 
+    body: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json={
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        })
+        resp = await client.post(url, json=body)
 
     if resp.status_code != 200:
         raise RuntimeError(f"BOT_SEND_FAILED_HTTP_{resp.status_code}: {resp.text}")

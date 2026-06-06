@@ -260,6 +260,18 @@ def _media_kind_marker(ev: "MatchEvent", language: str) -> str:
     return bot_t(i18n_key, language)
 
 
+def _esc(s: str) -> str:
+    """
+    Минимальный HTML-escape для текстовых полей match-сообщений.
+    Telegram parse_mode='HTML' допускает только &lt;, &gt;, &amp; и
+    разрешённый набор тегов (b, i, u, s, code, pre, a). Любой неэкранированный
+    `<`, `>`, `&` в тексте может сломать парсинг — экранируем.
+    """
+    if not s:
+        return ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _format_match_events_message(
     sub: Subscription,
     events: list[MatchEvent],
@@ -274,11 +286,17 @@ def _format_match_events_message(
     «дальше не влезло…») определяется параметром `language`. Excerpt
     и ссылки — raw.
     """
+    # Все сообщения от форматтера матчей идут с parse_mode='HTML'
+    # (см. вызывающий код, где stand at `bot_send_message(..., parse_mode='HTML')`).
+    # Это даёт нам кликабельные ссылки внутри маркеров типа медиа
+    # («📷 Фото» сразу ведёт на сообщение в Telegram). Все поля,
+    # пришедшие извне (author_display, excerpt) — экранируются через _esc.
+
     sid = int(sub.id)
     name = sub.name or f"#{sid}"
     header = (
-        bot_t("match_header", language, name=name) + "\n"
-        + bot_t("match_count", language, count=len(events)) + "\n"
+        _esc(bot_t("match_header", language, name=name)) + "\n"
+        + _esc(bot_t("match_count", language, count=len(events))) + "\n"
     )
 
     text_parts: list[str] = [header]
@@ -289,12 +307,14 @@ def _format_match_events_message(
 
     # 1) Сначала пытаемся набить подробную часть
     for idx, ev in enumerate(events, start=1):
-        author = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
-        ts = ev.message_ts.isoformat() if ev.message_ts else "—"
+        author_raw = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
+        author = _esc(author_raw)
+        ts = _esc(ev.message_ts.isoformat() if ev.message_ts else "—")
 
-        excerpt = (ev.excerpt or "").strip()
-        if len(excerpt) > 300:
-            excerpt = excerpt[:300].rstrip() + "…"
+        excerpt_raw = (ev.excerpt or "").strip()
+        if len(excerpt_raw) > 300:
+            excerpt_raw = excerpt_raw[:300].rstrip() + "…"
+        excerpt = _esc(excerpt_raw)
 
         # Маркер типа медиа для events с media_filter — берётся из
         # ev.llm_payload['kind'], который runner кладёт в subscriptions_runner.
@@ -306,15 +326,28 @@ def _format_match_events_message(
             chat_id=getattr(sub, "chat_id", None),
             message_id=int(ev.message_id),
         )
-        link_text = f"\n{url}" if url else ""
 
-        # Сборка тела сообщения. Если есть маркер — он идёт первой
-        # строкой; если есть и подпись — после маркера через перевод
-        # строки. Если подписи нет — маркер заменяет прочерк.
+        # Сборка тела:
+        # • media-матч + URL → маркер становится КЛИКАБЕЛЬНОЙ ссылкой,
+        #   подпись (если есть) под ним, отдельная строка URL не нужна
+        #   (даблирование смутит).
+        # • media-матч без URL (приватный чат без permalink) → маркер
+        #   плейн-текст, ниже подпись.
+        # • текстовый матч (нет маркера) — оставляем старую раскладку:
+        #   excerpt, под ним отдельной строкой URL (как анкор).
         if media_marker:
-            body = f"{media_marker}\n{excerpt}" if excerpt else media_marker
+            esc_marker = _esc(media_marker)
+            if url:
+                # `parse_mode='HTML'` поддерживает <a href> — это и даёт
+                # «фото = ссылка», как просил пользователь.
+                marker_line = f'<a href="{_esc(url)}">{esc_marker}</a>'
+            else:
+                marker_line = esc_marker
+            body = f"{marker_line}\n{excerpt}" if excerpt else marker_line
+            link_text = ""   # URL уже зашит в маркер
         else:
             body = excerpt or "—"
+            link_text = f'\n<a href="{_esc(url)}">{_esc(url)}</a>' if url else ""
 
         block = f"\n{idx}) {author} • {ts}\n{body}{link_text}"
 
@@ -328,7 +361,7 @@ def _format_match_events_message(
 
     # 2) Если осталось что-то — добавляем секцию ссылок
     if remaining_indexes:
-        tail_header = bot_t("remaining_links_header", language)
+        tail_header = _esc(bot_t("remaining_links_header", language))
         if used + len(tail_header) < TG_MSG_HARD_LIMIT:
             text_parts.append(tail_header)
             used += len(tail_header)
@@ -340,15 +373,17 @@ def _format_match_events_message(
                 chat_id=getattr(sub, "chat_id", None),
                 message_id=int(ev.message_id),
             )
-            # если ссылку построить нельзя — хотя бы покажем message_id
-            line = f"\n{idx}) {url}" if url else f"\n{idx}) message_id={int(ev.message_id)}"
+            if url:
+                line = f'\n{idx}) <a href="{_esc(url)}">{_esc(url)}</a>'
+            else:
+                line = f'\n{idx}) message_id={int(ev.message_id)}'
 
             if used + len(line) <= TG_MSG_HARD_LIMIT:
                 text_parts.append(line)
                 used += len(line)
             else:
                 # если даже ссылки уже не влезают — честно сообщаем
-                ell = bot_t("tg_limit_truncated", language)
+                ell = _esc(bot_t("tg_limit_truncated", language))
                 if used + len(ell) <= TG_MSG_HARD_LIMIT:
                     text_parts.append(ell)
                 break
@@ -541,7 +576,11 @@ async def run_tick() -> int:
                         raise RuntimeError(f"NO_BOT_USER_LINK owner_user_id={owner_user_id}")
 
                     text = _format_match_events_message(sub, events, language=language)
-                    await bot_send_message(chat_id=int(dest_chat_id), text=text)
+                    # parse_mode='HTML' — нужен, чтобы клик по «📷 Фото»
+                    # / «🎥 Видеофайл» в маркере вёл прямо в Telegram-сообщение.
+                    await bot_send_message(
+                        chat_id=int(dest_chat_id), text=text, parse_mode="HTML",
+                    )
 
                     await _mark_match_events(db, [int(e.id) for e in events], STATUS_SENT)
                     elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
