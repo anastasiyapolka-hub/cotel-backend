@@ -669,7 +669,10 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
                     llm_payload={"confidence": confidence} if confidence is not None else None,
                     notify_status="queued",
                 )
-                .on_conflict_do_nothing(constraint="uq_digest_subscription_endmsg")
+                # constraint= не указываем: миграция group_subscriptions
+                # заменила UNIQUE-constraint на функциональный UNIQUE INDEX.
+                # Пустой ON CONFLICT DO NOTHING ловит любой unique-конфликт.
+                .on_conflict_do_nothing()
             )
             r = await db.execute(stmt)
             metrics["digest_events_written"] = 1 if getattr(r, "rowcount", 0) == 1 else 0
@@ -1576,7 +1579,9 @@ async def _process_group_subscription(
                                 "ttl_period_sec": m.ttl_period_sec,
                             },
                         )
-                        .on_conflict_do_nothing(constraint="uq_match_sub_chat_msg")
+                        # constraint= не указываем: уникальность задана функциональным
+                        # индексом (COALESCE(chat_id,0)), а это не constraint в смысле PG.
+                        .on_conflict_do_nothing()
                     )
                     rmw = await db.execute(me_stmt)
                     if getattr(rmw, "rowcount", 0) == 1:
@@ -1776,7 +1781,9 @@ async def _process_group_subscription(
                         llm_payload={"confidence": confidence} if confidence is not None else None,
                         notify_status="queued",
                     )
-                    .on_conflict_do_nothing(index_elements=None, constraint="uq_digest_sub_chat_endmsg")
+                    # constraint= не указываем: уникальность задана функциональным
+                    # индексом (COALESCE(chat_id,0)), а это не constraint в смысле PG.
+                    .on_conflict_do_nothing()
                 )
                 r = await db.execute(stmt)
                 written = 1 if getattr(r, "rowcount", 0) == 1 else 0
@@ -1834,7 +1841,9 @@ async def _process_group_subscription(
                             notify_status="queued",
                             llm_payload=None,
                         )
-                        .on_conflict_do_nothing(constraint="uq_match_sub_chat_msg")
+                        # constraint= не указываем: уникальность задана функциональным
+                        # индексом (COALESCE(chat_id,0)), а это не constraint в смысле PG.
+                        .on_conflict_do_nothing()
                     )
                     r = await db.execute(me_stmt)
                     if getattr(r, "rowcount", 0) == 1:

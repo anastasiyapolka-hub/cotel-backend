@@ -952,13 +952,21 @@ async def _replace_subscription_chats(
     )
 
     for position, c in enumerate(resolved_chats):
+        # Truncate VARCHAR-полей перед INSERT: Telegram-чаты с эмодзи
+        # легко превышают 255/128 символов.
+        ct = c.get("chat_title")
+        cu = c.get("chat_username")
+        if ct is not None and len(ct) > 255:
+            ct = ct[:255]
+        if cu is not None and len(cu) > 128:
+            cu = cu[:128]
         db.add(SubscriptionChat(
             subscription_id=subscription_id,
             position=position,
             chat_ref=c["chat_ref"],
             chat_id=c.get("chat_id"),
-            chat_title=c.get("chat_title"),
-            chat_username=c.get("chat_username"),
+            chat_title=ct,
+            chat_username=cu,
         ))
 
     # Создаём state-записи для новых чатов
@@ -1373,7 +1381,12 @@ async def run_subscriptions(
                                     llm_payload={},  # ты убрала payload — оставляем так
                                     notify_status="queued",
                                 )
-                                .on_conflict_do_nothing(constraint="uq_match_subscription_message")
+                                # constraint= не указываем: миграция group_subscriptions
+                                # заменила старый UNIQUE-constraint на функциональный
+                                # UNIQUE INDEX (uq_match_sub_chat_msg с COALESCE),
+                                # который не является constraint в смысле PG. Пустой
+                                # ON CONFLICT DO NOTHING ловит любой unique-конфликт.
+                                .on_conflict_do_nothing()
                             )
 
                             try:
