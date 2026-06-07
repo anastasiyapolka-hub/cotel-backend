@@ -507,6 +507,32 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
             sub.status = "ok"
 
         # =====================================================================
+        # Защита: «пустая» подписка (нет prompt и нет media-filter) — НЕ
+        # дёргаем LLM, не списываем токены. Применимо и для одиночной,
+        # и для групповой (групповая ещё раз перепроверит per-chat, но
+        # быстрый short-circuit здесь экономит работу).
+        # =====================================================================
+        _mf = getattr(sub, "media_filter", None)
+        _has_active_mf = (
+            isinstance(_mf, dict)
+            and _mf.get("enabled", True)
+            and sub_type == "events"
+        )
+        if not (sub.prompt or "").strip() and not _has_active_mf:
+            print(
+                f"[subscriptions_runner] SKIP sub_id={sub.id} "
+                f"reason=EMPTY_SUBSCRIPTION_NO_PROMPT_NO_MEDIA_FILTER"
+            )
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+            sub.status = "error"
+            sub.last_error = "EMPTY_SUBSCRIPTION_NO_PROMPT_NO_MEDIA_FILTER"
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=freq_min)
+            return
+
+        # =====================================================================
         # ГРУППОВАЯ ПОДПИСКА — отдельная ветка
         # =====================================================================
         if bool(getattr(sub, "is_group", False)):
@@ -1134,6 +1160,25 @@ async def _process_group_subscription(
         and media_filter_dict.get("enabled", True)
         and sub_type == "events"
     )
+
+    # === Защита от «пустой» подписки ===
+    # Если в подписке нет ни текстового запроса, ни активного media-filter —
+    # дёргать LLM нечего и не за чем (classify с пустым prompt всё равно
+    # вернёт нулевые matches, digest напишет пустоту). Просто продвигаем
+    # next_run_at и выходим. Без этой защиты пустая подписка жжёт токены
+    # на каждом тике (для группы — N токенов за раз).
+    prompt_is_empty = not (sub.prompt or "").strip()
+    if prompt_is_empty and not is_media_group:
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
+        sub.status = "error"
+        sub.last_error = "EMPTY_SUBSCRIPTION_NO_PROMPT_NO_MEDIA_FILTER"
+        st.last_checked_at = now_utc
+        # На обычный freq_min — пользователь увидит ошибку и поправит подписку.
+        st.next_run_at = now_utc + timedelta(minutes=freq_min)
+        metrics["phase"] = "empty_subscription_skipped"
+        return
 
     # Group subscriptions работают только в personal-mode (на бэке мы
     # это валидируем при создании, но runner защищается от старых данных).
