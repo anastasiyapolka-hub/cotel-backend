@@ -5,10 +5,32 @@ from datetime import datetime
 SourceMode = Literal["personal", "service"]
 SubscriptionType = Literal["events", "digest"]
 
+
+class SubscriptionChatItem(BaseModel):
+    """Один чат внутри групповой подписки. Используется и на вход
+    (валидация при create/update — там приходит как минимум chat_ref),
+    и на выход (там заполнены все поля, какие смогли резолвить)."""
+    chat_ref: str = Field(min_length=1)
+    chat_id: Optional[int] = None
+    chat_title: Optional[str] = None
+    chat_username: Optional[str] = None
+    position: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
 class SubscriptionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     source_mode: SourceMode
-    chat_ref: str = Field(min_length=1)
+
+    # Для одиночной подписки: chat_ref — обязательное поле, chats не задано.
+    # Для групповой (is_group=True): chats — список из 1..N чатов; chat_ref
+    # игнорируется (бэкенд сам подставит синтетический "group:<sub_id>").
+    chat_ref: Optional[str] = Field(default=None, min_length=1)
+    is_group: bool = False
+    chats: Optional[list[str]] = None  # список chat_ref-ов в порядке, в котором юзер их выбрал на фронте
+
     frequency_minutes: int = Field(ge=5, le=7 * 24 * 60)
     # Текст запроса. Для медиа-подписки (media_filter != None) опционален;
     # min_length=1 убран, чтобы можно было создать «чистый» медиа-фильтр
@@ -47,6 +69,12 @@ class SubscriptionOut(BaseModel):
     subscription_type: Optional[str] = None
 
     media_filter: Optional[dict[str, Any]] = None
+
+    # Групповая подписка: is_group=True + chats содержит список чатов
+    # (в том же порядке, в каком юзер выбрал на фронте). Для одиночной
+    # подписки is_group=False и chats=None (фронт прячет блок выбора чатов).
+    is_group: bool = False
+    chats: Optional[list[SubscriptionChatItem]] = None
 
     is_trial: bool = False
     trial_started_at: Optional[datetime] = None

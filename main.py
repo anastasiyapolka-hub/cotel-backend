@@ -41,6 +41,8 @@ import billing
 from db.models import (
     User,
     Subscription,
+    SubscriptionChat,
+    SubscriptionChatState,
     SubscriptionState,
     DigestEvent,
     MatchEvent,
@@ -767,6 +769,264 @@ async def reset_subscription_state(
     st.last_success_at = None
     st.next_run_at = None
 
+
+# ---------------------------------------------------------------------------
+# Подготовка списка чатов для ГРУППОВОЙ подписки.
+#
+# Валидируем каждый чат (через тот же fetch_chat_messages_for_subscription,
+# что и одиночная подписка), собираем resolved-метаданные. Если хотя бы
+# один чат невалиден — поднимаем 400 с массивом invalid_chats; подписку
+# НЕ сохраняем (партиальная подписка с битыми чатами никому не нужна).
+#
+# Доступно только для personal source_mode — для service групповые
+# подписки запрещены (на фронте галочка спрятана; здесь на всякий случай
+# отбиваем 400). Здесь же отбиваем free-плана (на фронте тоже спрятано).
+# ---------------------------------------------------------------------------
+async def prepare_subscription_group_targets(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    user: User,
+    source_mode: str,
+    chat_refs: list[str],
+) -> list[dict]:
+    """
+    Возвращает список dict со ключами:
+      chat_ref (нормализованный для сохранения),
+      chat_id, chat_title, chat_username.
+    Порядок сохраняется ровно как пришёл (фронт даёт порядок выбора юзером).
+    """
+    mode = (source_mode or "personal").strip().lower()
+    if mode != "personal":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_SUBSCRIPTION_REQUIRES_PERSONAL",
+                "message": "Групповые подписки доступны только для личного Telegram-аккаунта.",
+            },
+        )
+
+    plan_code = str(getattr(user, "plan", "") or "").strip().lower()
+    if plan_code == "free":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "GROUP_SUBSCRIPTION_NOT_ALLOWED_FOR_FREE",
+                "message": "Групповые подписки недоступны на тарифе Free.",
+            },
+        )
+
+    # Нормализуем + дедупим, сохраняя порядок (Q&A group делает так же).
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in chat_refs or []:
+        s = str(raw or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+
+    if not cleaned:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_EMPTY",
+                "message": "Не выбрано ни одного чата для групповой подписки.",
+            },
+        )
+
+    group_limit = resolve_group_chats_limit(plan_code)
+    if len(cleaned) > group_limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_CHATS_LIMIT_EXCEEDED",
+                "message": (
+                    f"Ваш тариф разрешает не более {group_limit} чатов "
+                    f"в одной групповой подписке."
+                ),
+                "group_chats_limit": group_limit,
+                "requested": len(cleaned),
+            },
+        )
+
+    # Валидируем чаты ПОСЛЕДОВАТЕЛЬНО: в personal-mode у юзера одна
+    # StringSession, параллельный fetch к 20 чатам провоцирует FLOOD_WAIT.
+    # Это операция разовая (при создании/редактировании), скорость не критична.
+    resolved: list[dict] = []
+    invalid: list[dict] = []
+
+    for chat_ref in cleaned:
+        try:
+            entity, _ = await fetch_chat_messages_for_subscription(
+                db=db,
+                owner_user_id=owner_user_id,
+                chat_link=chat_ref,
+                since_dt=datetime.now(timezone.utc) - timedelta(days=1),
+                min_id=None,
+                limit=1,
+            )
+        except ValueError as ve:
+            invalid.append({"chat_ref": chat_ref, "error": str(ve)})
+            continue
+        except Exception as e:
+            invalid.append({"chat_ref": chat_ref, "error": f"CHAT_VALIDATE_FAILED: {str(e)}"})
+            continue
+
+        chat_title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Без названия"
+        )
+        resolved.append({
+            "chat_ref": chat_ref,
+            "chat_id": int(getattr(entity, "id", None)) if getattr(entity, "id", None) is not None else None,
+            "chat_title": chat_title,
+            "chat_username": getattr(entity, "username", None),
+        })
+
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_INVALID_CHATS",
+                "message": (
+                    f"Не удалось добавить {len(invalid)} из {len(cleaned)} чатов. "
+                    f"Удалите проблемные чаты из списка."
+                ),
+                "invalid_chats": invalid,
+            },
+        )
+
+    return resolved
+
+
+def _normalize_group_marker(sub_id: int) -> str:
+    """Синтетический chat_ref для групповой подписки — пишем в Subscription.chat_ref.
+    Реальный список чатов хранится в subscription_chats."""
+    return f"group:{int(sub_id)}"
+
+
+async def _replace_subscription_chats(
+    db: AsyncSession,
+    *,
+    subscription_id: int,
+    resolved_chats: list[dict],
+    reset_state_for_new_chats_only: bool,
+) -> None:
+    """
+    Полностью переписывает subscription_chats для подписки.
+    Для subscription_chat_state:
+      - если reset_state_for_new_chats_only=True (UPDATE):
+        состояние для оставшихся чатов сохраняем (курсор НЕ сбрасываем),
+        для удалённых — удаляем, для новых — создаём пустое.
+      - если False (CREATE): просто создаём пустые state-записи.
+    """
+    new_keys = {c["chat_ref"] for c in resolved_chats}
+
+    if reset_state_for_new_chats_only:
+        # Получаем текущее состояние
+        existing_states_res = await db.execute(
+            select(SubscriptionChatState.chat_key).where(
+                SubscriptionChatState.subscription_id == subscription_id
+            )
+        )
+        existing_keys = {row[0] for row in existing_states_res.all()}
+
+        # Удалим state для исчезнувших чатов
+        to_remove = existing_keys - new_keys
+        if to_remove:
+            await db.execute(
+                delete(SubscriptionChatState).where(
+                    SubscriptionChatState.subscription_id == subscription_id,
+                    SubscriptionChatState.chat_key.in_(to_remove),
+                )
+            )
+        keys_to_create = new_keys - existing_keys
+    else:
+        keys_to_create = new_keys
+
+    # Полностью пересоздаём subscription_chats (порядок чатов мог поменяться)
+    await db.execute(
+        delete(SubscriptionChat).where(SubscriptionChat.subscription_id == subscription_id)
+    )
+
+    for position, c in enumerate(resolved_chats):
+        db.add(SubscriptionChat(
+            subscription_id=subscription_id,
+            position=position,
+            chat_ref=c["chat_ref"],
+            chat_id=c.get("chat_id"),
+            chat_title=c.get("chat_title"),
+            chat_username=c.get("chat_username"),
+        ))
+
+    # Создаём state-записи для новых чатов
+    for c in resolved_chats:
+        if c["chat_ref"] in keys_to_create:
+            db.add(SubscriptionChatState(
+                subscription_id=subscription_id,
+                chat_key=c["chat_ref"],
+                last_message_id=None,
+                last_success_at=None,
+                last_error=None,
+            ))
+
+
+async def _load_subscription_chats(
+    db: AsyncSession,
+    *,
+    subscription_id: int,
+) -> list[dict]:
+    """Подгрузить список чатов для групповой подписки в виде списка
+    dict-ов, отсортированных по position. Используется в SubscriptionOut."""
+    res = await db.execute(
+        select(SubscriptionChat)
+        .where(SubscriptionChat.subscription_id == subscription_id)
+        .order_by(SubscriptionChat.position.asc())
+    )
+    rows = list(res.scalars().all())
+    return [
+        {
+            "chat_ref": r.chat_ref,
+            "chat_id": r.chat_id,
+            "chat_title": r.chat_title,
+            "chat_username": r.chat_username,
+            "position": r.position,
+        }
+        for r in rows
+    ]
+
+
+def _serialize_subscription(sub: Subscription, chats: list[dict] | None = None) -> dict:
+    """Превратить Subscription + опциональный список чатов в dict,
+    пригодный для SubscriptionOut. Используется в эндпоинтах, где
+    нужно вернуть подписку с подгруженным списком чатов."""
+    base = {
+        "id": sub.id,
+        "owner_user_id": sub.owner_user_id,
+        "name": sub.name,
+        "source_mode": sub.source_mode,
+        "chat_ref": sub.chat_ref,
+        "chat_id": sub.chat_id,
+        "frequency_minutes": sub.frequency_minutes,
+        "prompt": sub.prompt,
+        "ai_model": sub.ai_model,
+        "is_active": sub.is_active,
+        "status": sub.status,
+        "last_error": sub.last_error,
+        "created_at": sub.created_at,
+        "updated_at": sub.updated_at,
+        "subscription_type": sub.subscription_type,
+        "media_filter": sub.media_filter,
+        "is_group": bool(getattr(sub, "is_group", False)),
+        "chats": chats,
+        "is_trial": bool(getattr(sub, "is_trial", False)),
+        "trial_started_at": sub.trial_started_at,
+        "trial_ends_at": sub.trial_ends_at,
+    }
+    return base
+
 def extract_text_messages(messages, limit: int = 100000):
     """
     Берём только текстовые сообщения (type == 'message'),
@@ -848,9 +1108,18 @@ def build_tg_message_link(chat_ref: str | None, chat_id: int | None, message_id:
     if chat_id:
         aid = abs(int(chat_id))
         s = str(aid)
+        # Формат бот-API: -100XXXXX → abs → "100XXXXX". Срезаем "100".
         if s.startswith("100") and len(s) > 3:
             internal = s[3:]
             return f"https://t.me/c/{internal}/{message_id}"
+        # Формат Telethon: entity.id у каналов/супергрупп — это «сырое»
+        # положительное число без префикса -100 (например, 1900836903).
+        # subscriptions_runner сохраняет его как есть в sub.chat_id, и
+        # без этой ветки media-подписки на приватные/числовые чаты
+        # оставались без рабочих ссылок. Для каналов id всегда «крупное»
+        # число; защищаемся от случайных малых id (User entity) порогом.
+        if aid > 10_000_000:
+            return f"https://t.me/c/{s}/{message_id}"
 
     return None
 
@@ -2891,7 +3160,28 @@ async def list_subscriptions(
     if changed:
         await db.commit()
 
-    return subs
+    # Одним запросом подгружаем все чаты по всем групповым подпискам — N+1 не нужен.
+    group_ids = [s.id for s in subs if getattr(s, "is_group", False)]
+    chats_by_sub: dict[int, list[dict]] = {gid: [] for gid in group_ids}
+    if group_ids:
+        chats_res = await db.execute(
+            select(SubscriptionChat)
+            .where(SubscriptionChat.subscription_id.in_(group_ids))
+            .order_by(SubscriptionChat.subscription_id.asc(), SubscriptionChat.position.asc())
+        )
+        for row in chats_res.scalars().all():
+            chats_by_sub.setdefault(int(row.subscription_id), []).append({
+                "chat_ref": row.chat_ref,
+                "chat_id": row.chat_id,
+                "chat_title": row.chat_title,
+                "chat_username": row.chat_username,
+                "position": row.position,
+            })
+
+    return [
+        _serialize_subscription(s, chats=chats_by_sub.get(s.id) if getattr(s, "is_group", False) else None)
+        for s in subs
+    ]
 
 @app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
 async def get_subscription(
@@ -2905,7 +3195,11 @@ async def get_subscription(
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
-    return sub
+
+    chats_payload = None
+    if getattr(sub, "is_group", False):
+        chats_payload = await _load_subscription_chats(db, subscription_id=sub.id)
+    return _serialize_subscription(sub, chats=chats_payload)
 
 def _normalize_subscription_media_filter(
     *,
@@ -2973,13 +3267,31 @@ async def update_subscription(
 
     old_chat_ref = (sub.chat_ref or "").strip()
     old_source_mode = (sub.source_mode or "").strip().lower()
+    old_is_group = bool(getattr(sub, "is_group", False))
 
-    normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
-        db,
-        owner_user_id=user.id,
-        source_mode=payload.source_mode,
-        chat_ref=payload.chat_ref,
-    )
+    is_group = bool(payload.is_group)
+    resolved_group_chats: list[dict] = []
+    normalized_chat_ref: str
+    chat_id = None
+    chat_title = None
+    chat_username = None
+
+    if is_group:
+        resolved_group_chats = await prepare_subscription_group_targets(
+            db,
+            owner_user_id=user.id,
+            user=user,
+            source_mode=payload.source_mode,
+            chat_refs=payload.chats or [],
+        )
+        normalized_chat_ref = _normalize_group_marker(sub.id)
+    else:
+        normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
+            db,
+            owner_user_id=user.id,
+            source_mode=payload.source_mode,
+            chat_ref=payload.chat_ref or "",
+        )
 
     ai_model = resolve_ai_model_for_user(
         user=user,
@@ -2997,6 +3309,7 @@ async def update_subscription(
     sub.name = payload.name
     sub.source_mode = payload.source_mode
     sub.subscription_type = sub_type
+    sub.is_group = is_group
     sub.chat_ref = normalized_chat_ref
     sub.chat_id = chat_id
     sub.frequency_minutes = payload.frequency_minutes
@@ -3010,26 +3323,65 @@ async def update_subscription(
 
     await expire_trial_subscription_if_needed(db, sub=sub)
 
-    # если чат или режим изменились — сбрасываем state
+    # ---- SubscriptionState (общий tick reservation) ----
     state_res = await db.execute(
         select(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id)
     )
     st = state_res.scalar_one_or_none()
-    if st and (old_chat_ref != normalized_chat_ref or old_source_mode != payload.source_mode):
+    mode_changed = old_source_mode != payload.source_mode
+    type_changed = old_is_group != is_group  # переключение одиночная↔групповая
+    chat_changed_singleton = (not is_group) and (old_chat_ref != normalized_chat_ref)
+
+    # Сбрасываем общий state, если:
+    # - сменился режим (personal↔service);
+    # - переключились между одиночной и групповой (логика курсора меняется);
+    # - в одиночной сменился чат.
+    if st and (mode_changed or type_changed or chat_changed_singleton):
         st.last_message_id = None
         st.last_checked_at = None
         st.last_success_at = None
         st.next_run_at = None
 
-    await upsert_user_chat_history(
-        db,
-        owner_user_id=user.id,
-        source_mode=payload.source_mode,
-        chat_ref=normalized_chat_ref,
-        chat_title=chat_title,
-        chat_username=chat_username,
-        chat_id=chat_id,
-    )
+    # ---- subscription_chats + subscription_chat_state ----
+    if is_group:
+        await _replace_subscription_chats(
+            db,
+            subscription_id=sub.id,
+            # Если переключались с одиночной — все чаты для нас новые,
+            # курсор сохранять не от чего. Если уже была группа — сохраняем
+            # курсор только для тех чатов, которые остались.
+            resolved_chats=resolved_group_chats,
+            reset_state_for_new_chats_only=(old_is_group and not type_changed),
+        )
+        for c in resolved_group_chats:
+            await upsert_user_chat_history(
+                db,
+                owner_user_id=user.id,
+                source_mode=payload.source_mode,
+                chat_ref=c["chat_ref"],
+                chat_title=c.get("chat_title"),
+                chat_username=c.get("chat_username"),
+                chat_id=c.get("chat_id"),
+            )
+    else:
+        # Если стала одиночной — снести все subscription_chats / state.
+        if old_is_group:
+            await db.execute(
+                delete(SubscriptionChat).where(SubscriptionChat.subscription_id == sub.id)
+            )
+            await db.execute(
+                delete(SubscriptionChatState).where(SubscriptionChatState.subscription_id == sub.id)
+            )
+
+        await upsert_user_chat_history(
+            db,
+            owner_user_id=user.id,
+            source_mode=payload.source_mode,
+            chat_ref=normalized_chat_ref,
+            chat_title=chat_title,
+            chat_username=chat_username,
+            chat_id=chat_id,
+        )
 
     db.add(
         UsageEvent(
@@ -3042,13 +3394,19 @@ async def update_subscription(
             meta_json={
                 "is_active": bool(sub.is_active),
                 "frequency_minutes": int(sub.frequency_minutes),
+                "is_group": bool(is_group),
+                "group_size": len(resolved_group_chats) if is_group else None,
             },
         )
     )
 
     await db.commit()
     await db.refresh(sub)
-    return sub
+
+    chats_payload = None
+    if sub.is_group:
+        chats_payload = await _load_subscription_chats(db, subscription_id=sub.id)
+    return _serialize_subscription(sub, chats=chats_payload)
 
 @app.post("/subscriptions/{subscription_id}/toggle", response_model=SubscriptionOut)
 async def toggle_subscription(
@@ -3093,7 +3451,11 @@ async def toggle_subscription(
 
     await db.commit()
     await db.refresh(sub)
-    return sub
+
+    chats_payload = None
+    if getattr(sub, "is_group", False):
+        chats_payload = await _load_subscription_chats(db, subscription_id=sub.id)
+    return _serialize_subscription(sub, chats=chats_payload)
 
 @app.post("/subscriptions", response_model=SubscriptionOut)
 async def create_subscription(
@@ -3108,12 +3470,32 @@ async def create_subscription(
         requested_is_active=payload.is_active,
     )
 
-    normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
-        db,
-        owner_user_id=user.id,
-        source_mode=payload.source_mode,
-        chat_ref=payload.chat_ref,
-    )
+    # ---- Группа vs одиночная ----
+    is_group = bool(payload.is_group)
+    resolved_group_chats: list[dict] = []
+
+    if is_group:
+        resolved_group_chats = await prepare_subscription_group_targets(
+            db,
+            owner_user_id=user.id,
+            user=user,
+            source_mode=payload.source_mode,
+            chat_refs=payload.chats or [],
+        )
+        # Для группы chat_ref в самой Subscription — синтетический "group:<id>",
+        # реальный список — в subscription_chats. chat_id/chat_title для
+        # Subscription не имеют смысла (NULL).
+        normalized_chat_ref = "group:pending"  # перезапишем после flush, когда узнаем sub.id
+        chat_id = None
+        chat_title = None
+        chat_username = None
+    else:
+        normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
+            db,
+            owner_user_id=user.id,
+            source_mode=payload.source_mode,
+            chat_ref=payload.chat_ref or "",
+        )
 
     ai_model = resolve_ai_model_for_user(
         user=user,
@@ -3133,6 +3515,7 @@ async def create_subscription(
         name=payload.name,
         source_mode=payload.source_mode,
         subscription_type=sub_type,
+        is_group=is_group,
         chat_ref=normalized_chat_ref,
         chat_id=chat_id,
         frequency_minutes=payload.frequency_minutes,
@@ -3158,6 +3541,10 @@ async def create_subscription(
     db.add(sub)
     await db.flush()
 
+    # Для группы — перезаписываем chat_ref на финальный "group:<sub.id>"
+    if is_group:
+        sub.chat_ref = _normalize_group_marker(sub.id)
+
     st = SubscriptionState(
         subscription_id=sub.id,
         last_message_id=None,
@@ -3167,15 +3554,37 @@ async def create_subscription(
     )
     db.add(st)
 
-    await upsert_user_chat_history(
-        db,
-        owner_user_id=user.id,
-        source_mode=payload.source_mode,
-        chat_ref=normalized_chat_ref,
-        chat_title=chat_title,
-        chat_username=chat_username,
-        chat_id=chat_id,
-    )
+    # Для группы — наполняем subscription_chats и subscription_chat_state
+    if is_group:
+        await _replace_subscription_chats(
+            db,
+            subscription_id=sub.id,
+            resolved_chats=resolved_group_chats,
+            reset_state_for_new_chats_only=False,
+        )
+
+        # История чатов — добавляем каждый чат группы, чтобы они подтягивались
+        # в подсказках UI наравне с одиночными.
+        for c in resolved_group_chats:
+            await upsert_user_chat_history(
+                db,
+                owner_user_id=user.id,
+                source_mode=payload.source_mode,
+                chat_ref=c["chat_ref"],
+                chat_title=c.get("chat_title"),
+                chat_username=c.get("chat_username"),
+                chat_id=c.get("chat_id"),
+            )
+    else:
+        await upsert_user_chat_history(
+            db,
+            owner_user_id=user.id,
+            source_mode=payload.source_mode,
+            chat_ref=normalized_chat_ref,
+            chat_title=chat_title,
+            chat_username=chat_username,
+            chat_id=chat_id,
+        )
 
     db.add(
         UsageEvent(
@@ -3183,19 +3592,26 @@ async def create_subscription(
             event_type="subscription_created",
             status="success_counted",
             source_mode=payload.source_mode,
-            chat_ref=normalized_chat_ref,
+            chat_ref=sub.chat_ref,
             subscription_id=sub.id,
             meta_json={
                 "is_trial": bool(is_trial),
                 "is_active": bool(payload.is_active),
                 "frequency_minutes": int(payload.frequency_minutes),
+                "is_group": bool(is_group),
+                "group_size": len(resolved_group_chats) if is_group else None,
             },
         )
     )
 
     await db.commit()
     await db.refresh(sub)
-    return sub
+
+    chats_payload = resolved_group_chats if is_group else None
+    if is_group:
+        # Подгружаем из БД с правильным position, чтобы отдать клиенту в финальной форме.
+        chats_payload = await _load_subscription_chats(db, subscription_id=sub.id)
+    return _serialize_subscription(sub, chats=chats_payload)
 
 @app.delete("/subscriptions/{subscription_id}")
 async def delete_subscription(
@@ -3229,6 +3645,9 @@ async def delete_subscription(
     await db.execute(delete(MatchEvent).where(MatchEvent.subscription_id == subscription_id))
     await db.execute(delete(DigestEvent).where(DigestEvent.subscription_id == subscription_id))
     await db.execute(delete(SubscriptionState).where(SubscriptionState.subscription_id == subscription_id))
+    # Групповые таблицы — для групповых подписок. Для одиночных строк нет, DELETE no-op.
+    await db.execute(delete(SubscriptionChatState).where(SubscriptionChatState.subscription_id == subscription_id))
+    await db.execute(delete(SubscriptionChat).where(SubscriptionChat.subscription_id == subscription_id))
     await db.execute(delete(Subscription).where(Subscription.id == subscription_id))
 
     await db.commit()
@@ -3252,6 +3671,20 @@ async def switch_subscription_mode(
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
 
+    # Switch-mode для групповых подписок запрещён.
+    # Для service-режима групповые подписки в принципе не поддерживаются
+    # (нет fetch-логики, нет UI), а ручной свитч одного формата в другой
+    # с N чатами потребовал бы заново валидировать все чаты в новом
+    # режиме — задача за пределами MVP.
+    if bool(getattr(sub, "is_group", False)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SWITCH_MODE_NOT_ALLOWED_FOR_GROUP",
+                "message": "Смена режима недоступна для групповой подписки. Создайте новую.",
+            },
+        )
+
     target_mode = (payload.target_source_mode or "").strip().lower()
     current_mode = (sub.source_mode or "personal").strip().lower()
 
@@ -3259,7 +3692,7 @@ async def switch_subscription_mode(
         raise HTTPException(status_code=400, detail="INVALID_SOURCE_MODE")
 
     if current_mode == target_mode:
-        return sub
+        return _serialize_subscription(sub, chats=None)
 
     normalized_chat_ref, chat_id, chat_title, chat_username = await prepare_subscription_target(
         db,
@@ -3289,7 +3722,7 @@ async def switch_subscription_mode(
 
     await db.commit()
     await db.refresh(sub)
-    return sub
+    return _serialize_subscription(sub, chats=None)
 
 
 @app.post("/tg/bot/dispatch")

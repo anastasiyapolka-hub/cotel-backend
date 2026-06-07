@@ -24,6 +24,11 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "digest_title": "Summary for your subscription: {name}",
         "digest_period": "Period: {period}",
         "digest_period_empty": "Period: —",
+        # Групповая подписка: маркер чата внутри сообщения и в шапке саммари.
+        "match_chat_section": "\n\n📁 Chat: {chat}",
+        "match_chat_section_with_link": "\n\n📁 Chat: {chat} — {url}",
+        "digest_chat_label": "Chat: {chat}",
+        "digest_chat_label_with_link": "Chat: {chat} ({url})",
         # Маркеры типа медиа для events-подписок с media_filter.
         # Используются в начале блока сообщения, чтобы было видно тип
         # «вслепую» (без перехода по ссылке).
@@ -51,6 +56,11 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "digest_title": "Резюме по подписке: {name}",
         "digest_period": "Период: {period}",
         "digest_period_empty": "Период: —",
+        # Групповая подписка
+        "match_chat_section": "\n\n📁 Чат: {chat}",
+        "match_chat_section_with_link": "\n\n📁 Чат: {chat} — {url}",
+        "digest_chat_label": "Чат: {chat}",
+        "digest_chat_label_with_link": "Чат: {chat} ({url})",
         "media_kind_video_file":  "🎥 Видеофайл",
         "media_kind_video_round": "⚪ Видеокружок",
         "media_kind_photo":       "📷 Фото",

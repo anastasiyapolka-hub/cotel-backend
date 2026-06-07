@@ -12,7 +12,9 @@ from sqlalchemy.dialects.postgresql import insert
 
 from db.session import AsyncSessionLocal
 from db.models import (
-    Subscription, SubscriptionState, MatchEvent, DigestEvent, User, UsageEvent,
+    Subscription, SubscriptionState,
+    SubscriptionChat, SubscriptionChatState,
+    MatchEvent, DigestEvent, User, UsageEvent,
 )
 import os
 from main import parse_iso_ts
@@ -36,8 +38,14 @@ from media_filter.reranker import rerank_messages
 
 BATCH_SIZE = 20
 EVENTS_READ_LIMIT = 1000  # как ты утвердила ранее для events
-LEASE_MINUTES = 5      # сколько держим "замок" на время обработки
+LEASE_MINUTES = 5      # сколько держим "замок" на время обработки одиночной
+LEASE_MINUTES_GROUP = 40  # групповая до 20 чатов — берём с запасом, чтобы другой раннер не подхватил
 RETRY_MINUTES = 2      # через сколько повторять при ошибке
+
+# Пауза между fetch'ами разных чатов в групповой подписке.
+# Достаточно мала, чтобы для журналиста оставался лайв-мониторинг,
+# и достаточна, чтобы не словить FLOOD_WAIT на одной StringSession.
+GROUP_INTER_CHAT_SLEEP_SEC = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +124,12 @@ def _build_run_success_meta(
     cost_kwargs: dict,
 ) -> dict[str, Any]:
     """Build UsageEvent.meta_json for subscription_run_success.
-    Drops keys with None values to keep storage compact."""
+    Drops keys with None values to keep storage compact.
+
+    Для групповой подписки (metrics["is_group"] = True) добавляем поля:
+      is_group, group_size, chats_ok, chats_failed, chats_empty
+      и per_chat: [...] с расшифровкой по каждому чату.
+    """
     raw: dict[str, Any] = {
         "subscription_type": metrics.get("subscription_type"),
         "source_mode": metrics.get("source_mode"),
@@ -134,6 +147,17 @@ def _build_run_success_meta(
     }
     raw.update(split_usage_for_meta(llm_usage))
     raw.update(cost_kwargs)
+
+    if metrics.get("is_group"):
+        raw["is_group"] = True
+        raw["group_size"] = metrics.get("group_size")
+        raw["chats_ok"] = metrics.get("chats_ok")
+        raw["chats_failed"] = metrics.get("chats_failed")
+        raw["chats_empty"] = metrics.get("chats_empty")
+        per_chat = metrics.get("per_chat_results")
+        if per_chat:
+            raw["per_chat"] = per_chat
+
     return {k: v for k, v in raw.items() if v is not None}
 
 
@@ -156,6 +180,15 @@ def _build_run_failed_meta(
         "duration_ms_fetch": metrics.get("fetch_duration_ms"),
         "duration_ms_llm": metrics.get("llm_duration_ms"),
     }
+    if metrics.get("is_group"):
+        raw["is_group"] = True
+        raw["group_size"] = metrics.get("group_size")
+        raw["chats_ok"] = metrics.get("chats_ok")
+        raw["chats_failed"] = metrics.get("chats_failed")
+        raw["chats_empty"] = metrics.get("chats_empty")
+        per_chat = metrics.get("per_chat_results")
+        if per_chat:
+            raw["per_chat"] = per_chat
     return {k: v for k, v in raw.items() if v is not None}
 
 
@@ -323,7 +356,8 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
     Короткая транзакция:
     - выбираем due подписки по next_run_at
     - лочим строки subscription_state FOR UPDATE SKIP LOCKED
-    - резервируем: last_checked_at=now, next_run_at=now+freq
+    - резервируем: last_checked_at=now, next_run_at=now+lease
+    - lease = LEASE_MINUTES_GROUP для is_group, иначе LEASE_MINUTES
     - коммит
     """
     async with db.begin():
@@ -351,8 +385,9 @@ async def _reserve_due_subscriptions(db, now_utc: datetime) -> list[int]:
 
         due_ids: list[int] = []
         for st, sub in rows:
+            lease = LEASE_MINUTES_GROUP if bool(getattr(sub, "is_group", False)) else LEASE_MINUTES
             st.last_checked_at = now_utc
-            st.next_run_at = now_utc + timedelta(minutes=LEASE_MINUTES)
+            st.next_run_at = now_utc + timedelta(minutes=lease)
             due_ids.append(int(sub.id))
 
         return due_ids
@@ -470,6 +505,26 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
         # возвращаем подписку в нормальное состояние.
         if sub.status == "no_tokens":
             sub.status = "ok"
+
+        # =====================================================================
+        # ГРУППОВАЯ ПОДПИСКА — отдельная ветка
+        # =====================================================================
+        if bool(getattr(sub, "is_group", False)):
+            metrics["is_group"] = True
+            await _process_group_subscription(
+                db=db,
+                sub=sub,
+                st=st,
+                metrics=metrics,
+                now_utc=now_utc,
+                freq_min=freq_min,
+                owner_user_id=owner_user_id,
+                owner_language=owner_language,
+                source_mode=source_mode,
+                subscription_model_slug=subscription_model.slug,
+                sub_type=sub_type,
+            )
+            return
 
         # =====================================================================
         # DIGEST / SUMMARY
@@ -1030,6 +1085,466 @@ async def _run_media_filter_events_branch(
     st.next_run_at = now_utc + timedelta(minutes=freq_min)
 
     await _record_subscription_run_success_same_session(db, metrics)
+
+
+# ---------------------------------------------------------------------------
+# Групповая подписка — обработка нескольких чатов одной подпиской
+# ---------------------------------------------------------------------------
+#
+# Стратегия:
+# 1. Загружаем список чатов из subscription_chats + текущий курсор
+#    каждого чата из subscription_chat_state.
+# 2. ПОСЛЕДОВАТЕЛЬНО (микропауза между чатами, чтобы не словить
+#    FLOOD_WAIT на одной StringSession юзера):
+#      • fetch чата по cursor;
+#      • если есть сообщения — LLM (events.classify_subscription_matches
+#        или digest.build_subscription_digest);
+#      • пишем MatchEvent / DigestEvent с chat_id/chat_ref/chat_title;
+#      • обновляем per-chat курсор.
+# 3. Частичные фейлы по отдельным чатам не валят всю подписку:
+#    error пишем в subscription_chat_state.last_error,
+#    продолжаем обрабатывать оставшиеся.
+# 4. UsageEvent — ОДНА запись subscription_run_success на тик,
+#    в meta_json.per_chat — расшифровка по чатам;
+#    токены суммируются по N LLM-вызовам, debit — один.
+# 5. Если ВСЕ чаты упали — пробрасываем исключение, чтобы run_tick
+#    написал subscription_run_failed.
+# ---------------------------------------------------------------------------
+async def _process_group_subscription(
+    *,
+    db,
+    sub: Subscription,
+    st: Optional[SubscriptionState],
+    metrics: dict,
+    now_utc: datetime,
+    freq_min: int,
+    owner_user_id: int,
+    owner_language: str,
+    source_mode: str,
+    subscription_model_slug: str,
+    sub_type: str,
+) -> None:
+    # Media-filter для группы пока не поддерживаем — слишком много
+    # пересечений с per-chat реранкером и парсером. На MVP режем.
+    if isinstance(getattr(sub, "media_filter", None), dict):
+        sub.status = "error"
+        sub.last_error = "MEDIA_FILTER_NOT_SUPPORTED_FOR_GROUP"
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        metrics["phase"] = "media_filter_unsupported_for_group"
+        return
+
+    # Group subscriptions работают только в personal-mode (на бэке мы
+    # это валидируем при создании, но runner защищается от старых данных).
+    if source_mode != "personal":
+        sub.status = "error"
+        sub.last_error = "GROUP_REQUIRES_PERSONAL"
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        metrics["phase"] = "group_requires_personal"
+        return
+
+    # Загружаем список чатов в правильном порядке.
+    chats_res = await db.execute(
+        select(SubscriptionChat)
+        .where(SubscriptionChat.subscription_id == sub.id)
+        .order_by(SubscriptionChat.position.asc())
+    )
+    chats: list[SubscriptionChat] = list(chats_res.scalars().all())
+
+    if not chats:
+        # Группа без чатов — некорректное состояние. Парк.
+        sub.status = "error"
+        sub.last_error = "GROUP_NO_CHATS"
+        if st is None:
+            st = SubscriptionState(subscription_id=sub.id)
+            db.add(st)
+        st.last_checked_at = now_utc
+        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+        metrics["phase"] = "group_empty"
+        return
+
+    # Подгружаем per-chat курсоры одним запросом.
+    state_res = await db.execute(
+        select(SubscriptionChatState)
+        .where(SubscriptionChatState.subscription_id == sub.id)
+    )
+    state_by_key = {s.chat_key: s for s in state_res.scalars().all()}
+
+    # Накопители для агрегированных метрик по группе.
+    per_chat_results: list[dict] = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_thinking_tokens = 0
+    total_matches_written = 0
+    total_digest_events_written = 0
+    total_messages_fetched = 0
+    total_messages_sent = 0
+    total_context_chars = 0
+    total_answer_chars = 0
+    total_tokens_charged = 0
+    primary_tokens_source = TOKENS_SOURCE_EMPTY
+    chats_ok = 0
+    chats_failed = 0
+    chats_empty = 0
+
+    fetch_total_ms = 0
+    llm_total_ms = 0
+
+    # Время для last_success_at в SubscriptionState — обновим только если
+    # хотя бы один чат отработал успешно.
+    any_success = False
+
+    for chat in chats:
+        chat_state = state_by_key.get(chat.chat_ref)
+        if chat_state is None:
+            chat_state = SubscriptionChatState(
+                subscription_id=sub.id,
+                chat_key=chat.chat_ref,
+                last_message_id=None,
+                last_success_at=None,
+                last_error=None,
+            )
+            db.add(chat_state)
+            state_by_key[chat.chat_ref] = chat_state
+
+        last_msg_id = chat_state.last_message_id
+
+        if sub_type == "digest":
+            since_dt = now_utc - timedelta(minutes=freq_min)
+            min_id = None
+        elif last_msg_id:
+            since_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            min_id = int(last_msg_id)
+        else:
+            since_dt = now_utc - timedelta(minutes=freq_min)
+            min_id = None
+
+        chat_per: dict[str, Any] = {
+            "chat_ref": chat.chat_ref,
+            "chat_id": chat.chat_id,
+            "chat_title": chat.chat_title,
+            "status": "ok",
+            "messages_fetched": 0,
+            "matches_written": 0,
+            "digest_events_written": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "tokens_charged": 0,
+            "error_code": None,
+            "error_message": None,
+        }
+
+        # ---- Fetch ----
+        fetch_t0 = time.perf_counter()
+        try:
+            entity, msgs = await fetch_chat_messages_for_subscription(
+                db=db,
+                owner_user_id=owner_user_id,
+                chat_link=chat.chat_ref,
+                since_dt=since_dt,
+                min_id=min_id,
+                limit=EVENTS_READ_LIMIT,
+            )
+        except Exception as fetch_err:
+            fetch_total_ms += _ms_since(fetch_t0)
+            chats_failed += 1
+            chat_per["status"] = "failed"
+            chat_per["error_code"] = "TELEGRAM_FETCH_FAILED"
+            chat_per["error_message"] = (str(fetch_err) or "")[:300] or None
+            chat_state.last_error = chat_per["error_message"]
+            per_chat_results.append(chat_per)
+            print(
+                f"[subscriptions_runner] GROUP sub_id={sub.id} "
+                f"chat={chat.chat_ref} fetch_failed err={fetch_err}"
+            )
+            # Микропауза между чатами — даже при ошибке (вдруг это flood/network).
+            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+            continue
+        fetch_total_ms += _ms_since(fetch_t0)
+
+        # Кэшируем chat_id, если впервые узнали (для приватных каналов).
+        if chat.chat_id is None:
+            ent_id = getattr(entity, "id", None)
+            if ent_id is not None:
+                chat.chat_id = int(ent_id)
+                chat_per["chat_id"] = chat.chat_id
+
+        if not chat.chat_title:
+            t = getattr(entity, "title", None) or getattr(entity, "username", None)
+            if t:
+                chat.chat_title = t
+                chat_per["chat_title"] = t
+
+        chat_per["messages_fetched"] = len(msgs or [])
+        total_messages_fetched += len(msgs or [])
+
+        if not msgs:
+            chats_empty += 1
+            chat_per["status"] = "empty"
+            # Курсор не двигаем (двигать некуда), last_success_at — обновим.
+            chat_state.last_success_at = now_utc
+            chat_state.last_error = None
+            per_chat_results.append(chat_per)
+            any_success = True
+            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+            continue
+
+        ids_in_chat = [
+            int(m["message_id"])
+            for m in msgs
+            if isinstance(m, dict) and m.get("message_id") is not None
+        ]
+        newest_in_chat = max(ids_in_chat) if ids_in_chat else last_msg_id
+        oldest_in_chat = min(ids_in_chat) if ids_in_chat else None
+
+        chat_title_for_llm = (
+            chat.chat_title
+            or getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Chat"
+        )
+
+        total_messages_sent += len(msgs)
+        total_context_chars += _approx_context_chars(msgs)
+
+        # ---- LLM ----
+        llm_t0 = time.perf_counter()
+        try:
+            if sub_type == "digest":
+                llm_result = await build_subscription_digest(
+                    prompt=sub.prompt,
+                    chat_title=chat_title_for_llm,
+                    messages=msgs,
+                    answer_language=owner_language,
+                    ai_model=subscription_model_slug,
+                    return_usage=True,
+                )
+            else:
+                llm_result = await classify_subscription_matches(
+                    prompt=sub.prompt,
+                    chat_title=chat_title_for_llm,
+                    messages=msgs,
+                    ux_language=owner_language,
+                    ai_model=subscription_model_slug,
+                    return_usage=True,
+                )
+        except Exception as llm_err:
+            llm_total_ms += _ms_since(llm_t0)
+            chats_failed += 1
+            chat_per["status"] = "failed"
+            chat_per["error_code"] = "LLM_ERROR"
+            chat_per["error_message"] = (str(llm_err) or "")[:300] or None
+            chat_state.last_error = chat_per["error_message"]
+            per_chat_results.append(chat_per)
+            print(
+                f"[subscriptions_runner] GROUP sub_id={sub.id} "
+                f"chat={chat.chat_ref} llm_failed err={llm_err}"
+            )
+            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+            continue
+        llm_total_ms += _ms_since(llm_t0)
+
+        usage = llm_result.usage or LlmUsage(0, 0, 0, TOKENS_SOURCE_EMPTY)
+        in_tok = usage.input_tokens or 0
+        out_tok = usage.output_tokens or 0
+        think_tok = getattr(usage, "thinking_tokens", 0) or 0
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        total_thinking_tokens += think_tok
+        if usage.tokens_source and primary_tokens_source == TOKENS_SOURCE_EMPTY:
+            primary_tokens_source = usage.tokens_source
+
+        # Списание в наших токенах — точное по этому вызову.
+        rates = await get_token_rates(db, subscription_model_slug)
+        if rates is None or (not in_tok and not out_tok):
+            tokens_for_call = 1
+        else:
+            tokens_for_call = billing.compute_tokens_for_llm_call(
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                thinking_tokens=think_tok,
+                in_per_1k=rates.in_per_1k,
+                out_per_1k=rates.out_per_1k,
+            )
+        total_tokens_charged += tokens_for_call
+
+        chat_per["input_tokens"] = in_tok
+        chat_per["output_tokens"] = out_tok
+        chat_per["thinking_tokens"] = think_tok or None
+        chat_per["tokens_charged"] = tokens_for_call
+
+        # ---- Запись MatchEvent / DigestEvent ----
+        try:
+            if sub_type == "digest":
+                digest_text = ""
+                confidence = None
+                llm_json = llm_result.data or {}
+                if isinstance(llm_json, dict):
+                    digest_text = (llm_json.get("digest_text") or "").strip()
+                    confidence = llm_json.get("confidence")
+                if len(digest_text) > 4096:
+                    digest_text = digest_text[:4096].rstrip() + "…"
+
+                stmt = (
+                    insert(DigestEvent)
+                    .values(
+                        subscription_id=sub.id,
+                        chat_ref=chat.chat_ref,
+                        chat_id=chat.chat_id,
+                        chat_title=chat.chat_title,
+                        window_start=since_dt,
+                        window_end=now_utc,
+                        start_message_id=int(oldest_in_chat) if oldest_in_chat else None,
+                        end_message_id=int(newest_in_chat) if newest_in_chat else None,
+                        messages_seen=len(msgs),
+                        digest_text=digest_text,
+                        llm_payload={"confidence": confidence} if confidence is not None else None,
+                        notify_status="queued",
+                    )
+                    .on_conflict_do_nothing(index_elements=None, constraint="uq_digest_sub_chat_endmsg")
+                )
+                r = await db.execute(stmt)
+                written = 1 if getattr(r, "rowcount", 0) == 1 else 0
+                chat_per["digest_events_written"] = written
+                total_digest_events_written += written
+                total_answer_chars += len(digest_text)
+            else:
+                # events
+                msg_by_id = {
+                    int(m["message_id"]): m
+                    for m in msgs
+                    if isinstance(m, dict) and m.get("message_id") is not None
+                }
+                llm_json = llm_result.data or {}
+                matches = (llm_json.get("matches") or []) if isinstance(llm_json, dict) else []
+                written_this_chat = 0
+                for item in matches:
+                    mid = item.get("message_id")
+                    if mid is None:
+                        continue
+                    src = msg_by_id.get(int(mid))
+                    author_id = src.get("author_id") if src else None
+                    author_display = src.get("author_display") if src else None
+                    excerpt = ""
+                    if src:
+                        excerpt = (src.get("text") or "").strip()
+                    if not excerpt:
+                        excerpt = (item.get("excerpt") or "").strip()
+                    if len(excerpt) > 300:
+                        excerpt = excerpt[:300].rstrip() + "…"
+                    ts = None
+                    try:
+                        if src and src.get("message_ts"):
+                            ts = parse_iso_ts(src.get("message_ts"))
+                        else:
+                            ts = parse_iso_ts(item.get("message_ts"))
+                    except Exception:
+                        ts = None
+                    reason = item.get("reason")
+                    total_answer_chars += len(excerpt) + len(reason or "")
+
+                    me_stmt = (
+                        insert(MatchEvent)
+                        .values(
+                            subscription_id=sub.id,
+                            chat_ref=chat.chat_ref,
+                            chat_id=chat.chat_id,
+                            chat_title=chat.chat_title,
+                            message_id=int(mid),
+                            message_ts=ts,
+                            author_id=author_id,
+                            author_display=author_display,
+                            excerpt=excerpt,
+                            reason=reason,
+                            notify_status="queued",
+                            llm_payload=None,
+                        )
+                        .on_conflict_do_nothing(constraint="uq_match_sub_chat_msg")
+                    )
+                    r = await db.execute(me_stmt)
+                    if getattr(r, "rowcount", 0) == 1:
+                        written_this_chat += 1
+                chat_per["matches_written"] = written_this_chat
+                total_matches_written += written_this_chat
+        except Exception as write_err:
+            chats_failed += 1
+            chat_per["status"] = "failed"
+            chat_per["error_code"] = "DB_WRITE_FAILED"
+            chat_per["error_message"] = (str(write_err) or "")[:300] or None
+            chat_state.last_error = chat_per["error_message"]
+            per_chat_results.append(chat_per)
+            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+            continue
+
+        # Успешный чат — обновляем курсор и last_success_at.
+        if newest_in_chat:
+            chat_state.last_message_id = int(newest_in_chat)
+        chat_state.last_success_at = now_utc
+        chat_state.last_error = None
+        chats_ok += 1
+        any_success = True
+        per_chat_results.append(chat_per)
+
+        await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+
+    # ---- Финальный апдейт state и метрик ----
+    if st is None:
+        st = SubscriptionState(subscription_id=sub.id)
+        db.add(st)
+
+    if any_success:
+        st.last_success_at = now_utc
+    st.last_checked_at = now_utc
+    st.next_run_at = now_utc + timedelta(minutes=freq_min)
+
+    metrics["messages_fetched_count"] = total_messages_fetched
+    metrics["messages_sent_to_llm_count"] = total_messages_sent
+    metrics["context_chars"] = total_context_chars or None
+    metrics["answer_chars"] = total_answer_chars or None
+    metrics["matches_written"] = total_matches_written
+    metrics["digest_events_written"] = total_digest_events_written
+    metrics["fetch_duration_ms"] = fetch_total_ms
+    metrics["llm_duration_ms"] = llm_total_ms
+    metrics["group_size"] = len(chats)
+    metrics["chats_ok"] = chats_ok
+    metrics["chats_failed"] = chats_failed
+    metrics["chats_empty"] = chats_empty
+    metrics["per_chat_results"] = per_chat_results
+
+    # Если ни одного успеха — поднимаем ошибку наружу, чтобы run_tick
+    # написал subscription_run_failed и поставил retry.
+    if not any_success:
+        raise RuntimeError(
+            f"GROUP_ALL_CHATS_FAILED chats={len(chats)} failed={chats_failed}"
+        )
+
+    # Накопленные токены и tokens_charged_precomputed — это сигнал
+    # _record_subscription_run_success_same_session: не пересчитывать
+    # стоимость по тарифам, а уважать наше число (точное per-chat).
+    if total_input_tokens or total_output_tokens or total_tokens_charged:
+        metrics["llm_usage"] = LlmUsage(
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            total_tokens=total_input_tokens + total_output_tokens,
+            tokens_source=primary_tokens_source,
+            thinking_tokens=total_thinking_tokens,
+        )
+        # Reuse существующего поля precomputed — уже понимается биллингом.
+        metrics["mf_tokens_charged_precomputed"] = total_tokens_charged
+
+    # Если в группе не было ни одного LLM-вызова (все чаты empty) —
+    # не пишем UsageEvent, чтобы не плодить пустых записей (как и
+    # в одиночной ветке). Иначе — общая запись с per-chat расшифровкой.
+    if chats_ok > 0 and (total_input_tokens or total_output_tokens or total_tokens_charged):
+        await _record_subscription_run_success_same_session(db, metrics)
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
@@ -272,10 +273,70 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _event_chat_ref(sub: Subscription, ev) -> str | None:
+    """Для группы — берём chat_ref из самого события (он в MatchEvent
+    заполнен при записи). Для одиночной — из Subscription."""
+    return getattr(ev, "chat_ref", None) or getattr(sub, "chat_ref", None)
+
+
+def _event_chat_id(sub: Subscription, ev) -> int | None:
+    v = getattr(ev, "chat_id", None)
+    if v is not None:
+        return int(v)
+    s = getattr(sub, "chat_id", None)
+    return int(s) if s is not None else None
+
+
+def _event_chat_title(ev) -> str | None:
+    return getattr(ev, "chat_title", None) or None
+
+
+def _build_chat_url(sub: Subscription, ev) -> str | None:
+    """Ссылка на сам чат (не на сообщение). build_tg_message_link с
+    фейковым message_id=1 даёт URL вида https://t.me/<chat>/1 — Telegram
+    редиректит на чат. Отрезаем "/1" и получаем «голую» ссылку."""
+    url = build_tg_message_link(
+        chat_ref=_event_chat_ref(sub, ev),
+        chat_id=_event_chat_id(sub, ev),
+        message_id=1,
+    )
+    if not url:
+        return None
+    return url.rsplit("/", 1)[0]
+
+
+def _format_match_event_ts(message_ts: Optional[datetime], tz_name: str) -> str:
+    """
+    Преобразовать UTC-метку времени сообщения в локальное время
+    пользователя и отформатировать как `YYYY-MM-DD HH:MM (GMT+N)`.
+    Используем ZoneInfo (как в digest-форматтере), GMT-offset считаем сами.
+    """
+    if message_ts is None:
+        return "—"
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:
+        tz = ZoneInfo("UTC")
+    aware = message_ts if message_ts.tzinfo else message_ts.replace(tzinfo=timezone.utc)
+    local = aware.astimezone(tz)
+    # Лейбл смещения (GMT+3, GMT-5 и т.п.) — без минут, чтобы не шумело.
+    # Для UTC оставляем просто «UTC».
+    offset = local.utcoffset()
+    if offset is None or tz_name == "UTC":
+        suffix = " (UTC)"
+    else:
+        total_min = int(offset.total_seconds() // 60)
+        sign = "+" if total_min >= 0 else "-"
+        h, m = divmod(abs(total_min), 60)
+        suffix = f" (GMT{sign}{h})" if m == 0 else f" (GMT{sign}{h}:{m:02d})"
+    return f"{local:%Y-%m-%d %H:%M}{suffix}"
+
+
 def _format_match_events_message(
     sub: Subscription,
     events: list[MatchEvent],
     language: str = "en",
+    tz_name: str = "UTC",
 ) -> str:
     """
     Формат:
@@ -294,6 +355,7 @@ def _format_match_events_message(
 
     sid = int(sub.id)
     name = sub.name or f"#{sid}"
+    is_group = bool(getattr(sub, "is_group", False))
     header = (
         _esc(bot_t("match_header", language, name=name)) + "\n"
         + _esc(bot_t("match_count", language, count=len(events))) + "\n"
@@ -305,59 +367,94 @@ def _format_match_events_message(
     detailed_indexes: list[int] = []
     remaining_indexes: list[int] = []
 
+    # Подготовка порядка обхода: для группы — сначала по чатам в порядке
+    # появления, внутри чата — по индексу события. Для одиночной —
+    # один «псевдо-чат» с None-ключом, всё как раньше.
+    if is_group:
+        chats_order: list[str] = []
+        ev_groups: dict[str, list[tuple[int, "MatchEvent"]]] = {}
+        for idx, ev in enumerate(events, start=1):
+            key = _event_chat_ref(sub, ev) or "—"
+            if key not in ev_groups:
+                chats_order.append(key)
+                ev_groups[key] = []
+            ev_groups[key].append((idx, ev))
+    else:
+        chats_order = ["__single__"]
+        ev_groups = {"__single__": list(enumerate(events, start=1))}
+
     # 1) Сначала пытаемся набить подробную часть
-    for idx, ev in enumerate(events, start=1):
-        author_raw = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
-        author = _esc(author_raw)
-        ts = _esc(ev.message_ts.isoformat() if ev.message_ts else "—")
+    for chat_key in chats_order:
+        ev_list = ev_groups.get(chat_key, [])
 
-        excerpt_raw = (ev.excerpt or "").strip()
-        if len(excerpt_raw) > 300:
-            excerpt_raw = excerpt_raw[:300].rstrip() + "…"
-        excerpt = _esc(excerpt_raw)
-
-        # Маркер типа медиа для events с media_filter — берётся из
-        # ev.llm_payload['kind'], который runner кладёт в subscriptions_runner.
-        # Если поля нет (классическая текстовая events-подписка) — None.
-        media_marker = _media_kind_marker(ev, language)
-
-        url = build_tg_message_link(
-            chat_ref=getattr(sub, "chat_ref", None),
-            chat_id=getattr(sub, "chat_id", None),
-            message_id=int(ev.message_id),
-        )
-
-        # Сборка тела:
-        # • media-матч + URL → маркер становится КЛИКАБЕЛЬНОЙ ссылкой,
-        #   подпись (если есть) под ним, отдельная строка URL не нужна
-        #   (даблирование смутит).
-        # • media-матч без URL (приватный чат без permalink) → маркер
-        #   плейн-текст, ниже подпись.
-        # • текстовый матч (нет маркера) — оставляем старую раскладку:
-        #   excerpt, под ним отдельной строкой URL (как анкор).
-        if media_marker:
-            esc_marker = _esc(media_marker)
-            if url:
-                # `parse_mode='HTML'` поддерживает <a href> — это и даёт
-                # «фото = ссылка», как просил пользователь.
-                marker_line = f'<a href="{_esc(url)}">{esc_marker}</a>'
+        # Шапка чата — только для группы. Внутри ev_list первый элемент
+        # даёт нам chat_title/chat_id/chat_ref.
+        if is_group and ev_list:
+            first_ev = ev_list[0][1]
+            chat_title = _event_chat_title(first_ev) or chat_key or "—"
+            chat_url = _build_chat_url(sub, first_ev)
+            if chat_url:
+                # HTML-ссылка → название чата кликабельно
+                section_raw = bot_t(
+                    "match_chat_section_with_link",
+                    language,
+                    chat=chat_title,
+                    url="__URL__",
+                )
+                # Безопасно: заменим плейсхолдер на полноценный <a>,
+                # а само название чата экранируем.
+                section = section_raw.replace("__URL__", "")  # сначала уберём
+                # затем соберём вручную: «\n\n📁 Чат: <a href=...>NAME</a>»
+                # формат «{chat} — {url}» — но переделаем сразу руками:
+                chat_label_no_link = bot_t("match_chat_section", language, chat="__CHAT__")
+                section = chat_label_no_link.replace(
+                    "__CHAT__",
+                    f'<a href="{_esc(chat_url)}">{_esc(chat_title)}</a>',
+                )
             else:
-                marker_line = esc_marker
-            body = f"{marker_line}\n{excerpt}" if excerpt else marker_line
-            link_text = ""   # URL уже зашит в маркер
-        else:
-            body = excerpt or "—"
-            link_text = f'\n<a href="{_esc(url)}">{_esc(url)}</a>' if url else ""
+                section = _esc(bot_t("match_chat_section", language, chat=chat_title))
+            if used + len(section) <= DETAIL_TEXT_LIMIT:
+                text_parts.append(section)
+                used += len(section)
 
-        block = f"\n{idx}) {author} • {ts}\n{body}{link_text}"
+        for idx, ev in ev_list:
+            author_raw = ev.author_display or (str(ev.author_id) if ev.author_id else "—")
+            author = _esc(author_raw)
+            ts = _esc(_format_match_event_ts(ev.message_ts, tz_name))
 
-        # ограничение на подробную часть (оставляем запас под секцию ссылок)
-        if used + len(block) <= DETAIL_TEXT_LIMIT:
-            text_parts.append(block)
-            used += len(block)
-            detailed_indexes.append(idx)
-        else:
-            remaining_indexes.append(idx)
+            excerpt_raw = (ev.excerpt or "").strip()
+            if len(excerpt_raw) > 300:
+                excerpt_raw = excerpt_raw[:300].rstrip() + "…"
+            excerpt = _esc(excerpt_raw)
+
+            media_marker = _media_kind_marker(ev, language)
+
+            url = build_tg_message_link(
+                chat_ref=_event_chat_ref(sub, ev),
+                chat_id=_event_chat_id(sub, ev),
+                message_id=int(ev.message_id),
+            )
+
+            if media_marker:
+                esc_marker = _esc(media_marker)
+                if url:
+                    marker_line = f'<a href="{_esc(url)}">{esc_marker}</a>'
+                else:
+                    marker_line = esc_marker
+                body = f"{marker_line}\n{excerpt}" if excerpt else marker_line
+                link_text = ""
+            else:
+                body = excerpt or "—"
+                link_text = f'\n<a href="{_esc(url)}">{_esc(url)}</a>' if url else ""
+
+            block = f"\n{idx}) {author} • {ts}\n{body}{link_text}"
+
+            if used + len(block) <= DETAIL_TEXT_LIMIT:
+                text_parts.append(block)
+                used += len(block)
+                detailed_indexes.append(idx)
+            else:
+                remaining_indexes.append(idx)
 
     # 2) Если осталось что-то — добавляем секцию ссылок
     if remaining_indexes:
@@ -369,8 +466,8 @@ def _format_match_events_message(
         for idx in remaining_indexes:
             ev = events[idx - 1]
             url = build_tg_message_link(
-                chat_ref=getattr(sub, "chat_ref", None),
-                chat_id=getattr(sub, "chat_id", None),
+                chat_ref=_event_chat_ref(sub, ev),
+                chat_id=_event_chat_id(sub, ev),
                 message_id=int(ev.message_id),
             )
             if url:
@@ -457,6 +554,7 @@ def _format_digest_message(
     Формат:
       заголовок: "Summary for your subscription: {name}" / «Резюме по подписке: {name}»
       период:   "Period: {window_start} — {window_end}" / «Период: …»
+      [для группы] чат: «Чат: <название> (<url>)»
       тело:     digest_text (язык narration уже выставлен LLM по `user.language`)
     """
     name = sub.name or f"#{sub.id}"
@@ -473,9 +571,20 @@ def _format_digest_message(
     else:
         period = bot_t("digest_period_empty", language)
 
+    # Для групповой подписки добавляем под шапкой строку с названием
+    # чата. Чтобы юзер видел, по какому именно чату пришло саммари.
+    chat_line = ""
+    if bool(getattr(sub, "is_group", False)):
+        chat_title = getattr(ev, "chat_title", None) or getattr(ev, "chat_ref", None) or "—"
+        chat_url = _build_chat_url(sub, ev)
+        if chat_url:
+            chat_line = "\n" + bot_t("digest_chat_label_with_link", language, chat=chat_title, url=chat_url)
+        else:
+            chat_line = "\n" + bot_t("digest_chat_label", language, chat=chat_title)
+
     body = (ev.digest_text or "").strip() or "—"
 
-    text = f"{title}\n{period}\n\n{body}"
+    text = f"{title}\n{period}{chat_line}\n\n{body}"
 
     if len(text) > TG_MSG_HARD_LIMIT:
         text = text[: TG_MSG_HARD_LIMIT - 1] + "…"
@@ -543,6 +652,7 @@ async def run_tick() -> int:
                 user: User = pack["user"]
                 events: list[MatchEvent] = pack["events"]
                 language = getattr(user, "language", None) or "en"
+                user_tz_name = getattr(user, "timezone", None) or "UTC"
                 events_in_group = len(events)
                 sub_source_mode = getattr(sub, "source_mode", None)
                 sub_chat_ref = getattr(sub, "chat_ref", None)
@@ -575,7 +685,9 @@ async def run_tick() -> int:
                     if not dest_chat_id:
                         raise RuntimeError(f"NO_BOT_USER_LINK owner_user_id={owner_user_id}")
 
-                    text = _format_match_events_message(sub, events, language=language)
+                    text = _format_match_events_message(
+                        sub, events, language=language, tz_name=user_tz_name,
+                    )
                     # parse_mode='HTML' — нужен, чтобы клик по «📷 Фото»
                     # / «🎥 Видеофайл» в маркере вёл прямо в Telegram-сообщение.
                     await bot_send_message(

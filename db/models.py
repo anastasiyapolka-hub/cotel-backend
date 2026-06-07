@@ -29,8 +29,24 @@ class Subscription(Base):
     source_mode = Column(String(20), nullable=False, default="personal")
     subscription_type = Column(String(30), nullable=False, server_default="events")
 
-    chat_ref = Column(Text, nullable=False)  # username/link/invite как ввёл пользователь
-    chat_id = Column(BigInteger, nullable=True)  # нормализованный peer id (когда распарсим)
+    chat_ref = Column(Text, nullable=False)  # username/link/invite как ввёл пользователь (для одиночной — реальный чат; для групповой — "group:<sub_id>")
+    chat_id = Column(BigInteger, nullable=True)  # нормализованный peer id (только для одиночной; для групповой — NULL)
+
+    # Групповая подписка — мониторит сразу несколько чатов.
+    # Если True, реальный список чатов лежит в таблице subscription_chats,
+    # а chat_ref содержит синтетический маркер "group:<sub_id>". Только
+    # для personal source_mode (для service групповые подписки запрещены).
+    # MIGRATION REQUIRED:
+    #   ALTER TABLE subscriptions
+    #     ADD COLUMN is_group BOOLEAN NOT NULL DEFAULT FALSE;
+    #   CREATE INDEX ix_subscriptions_owner_is_group
+    #     ON subscriptions(owner_user_id, is_group);
+    is_group = Column(
+        Boolean,
+        nullable=False,
+        server_default=sa.text("false"),
+        index=True,
+    )
 
     frequency_minutes = Column(Integer, nullable=False, default=60)  # 60=час, 1440=день
     prompt = Column(Text, nullable=False)
@@ -78,10 +94,101 @@ class SubscriptionState(Base):
         primary_key=True,
     )
 
+    # Для одиночной подписки — курсор по сообщениям. Для групповой не
+    # используется (см. SubscriptionChatState), но запись всё равно
+    # создаётся, чтобы reservation-логика по next_run_at работала
+    # единообразно для обоих типов.
     last_message_id = Column(BigInteger, nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     last_success_at = Column(DateTime(timezone=True), nullable=True)
     next_run_at = Column(sa.DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Групповые подписки: один subscription -> много чатов.
+# ---------------------------------------------------------------------------
+# MIGRATION REQUIRED — новая таблица subscription_chats:
+#   CREATE TABLE subscription_chats (
+#     subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+#     position INTEGER NOT NULL,
+#     chat_ref TEXT NOT NULL,
+#     chat_id BIGINT NULL,
+#     chat_title VARCHAR(255) NULL,
+#     chat_username VARCHAR(128) NULL,
+#     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     PRIMARY KEY (subscription_id, position)
+#   );
+#   CREATE INDEX ix_subscription_chats_subscription ON subscription_chats(subscription_id);
+# ---------------------------------------------------------------------------
+class SubscriptionChat(Base):
+    __tablename__ = "subscription_chats"
+
+    subscription_id = Column(
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # Порядковый номер чата в группе — нужен и как часть PK, и чтобы
+    # стабильно показывать пользователю те же чаты в том же порядке,
+    # в котором он их выбрал на фронте.
+    position = Column(Integer, primary_key=True)
+
+    chat_ref = Column(Text, nullable=False)
+    chat_id = Column(BigInteger, nullable=True)
+    chat_title = Column(String(255), nullable=True)
+    chat_username = Column(String(128), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        sa.Index("ix_subscription_chats_subscription", "subscription_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Состояние групповой подписки на уровне отдельного чата.
+# Для групповой подписки на каждый чат — отдельный курсор last_message_id.
+# Это критично: без per-chat курсора либо теряем сообщения, либо шлём дубли
+# (message_id из разных чатов не сопоставимы).
+# ---------------------------------------------------------------------------
+# MIGRATION REQUIRED — новая таблица subscription_chat_state:
+#   CREATE TABLE subscription_chat_state (
+#     subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+#     chat_key TEXT NOT NULL,
+#     last_message_id BIGINT NULL,
+#     last_success_at TIMESTAMPTZ NULL,
+#     last_error TEXT NULL,
+#     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     PRIMARY KEY (subscription_id, chat_key)
+#   );
+# chat_key — это chat_ref нормализованный (то же, что лежит в
+# subscription_chats.chat_ref). Берём именно ref, а не chat_id, потому что
+# для приватных каналов chat_id может прийти позже первого фетча, а ref
+# известен сразу при создании.
+# ---------------------------------------------------------------------------
+class SubscriptionChatState(Base):
+    __tablename__ = "subscription_chat_state"
+
+    subscription_id = Column(
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    chat_key = Column(Text, primary_key=True)
+
+    last_message_id = Column(BigInteger, nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
 
 class MatchEvent(Base):
     __tablename__ = "match_events"
@@ -93,6 +200,17 @@ class MatchEvent(Base):
         ForeignKey("subscriptions.id", ondelete="CASCADE"),
         nullable=False,
     )
+
+    # Поля чата — нужны для групповых подписок (чтобы в боте показать,
+    # в каком именно чате нашлось совпадение, и построить ссылку).
+    # Для одиночной подписки — NULL (берём из самой Subscription).
+    # MIGRATION REQUIRED:
+    #   ALTER TABLE match_events ADD COLUMN chat_ref TEXT NULL;
+    #   ALTER TABLE match_events ADD COLUMN chat_id BIGINT NULL;
+    #   ALTER TABLE match_events ADD COLUMN chat_title VARCHAR(255) NULL;
+    chat_ref = Column(Text, nullable=True)
+    chat_id = Column(BigInteger, nullable=True)
+    chat_title = Column(String(255), nullable=True)
 
     message_id = Column(BigInteger, nullable=False)
     message_ts = Column(DateTime(timezone=True), nullable=True)
@@ -107,8 +225,22 @@ class MatchEvent(Base):
     notify_status = Column(String(20), nullable=False, default="queued")  # queued/sent/failed
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # MIGRATION REQUIRED — пересоздать unique constraint так, чтобы он
+    # учитывал chat_id (для групповой подписки message_id из разных чатов
+    # МОГУТ совпадать, иначе будут IntegrityError):
+    #   ALTER TABLE match_events DROP CONSTRAINT uq_match_subscription_message;
+    #   CREATE UNIQUE INDEX uq_match_sub_chat_msg
+    #     ON match_events (subscription_id, COALESCE(chat_id, 0), message_id);
+    # COALESCE нужен, чтобы старые одиночные подписки (chat_id IS NULL)
+    # не нарушали уникальность.
     __table_args__ = (
-        UniqueConstraint("subscription_id", "message_id", name="uq_match_subscription_message"),
+        sa.Index(
+            "uq_match_sub_chat_msg",
+            "subscription_id",
+            sa.func.coalesce(sa.text("chat_id"), sa.text("0")),
+            "message_id",
+            unique=True,
+        ),
     )
 
 class DigestEvent(Base):
@@ -116,6 +248,16 @@ class DigestEvent(Base):
 
     id = Column(Integer, primary_key=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
+
+    # Поля чата — для групповых саммари (бот шлёт N сообщений, по одному
+    # на чат, и для каждого нужны название/ссылка). Для одиночной — NULL.
+    # MIGRATION REQUIRED:
+    #   ALTER TABLE digest_events ADD COLUMN chat_ref TEXT NULL;
+    #   ALTER TABLE digest_events ADD COLUMN chat_id BIGINT NULL;
+    #   ALTER TABLE digest_events ADD COLUMN chat_title VARCHAR(255) NULL;
+    chat_ref = Column(Text, nullable=True)
+    chat_id = Column(BigInteger, nullable=True)
+    chat_title = Column(String(255), nullable=True)
 
     window_start = Column(DateTime(timezone=True), nullable=True)
     window_end = Column(DateTime(timezone=True), nullable=True)
@@ -130,8 +272,20 @@ class DigestEvent(Base):
     notify_status = Column(String(20), nullable=False, server_default="queued")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # MIGRATION REQUIRED — пересоздать unique constraint так, чтобы он
+    # учитывал chat_id (для групповой подписки end_message_id из разных
+    # чатов могут совпасть):
+    #   ALTER TABLE digest_events DROP CONSTRAINT uq_digest_subscription_endmsg;
+    #   CREATE UNIQUE INDEX uq_digest_sub_chat_endmsg
+    #     ON digest_events (subscription_id, COALESCE(chat_id, 0), end_message_id);
     __table_args__ = (
-        UniqueConstraint("subscription_id", "end_message_id", name="uq_digest_subscription_endmsg"),
+        sa.Index(
+            "uq_digest_sub_chat_endmsg",
+            "subscription_id",
+            sa.func.coalesce(sa.text("chat_id"), sa.text("0")),
+            "end_message_id",
+            unique=True,
+        ),
         sa.Index("ix_digest_subscription_created", "subscription_id", "created_at"),
     )
 
