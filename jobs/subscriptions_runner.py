@@ -1124,18 +1124,16 @@ async def _process_group_subscription(
     subscription_model_slug: str,
     sub_type: str,
 ) -> None:
-    # Media-filter для группы пока не поддерживаем — слишком много
-    # пересечений с per-chat реранкером и парсером. На MVP режем.
-    if isinstance(getattr(sub, "media_filter", None), dict):
-        sub.status = "error"
-        sub.last_error = "MEDIA_FILTER_NOT_SUPPORTED_FOR_GROUP"
-        if st is None:
-            st = SubscriptionState(subscription_id=sub.id)
-            db.add(st)
-        st.last_checked_at = now_utc
-        st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
-        metrics["phase"] = "media_filter_unsupported_for_group"
-        return
+    # Медиа-фильтр для групповой подписки: для каждого чата вызываем
+    # отдельный pipeline (Telethon messages.search + LLM-парсер/реранкер),
+    # MatchEvent с chat_id/chat_ref. Парсер sub.prompt вызываем ОДИН раз
+    # перед циклом (он не зависит от чата) — экономия токенов.
+    media_filter_dict = getattr(sub, "media_filter", None)
+    is_media_group = (
+        isinstance(media_filter_dict, dict)
+        and media_filter_dict.get("enabled", True)
+        and sub_type == "events"
+    )
 
     # Group subscriptions работают только в personal-mode (на бэке мы
     # это валидируем при создании, но runner защищается от старых данных).
@@ -1201,6 +1199,91 @@ async def _process_group_subscription(
     # хотя бы один чат отработал успешно.
     any_success = False
 
+    # === Pre-loop: общий парсер media-filter (один на всю группу) ===
+    # Парсер sub.prompt вызываем ОДИН раз перед циклом — он не зависит
+    # от чата. Это даёт ровно один LLM-вызов на парсер для всей группы,
+    # а не N идентичных вызовов. Реранкер вызываем уже per-chat (его
+    # вход — сообщения конкретного чата).
+    media_parsed = None
+    media_request = None
+    if is_media_group:
+        try:
+            media_request = MediaFilterRequest.model_validate(media_filter_dict)
+        except Exception as e:
+            sub.status = "error"
+            sub.last_error = f"BAD_MEDIA_FILTER: {type(e).__name__}"
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+            metrics["phase"] = "bad_media_filter"
+            return
+
+        parser_t0 = time.perf_counter()
+        metrics["phase"] = "group_media_filter_parsing"
+        try:
+            parser_outcome = await parse_user_query(
+                user_query=(sub.prompt or "").strip(),
+                ui_window_from=now_utc - timedelta(minutes=freq_min),
+                ui_window_to=None,
+                selected_categories=[c.value for c in media_request.effective_categories()],
+                now=now_utc,
+            )
+            media_parsed = parser_outcome.parsed
+        except Exception as e:
+            sub.status = "error"
+            sub.last_error = f"MEDIA_PARSER_FAILED: {type(e).__name__}"
+            if st is None:
+                st = SubscriptionState(subscription_id=sub.id)
+                db.add(st)
+            st.last_checked_at = now_utc
+            st.next_run_at = now_utc + timedelta(minutes=RETRY_MINUTES)
+            metrics["phase"] = "group_media_parser_failed"
+            return
+        llm_total_ms += _ms_since(parser_t0)
+
+        # Учёт токенов парсера — отдельной строкой "__parser__" в per_chat,
+        # чтобы был виден в admin-логе и не путался с per-chat реранкерами.
+        if parser_outcome.llm_result is not None:
+            p_usage = parser_outcome.llm_result.usage or LlmUsage(0, 0, 0, TOKENS_SOURCE_EMPTY)
+            p_in = p_usage.input_tokens or 0
+            p_out = p_usage.output_tokens or 0
+            p_think = getattr(p_usage, "thinking_tokens", 0) or 0
+            total_input_tokens += p_in
+            total_output_tokens += p_out
+            total_thinking_tokens += p_think
+            if p_usage.tokens_source and primary_tokens_source == TOKENS_SOURCE_EMPTY:
+                primary_tokens_source = p_usage.tokens_source
+            p_slug = parser_outcome.llm_result.used_model.slug
+            p_rates = await get_token_rates(db, p_slug)
+            if p_rates is None or (not p_in and not p_out):
+                p_tokens = 1
+            else:
+                p_tokens = billing.compute_tokens_for_llm_call(
+                    input_tokens=p_in,
+                    output_tokens=p_out,
+                    thinking_tokens=p_think,
+                    in_per_1k=p_rates.in_per_1k,
+                    out_per_1k=p_rates.out_per_1k,
+                )
+            total_tokens_charged += p_tokens
+            per_chat_results.append({
+                "chat_ref": None,
+                "chat_id": None,
+                "chat_title": None,
+                "stage": "media_parser_shared",
+                "status": "ok",
+                "messages_fetched": 0,
+                "matches_written": 0,
+                "input_tokens": p_in,
+                "output_tokens": p_out,
+                "thinking_tokens": p_think or None,
+                "tokens_charged": p_tokens,
+                "error_code": None,
+                "error_message": None,
+            })
+
     for chat in chats:
         chat_state = state_by_key.get(chat.chat_ref)
         if chat_state is None:
@@ -1241,6 +1324,233 @@ async def _process_group_subscription(
             "error_code": None,
             "error_message": None,
         }
+
+        # =================================================================
+        # MEDIA-FILTER ВЕТКА для группового чата
+        # =================================================================
+        # Используем messages.search (через fetch_chat_media) вместо
+        # обычного fetch+classify. Реранкер вызываем per-chat (его вход —
+        # сообщения конкретного чата), парсер уже отработал ОДИН раз
+        # перед циклом (см. блок выше).
+        if is_media_group:
+            # Окно: при наличии курсора берём всё после min_id,
+            # иначе — последний период (как в _run_media_filter_events_branch).
+            if last_msg_id:
+                mf_min_date_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                mf_cursor_min_id = int(last_msg_id)
+            else:
+                mf_min_date_dt = now_utc - timedelta(minutes=freq_min)
+                mf_cursor_min_id = None
+
+            mf_effective_window = compute_effective_window(
+                ui_window_from=mf_min_date_dt,
+                ui_window_to=None,
+                override=media_parsed.structured_filters.time_window_override,
+            )
+
+            # ---- messages.search ----
+            mf_fetch_t0 = time.perf_counter()
+            try:
+                mf_fetched = await fetch_chat_media(
+                    db, owner_user_id, chat.chat_ref,
+                    request=media_request,
+                    min_date=mf_effective_window.min_date,
+                    max_date=mf_effective_window.max_date,
+                    min_id=mf_cursor_min_id,
+                )
+            except Exception as fetch_err:
+                fetch_total_ms += _ms_since(mf_fetch_t0)
+                chats_failed += 1
+                chat_per["status"] = "failed"
+                chat_per["error_code"] = "MEDIA_FETCH_FAILED"
+                chat_per["error_message"] = (str(fetch_err) or "")[:300] or None
+                chat_state.last_error = chat_per["error_message"]
+                per_chat_results.append(chat_per)
+                print(
+                    f"[subscriptions_runner] GROUP_MF sub_id={sub.id} "
+                    f"chat={chat.chat_ref} fetch_failed err={fetch_err}"
+                )
+                await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+                continue
+            fetch_total_ms += _ms_since(mf_fetch_t0)
+
+            if mf_fetched.error_code:
+                chats_failed += 1
+                chat_per["status"] = "failed"
+                chat_per["error_code"] = f"MEDIA_FETCH_FAILED: {mf_fetched.error_code}"
+                chat_per["error_message"] = mf_fetched.error_code
+                chat_state.last_error = chat_per["error_message"]
+                per_chat_results.append(chat_per)
+                await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+                continue
+
+            # Кэшируем chat_id/chat_title, если впервые узнали.
+            if chat.chat_id is None:
+                ent_id = getattr(mf_fetched.entity, "id", None)
+                if ent_id is not None:
+                    chat.chat_id = int(ent_id)
+                    chat_per["chat_id"] = chat.chat_id
+            if not chat.chat_title:
+                t = getattr(mf_fetched.entity, "title", None) or getattr(mf_fetched.entity, "username", None)
+                if t:
+                    chat.chat_title = t
+                    chat_per["chat_title"] = t
+
+            mf_raw = mf_fetched.messages
+            chat_per["messages_fetched"] = len(mf_raw)
+            total_messages_fetched += len(mf_raw)
+
+            if not mf_raw:
+                chats_empty += 1
+                chat_per["status"] = "empty"
+                chat_state.last_success_at = now_utc
+                chat_state.last_error = None
+                per_chat_results.append(chat_per)
+                any_success = True
+                await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+                continue
+
+            # ---- Структурный пост-фильтр ----
+            mf_after_struct = apply_structured_filters(mf_raw, media_parsed.structured_filters)
+
+            # ---- Семантический реранкер (опц., per-chat) ----
+            mf_survivors = mf_after_struct
+            mf_reranker_llm_results = []
+            if (
+                media_parsed.needs_semantic_rerank
+                and media_parsed.semantic_query
+                and mf_after_struct
+            ):
+                rerank_t0 = time.perf_counter()
+                try:
+                    mf_reranker_outcome = await rerank_messages(
+                        messages=mf_after_struct,
+                        semantic_query=media_parsed.semantic_query,
+                    )
+                    mf_survivors = mf_reranker_outcome.survivors
+                    mf_reranker_llm_results = mf_reranker_outcome.llm_results or []
+                except Exception as rerank_err:
+                    llm_total_ms += _ms_since(rerank_t0)
+                    chats_failed += 1
+                    chat_per["status"] = "failed"
+                    chat_per["error_code"] = "MEDIA_RERANK_FAILED"
+                    chat_per["error_message"] = (str(rerank_err) or "")[:300] or None
+                    chat_state.last_error = chat_per["error_message"]
+                    per_chat_results.append(chat_per)
+                    await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+                    continue
+                llm_total_ms += _ms_since(rerank_t0)
+
+            # ---- Биллинг реранкера для этого чата ----
+            ch_in_tok = 0
+            ch_out_tok = 0
+            ch_think_tok = 0
+            ch_tokens = 0
+            for r in mf_reranker_llm_results:
+                if r is None:
+                    continue
+                slug = r.used_model.slug
+                rusage = r.usage or LlmUsage(0, 0, 0, TOKENS_SOURCE_EMPTY)
+                r_in = rusage.input_tokens or 0
+                r_out = rusage.output_tokens or 0
+                r_think = getattr(rusage, "thinking_tokens", 0) or 0
+                ch_in_tok += r_in
+                ch_out_tok += r_out
+                ch_think_tok += r_think
+                if rusage.tokens_source and primary_tokens_source == TOKENS_SOURCE_EMPTY:
+                    primary_tokens_source = rusage.tokens_source
+                rates = await get_token_rates(db, slug)
+                if rates is None or (not r_in and not r_out):
+                    ch_tokens += 1
+                else:
+                    ch_tokens += billing.compute_tokens_for_llm_call(
+                        input_tokens=r_in,
+                        output_tokens=r_out,
+                        thinking_tokens=r_think,
+                        in_per_1k=rates.in_per_1k,
+                        out_per_1k=rates.out_per_1k,
+                    )
+
+            total_input_tokens += ch_in_tok
+            total_output_tokens += ch_out_tok
+            total_thinking_tokens += ch_think_tok
+            total_tokens_charged += ch_tokens
+
+            chat_per["input_tokens"] = ch_in_tok
+            chat_per["output_tokens"] = ch_out_tok
+            chat_per["thinking_tokens"] = ch_think_tok or None
+            chat_per["tokens_charged"] = ch_tokens
+
+            # ---- Запись MatchEvent на каждое выжившее медиа ----
+            newest_in_chat = last_msg_id
+            written_this_chat = 0
+            try:
+                for m in mf_survivors:
+                    excerpt_src = (m.caption or m.text or "").strip()
+                    if len(excerpt_src) > 300:
+                        excerpt_src = excerpt_src[:300].rstrip() + "…"
+                    kind_label = m.kind.value
+                    reason = f"media:{kind_label}"
+                    if m.file_size:
+                        reason += f"|size={m.file_size}"
+                    if m.duration_sec:
+                        reason += f"|dur={m.duration_sec}s"
+                    me_stmt = (
+                        insert(MatchEvent)
+                        .values(
+                            subscription_id=sub.id,
+                            chat_ref=chat.chat_ref,
+                            chat_id=chat.chat_id,
+                            chat_title=chat.chat_title,
+                            message_id=int(m.message_id),
+                            message_ts=m.date,
+                            author_id=m.sender_id,
+                            author_display=m.sender_username or m.sender_display_name,
+                            excerpt=excerpt_src,
+                            reason=reason,
+                            notify_status="queued",
+                            llm_payload={
+                                "kind": kind_label,
+                                "permalink": m.permalink,
+                                "file_size": m.file_size,
+                                "duration_sec": m.duration_sec,
+                                "mime_type": m.mime_type,
+                                "file_name": m.file_name,
+                                "forwarded": bool(m.forward_info),
+                                "ttl_period_sec": m.ttl_period_sec,
+                            },
+                        )
+                        .on_conflict_do_nothing(constraint="uq_match_sub_chat_msg")
+                    )
+                    rmw = await db.execute(me_stmt)
+                    if getattr(rmw, "rowcount", 0) == 1:
+                        written_this_chat += 1
+                    if m.message_id and (newest_in_chat is None or m.message_id > newest_in_chat):
+                        newest_in_chat = int(m.message_id)
+            except Exception as write_err:
+                chats_failed += 1
+                chat_per["status"] = "failed"
+                chat_per["error_code"] = "DB_WRITE_FAILED"
+                chat_per["error_message"] = (str(write_err) or "")[:300] or None
+                chat_state.last_error = chat_per["error_message"]
+                per_chat_results.append(chat_per)
+                await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+                continue
+
+            chat_per["matches_written"] = written_this_chat
+            total_matches_written += written_this_chat
+
+            # Успешный чат — обновляем курсор и last_success_at.
+            if newest_in_chat:
+                chat_state.last_message_id = int(newest_in_chat)
+            chat_state.last_success_at = now_utc
+            chat_state.last_error = None
+            chats_ok += 1
+            any_success = True
+            per_chat_results.append(chat_per)
+
+            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
+            continue
 
         # ---- Fetch ----
         fetch_t0 = time.perf_counter()
@@ -1518,6 +1828,8 @@ async def _process_group_subscription(
     metrics["chats_failed"] = chats_failed
     metrics["chats_empty"] = chats_empty
     metrics["per_chat_results"] = per_chat_results
+    if is_media_group:
+        metrics["is_media_filter"] = True
 
     # Если ни одного успеха — поднимаем ошибку наружу, чтобы run_tick
     # написал subscription_run_failed и поставил retry.
