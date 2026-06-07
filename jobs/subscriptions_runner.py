@@ -48,6 +48,17 @@ RETRY_MINUTES = 2      # через сколько повторять при о�
 GROUP_INTER_CHAT_SLEEP_SEC = 0.3
 
 
+def _trunc(s, n: int):
+    """Обрезает строку до n символов. None → None. Используется перед
+    INSERT в колонки с лимитом длины (VARCHAR/String(N)) — Telegram-чаты
+    с эмодзи в названии легко превышают 200/255 байт, и без обрезки
+    PostgreSQL кидает StringDataRightTruncation → транзакция отравлена."""
+    if s is None:
+        return None
+    s = str(s)
+    return s if len(s) <= n else s[:n]
+
+
 # ---------------------------------------------------------------------------
 # UsageEvent helpers for subscription runtime
 # ---------------------------------------------------------------------------
@@ -1438,8 +1449,8 @@ async def _process_group_subscription(
             if not chat.chat_title:
                 t = getattr(mf_fetched.entity, "title", None) or getattr(mf_fetched.entity, "username", None)
                 if t:
-                    chat.chat_title = t
-                    chat_per["chat_title"] = t
+                    chat.chat_title = _trunc(t, 255)
+                    chat_per["chat_title"] = chat.chat_title
 
             mf_raw = mf_fetched.messages
             chat_per["messages_fetched"] = len(mf_raw)
@@ -1546,11 +1557,11 @@ async def _process_group_subscription(
                             subscription_id=sub.id,
                             chat_ref=chat.chat_ref,
                             chat_id=chat.chat_id,
-                            chat_title=chat.chat_title,
+                            chat_title=_trunc(chat.chat_title, 255),
                             message_id=int(m.message_id),
                             message_ts=m.date,
                             author_id=m.sender_id,
-                            author_display=m.sender_username or m.sender_display_name,
+                            author_display=_trunc(m.sender_username or m.sender_display_name, 200),
                             excerpt=excerpt_src,
                             reason=reason,
                             notify_status="queued",
@@ -1573,14 +1584,15 @@ async def _process_group_subscription(
                     if m.message_id and (newest_in_chat is None or m.message_id > newest_in_chat):
                         newest_in_chat = int(m.message_id)
             except Exception as write_err:
-                chats_failed += 1
-                chat_per["status"] = "failed"
-                chat_per["error_code"] = "DB_WRITE_FAILED"
-                chat_per["error_message"] = (str(write_err) or "")[:300] or None
-                chat_state.last_error = chat_per["error_message"]
-                per_chat_results.append(chat_per)
-                await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
-                continue
+                # КРИТИЧНО: НЕ делаем continue. Любая SQL-ошибка от db.execute
+                # отравляет текущую транзакцию, и следующий чат упадёт на
+                # InFailedSQLTransactionError. Пробрасываем наверх — run_tick
+                # сделает rollback всей сессии и retry в следующем тике.
+                print(
+                    f"[subscriptions_runner] GROUP_MF sub_id={sub.id} "
+                    f"chat={chat.chat_ref} db_write_failed err={write_err}"
+                )
+                raise
 
             chat_per["matches_written"] = written_this_chat
             total_matches_written += written_this_chat
@@ -1635,8 +1647,8 @@ async def _process_group_subscription(
         if not chat.chat_title:
             t = getattr(entity, "title", None) or getattr(entity, "username", None)
             if t:
-                chat.chat_title = t
-                chat_per["chat_title"] = t
+                chat.chat_title = _trunc(t, 255)
+                chat_per["chat_title"] = chat.chat_title
 
         chat_per["messages_fetched"] = len(msgs or [])
         total_messages_fetched += len(msgs or [])
@@ -1754,7 +1766,7 @@ async def _process_group_subscription(
                         subscription_id=sub.id,
                         chat_ref=chat.chat_ref,
                         chat_id=chat.chat_id,
-                        chat_title=chat.chat_title,
+                        chat_title=_trunc(chat.chat_title, 255),
                         window_start=since_dt,
                         window_end=now_utc,
                         start_message_id=int(oldest_in_chat) if oldest_in_chat else None,
@@ -1812,11 +1824,11 @@ async def _process_group_subscription(
                             subscription_id=sub.id,
                             chat_ref=chat.chat_ref,
                             chat_id=chat.chat_id,
-                            chat_title=chat.chat_title,
+                            chat_title=_trunc(chat.chat_title, 255),
                             message_id=int(mid),
                             message_ts=ts,
                             author_id=author_id,
-                            author_display=author_display,
+                            author_display=_trunc(author_display, 200),
                             excerpt=excerpt,
                             reason=reason,
                             notify_status="queued",
@@ -1830,14 +1842,15 @@ async def _process_group_subscription(
                 chat_per["matches_written"] = written_this_chat
                 total_matches_written += written_this_chat
         except Exception as write_err:
-            chats_failed += 1
-            chat_per["status"] = "failed"
-            chat_per["error_code"] = "DB_WRITE_FAILED"
-            chat_per["error_message"] = (str(write_err) or "")[:300] or None
-            chat_state.last_error = chat_per["error_message"]
-            per_chat_results.append(chat_per)
-            await asyncio.sleep(GROUP_INTER_CHAT_SLEEP_SEC)
-            continue
+            # КРИТИЧНО: НЕ делаем continue. Любая SQL-ошибка от db.execute
+            # отравляет текущую транзакцию, и следующий чат упадёт на
+            # InFailedSQLTransactionError. Пробрасываем наверх — run_tick
+            # сделает rollback всей сессии и retry в следующем тике.
+            print(
+                f"[subscriptions_runner] GROUP sub_id={sub.id} "
+                f"chat={chat.chat_ref} db_write_failed err={write_err}"
+            )
+            raise
 
         # Успешный чат — обновляем курсор и last_success_at.
         if newest_in_chat:
