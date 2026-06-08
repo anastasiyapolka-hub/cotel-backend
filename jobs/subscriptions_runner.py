@@ -146,6 +146,10 @@ def _build_run_success_meta(
         "source_mode": metrics.get("source_mode"),
         "frequency_minutes": metrics.get("frequency_minutes"),
         "ai_model": metrics.get("ai_model"),
+        # tokens_charged уже посчитан в _record_subscription_run_success_same_session
+        # и положен в metrics до вызова этой функции. Кладём его в meta_json, чтобы
+        # история запросов показывала расход по подпискам (иначе в UI прочерк).
+        "tokens_charged": metrics.get("tokens_charged"),
         "messages_fetched_count": metrics.get("messages_fetched_count"),
         "messages_sent_to_llm_count": metrics.get("messages_sent_to_llm_count"),
         "matches_written": metrics.get("matches_written"),

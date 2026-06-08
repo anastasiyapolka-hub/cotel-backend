@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Plan, UsageCounter, UsageEvent, Subscription, User, UserTokenBalance
+from db.models import Plan, UsageCounter, UsageEvent, Subscription, User, UserTokenBalance, TokenTransaction
 
 
 def utc_now() -> datetime:
@@ -1038,6 +1038,31 @@ async def build_usage_snapshot(
     token_monthly_remaining = max(0, token_monthly_granted - token_monthly_used)
     token_total_remaining = token_monthly_remaining + max(0, token_topup_balance)
 
+    # === Разбивка расхода за текущий период: Q&A vs подписки ===
+    # Считаем по token_transactions (списания, delta < 0) с начала периода.
+    # period_start берём из баланса; если строки нет — с начала текущего месяца.
+    if token_balance_row is not None and token_balance_row.period_start is not None:
+        spent_period_start = token_balance_row.period_start
+    else:
+        spent_period_start = month_period_start(now_utc).date()
+
+    spent_qa = 0
+    spent_subscriptions = 0
+    spent_stmt = (
+        select(TokenTransaction.reason, func.sum(TokenTransaction.delta))
+        .where(TokenTransaction.user_id == user.id)
+        .where(TokenTransaction.delta < 0)
+        .where(func.date(TokenTransaction.created_at) >= spent_period_start)
+        .group_by(TokenTransaction.reason)
+    )
+    for reason, delta_sum in (await db.execute(spent_stmt)).all():
+        spent = abs(int(delta_sum or 0))
+        if reason in ("subscription_event", "subscription_digest"):
+            spent_subscriptions += spent
+        elif reason == "qa_request":
+            spent_qa += spent
+        # classifier / прочие списания не относим ни к Q&A, ни к подпискам отдельно
+
     return {
         "plan": {
             "code": plan.code,
@@ -1068,6 +1093,10 @@ async def build_usage_snapshot(
                 "monthly_remaining": token_monthly_remaining,
                 "topup_balance": token_topup_balance,
                 "total_remaining": token_total_remaining,
+                # Разбивка расхода за текущий период для карточки баланса
+                "spent_qa": spent_qa,
+                "spent_subscriptions": spent_subscriptions,
+                "period_start": spent_period_start.isoformat() if spent_period_start else None,
             },
 
             # === DEPRECATED (старые счётчики qa-запросов) ===

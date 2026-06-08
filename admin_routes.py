@@ -36,7 +36,7 @@ from __future__ import annotations
 import hashlib
 import os
 import traceback
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Any, Optional
 
 import sqlalchemy as sa
@@ -51,9 +51,11 @@ from db.models import (
     MatchEvent, DigestEvent,
     BotUserLink, Session as WebSession, TelegramSession,
     UsageCounter, UsageEvent, Plan, LLMPricing,
+    TokenTransaction, UserTokenBalance, UserQueryLog,
 )
 from db.session import get_db
 from llm.pricing import invalidate_pricing_cache
+import billing
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -381,6 +383,17 @@ async def admin_list_users(
     total_res = await db.execute(select(func.count()).select_from(User))
     total = int(total_res.scalar_one() or 0)
 
+    # Баланс токенов для всех пользователей страницы — одним запросом, без N+1.
+    user_ids = [int(u.id) for u in users]
+    token_remaining_by_user: dict[int, int] = {}
+    if user_ids:
+        bal_rows = (await db.execute(
+            select(UserTokenBalance).where(UserTokenBalance.user_id.in_(user_ids))
+        )).scalars().all()
+        for b in bal_rows:
+            monthly_rem = max(0, int(b.monthly_granted) - int(b.monthly_used))
+            token_remaining_by_user[int(b.user_id)] = monthly_rem + max(0, int(b.topup_balance))
+
     items: list[dict[str, Any]] = []
     for u in users:
         items.append(
@@ -389,6 +402,8 @@ async def admin_list_users(
                 "email": u.email,
                 "plan": u.plan,
                 "is_active": bool(u.is_active),
+                # None = строки баланса нет (аномалия). UI покажет «—» / флажок.
+                "token_remaining": token_remaining_by_user.get(int(u.id)),
 
                 "created_at": _iso(u.created_at),
                 "last_login_at": _iso(u.last_login_at),
@@ -764,6 +779,73 @@ async def _section_recent_usage_events(db: AsyncSession, user_id_int: int) -> li
     return out
 
 
+async def _section_tokens(db: AsyncSession, user_id_int: int) -> dict[str, Any]:
+    """Токенный баланс пользователя + разбивка расхода за текущий период.
+
+    Источник: user_token_balances (баланс) + token_transactions (разбивка
+    списаний по reason с начала периода). Если строки баланса нет — это
+    аномалия (баланс не создался при регистрации), сигналим через _errors.
+    """
+    errors: list[str] = []
+    try:
+        bal = (await db.execute(
+            select(UserTokenBalance).where(UserTokenBalance.user_id == user_id_int)
+        )).scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{user_id_int}] tokens balance fetch failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        return {"_errors": ["BALANCE_FETCH_FAILED"]}
+
+    if bal is None:
+        return {
+            "monthly_granted": 0,
+            "monthly_used": 0,
+            "monthly_remaining": 0,
+            "topup_balance": 0,
+            "total_remaining": 0,
+            "period_start": None,
+            "spent_this_month": {},
+            "_errors": ["NO_BALANCE_ROW"],
+        }
+
+    monthly_granted = int(bal.monthly_granted)
+    monthly_used = int(bal.monthly_used)
+    topup_balance = int(bal.topup_balance)
+    monthly_remaining = max(0, monthly_granted - monthly_used)
+    total_remaining = monthly_remaining + max(0, topup_balance)
+    period_start = bal.period_start
+
+    spent_this_month: dict[str, int] = {}
+    try:
+        spent_stmt = (
+            select(TokenTransaction.reason, func.sum(TokenTransaction.delta))
+            .where(TokenTransaction.user_id == user_id_int)
+            .where(TokenTransaction.delta < 0)
+        )
+        if period_start is not None:
+            spent_stmt = spent_stmt.where(func.date(TokenTransaction.created_at) >= period_start)
+        spent_stmt = spent_stmt.group_by(TokenTransaction.reason)
+        for reason, delta_sum in (await db.execute(spent_stmt)).all():
+            spent_this_month[str(reason)] = abs(int(delta_sum or 0))
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{user_id_int}] tokens spent breakdown failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        errors.append("SPENT_BREAKDOWN_FAILED")
+
+    return {
+        "monthly_granted": monthly_granted,
+        "monthly_used": monthly_used,
+        "monthly_remaining": monthly_remaining,
+        "topup_balance": topup_balance,
+        "total_remaining": total_remaining,
+        "period_start": period_start.isoformat() if period_start else None,
+        "spent_this_month": spent_this_month,
+        "_errors": errors,
+    }
+
+
 @router.get("/users/{user_id}")
 async def admin_user_detail(
     user_id: int,
@@ -806,6 +888,7 @@ async def admin_user_detail(
     }
 
     usage_summary = await _section_usage_summary(db, user_id_int)
+    tokens = await _section_tokens(db, user_id_int)
     telegram = await _section_telegram(db, user_id_int)
     subs = await _section_subscriptions(db, user_id_int)
     recent = await _section_recent_usage_events(db, user_id_int)
@@ -813,6 +896,7 @@ async def admin_user_detail(
     return {
         "profile": profile,
         "usage_summary": usage_summary,
+        "tokens": tokens,
         "telegram": telegram,
         "subscriptions": subs,
         "recent_usage_events": recent,
@@ -997,6 +1081,17 @@ async def admin_list_subscriptions(
         )).scalar_one_or_none()
         last_run_cost = float(last_run_cost_val) if last_run_cost_val is not None else None
 
+        # Расход в НАШИХ токенах по этой подписке: суммируем списания из
+        # token_transactions, связанные с usage_events этой подписки.
+        tokens_spent_val = (await db.execute(
+            select(func.sum(TokenTransaction.delta))
+            .select_from(TokenTransaction)
+            .join(UsageEvent, UsageEvent.id == TokenTransaction.related_event_id)
+            .where(UsageEvent.subscription_id == sub.id)
+            .where(TokenTransaction.delta < 0)
+        )).scalar_one_or_none()
+        tokens_spent_total = abs(int(tokens_spent_val)) if tokens_spent_val is not None else 0
+
         items.append({
             "id": int(sub.id),
             "owner_user_id": int(sub.owner_user_id) if sub.owner_user_id is not None else None,
@@ -1035,6 +1130,7 @@ async def admin_list_subscriptions(
             "last_run_event_at": _iso(last_run),
             "last_run_estimated_cost_usd": last_run_cost,
             "total_estimated_cost_usd": total_cost,
+            "tokens_spent_total": tokens_spent_total,
             # prompt NEVER returned
         })
 
@@ -1286,3 +1382,312 @@ async def admin_update_pricing(
     invalidate_pricing_cache()
 
     return _serialize_pricing(row, updater_email=admin.email)
+
+
+# ---------------------------------------------------------------------------
+# Токены: журнал транзакций пользователя
+# ---------------------------------------------------------------------------
+
+def _serialize_token_transaction(tx: TokenTransaction) -> dict[str, Any]:
+    """Проекция TokenTransaction в admin-шейп. meta_json отдаём как есть —
+    там нет текста запроса (только snapshot модели/цены/служебные поля)."""
+    return {
+        "id": int(tx.id),
+        "created_at": _iso(tx.created_at),
+        "delta": int(tx.delta),
+        "reason": tx.reason,
+        "related_event_id": int(tx.related_event_id) if tx.related_event_id is not None else None,
+        "meta": _jsonable(tx.meta_json or {}),
+    }
+
+
+@router.get("/users/{user_id}/token-transactions")
+async def admin_user_token_transactions(
+    user_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    reason: Optional[str] = Query(default=None),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Журнал движений токенов пользователя. Сортировка от свежих к старым.
+    Опциональный фильтр по reason (одна из констант billing.REASON_*)."""
+    base = select(TokenTransaction).where(TokenTransaction.user_id == user_id)
+    count_base = (
+        select(func.count()).select_from(TokenTransaction)
+        .where(TokenTransaction.user_id == user_id)
+    )
+    if reason:
+        base = base.where(TokenTransaction.reason == reason)
+        count_base = count_base.where(TokenTransaction.reason == reason)
+
+    rows = (await db.execute(
+        base.order_by(TokenTransaction.created_at.desc()).limit(limit).offset(offset)
+    )).scalars().all()
+    total = int((await db.execute(count_base)).scalar_one() or 0)
+
+    return {
+        "items": [_serialize_token_transaction(tx) for tx in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Токены: ручная коррекция баланса
+# ---------------------------------------------------------------------------
+
+class TokenAdjustBody(BaseModel):
+    delta: int = Field(..., description="Положительное = начислить, отрицательное = снять. != 0")
+    bucket: str = Field(..., description="'monthly' или 'topup'")
+    note: str = Field(..., min_length=1, description="Обязательное пояснение для аудита")
+
+
+@router.post("/users/{user_id}/token-adjust")
+async def admin_user_token_adjust(
+    user_id: int,
+    body: TokenAdjustBody,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Ручная коррекция баланса. Обвязка над billing.admin_adjust:
+    валидирует вход, вызывает биллинг, коммитит, возвращает свежий снапшот.
+    Каждая правка пишется в token_transactions с reason=admin_adjustment и
+    admin_user_id в meta — это наш аудит-след."""
+    if body.delta == 0:
+        raise HTTPException(status_code=400, detail={"code": "DELTA_ZERO"})
+    if body.bucket not in ("monthly", "topup"):
+        raise HTTPException(status_code=400, detail={"code": "BAD_BUCKET"})
+    if not (body.note or "").strip():
+        raise HTTPException(status_code=400, detail={"code": "NOTE_REQUIRED"})
+
+    result = await billing.admin_adjust(
+        db,
+        user_id=user_id,
+        delta=int(body.delta),
+        bucket=body.bucket,
+        note=body.note.strip(),
+        admin_user_id=int(admin.id),
+    )
+    if result is None:
+        await _safe_rollback(db)
+        raise HTTPException(status_code=404, detail={"code": "NO_BALANCE_ROW"})
+
+    await db.commit()
+
+    return {
+        "monthly_granted": result.monthly_granted,
+        "monthly_used": result.monthly_used,
+        "monthly_remaining": result.monthly_remaining,
+        "topup_balance": result.topup_balance,
+        "total_remaining": result.total_remaining,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Журнал текстов запросов (приватность: тексты под флагом окружения)
+# ---------------------------------------------------------------------------
+
+def _admin_show_query_text() -> bool:
+    """ADMIN_SHOW_QUERY_TEXT=true включает показ текстов запросов в админке.
+    По умолчанию false — на проде тексты скрыты, видны только метаданные."""
+    return str(os.getenv("ADMIN_SHOW_QUERY_TEXT", "")).strip().lower() in ("1", "true", "yes")
+
+
+@router.get("/query-log")
+async def admin_query_log(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user_id: Optional[int] = Query(default=None),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Лог запросов для калибровки роутера. Тексты запросов отдаём только
+    если ADMIN_SHOW_QUERY_TEXT включён; иначе query_text=null, остаются
+    лишь метаданные классификации. Опциональный фильтр по user_id."""
+    show_text = _admin_show_query_text()
+
+    base = select(UserQueryLog)
+    count_base = select(func.count()).select_from(UserQueryLog)
+    if user_id is not None:
+        base = base.where(UserQueryLog.user_id == user_id)
+        count_base = count_base.where(UserQueryLog.user_id == user_id)
+
+    rows = (await db.execute(
+        base.order_by(UserQueryLog.created_at.desc()).limit(limit).offset(offset)
+    )).scalars().all()
+    total = int((await db.execute(count_base)).scalar_one() or 0)
+
+    items = []
+    for q in rows:
+        items.append({
+            "id": int(q.id),
+            "created_at": _iso(q.created_at),
+            "user_id": int(q.user_id),
+            "query_text": q.query_text if show_text else None,
+            "detected_category": q.detected_category,
+            "final_category": q.final_category,
+            "detected_confidence": float(q.detected_confidence) if q.detected_confidence is not None else None,
+            "selected_tier": q.selected_tier,
+            "selected_model": q.selected_model,
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "query_text_visible": show_text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Аналитика по моделям и тарифам
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/models")
+async def admin_analytics_models(
+    days: int = Query(default=30, ge=1, le=365),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Эффективность роутера за период. Источник — usage_events (used_model,
+    tokens_charged, was_fallback) + user_query_log (категория, уверенность).
+
+    Агрегация в Python по ограниченной выборке за период — для MVP-объёмов
+    надёжнее SQL-каста JSONB и устойчиво к отсутствию ключей в meta."""
+    since = _utc_now() - timedelta(days=days)
+
+    rows = (await db.execute(
+        select(UsageEvent)
+        .where(UsageEvent.created_at >= since)
+        .where(UsageEvent.event_type.in_([
+            "qa_request_success", "subscription_run_success",
+        ]))
+    )).scalars().all()
+
+    by_model: dict[str, dict[str, Any]] = {}
+    fallback_events = 0
+    for ev in rows:
+        m = _jsonable(ev.meta_json or {})
+        model = m.get("used_model") or m.get("ai_model") or "—"
+        bucket = by_model.setdefault(model, {
+            "model": model, "requests": 0, "tokens_charged_sum": 0, "_fallbacks": 0,
+        })
+        bucket["requests"] += 1
+        tc = m.get("tokens_charged")
+        if isinstance(tc, (int, float)):
+            bucket["tokens_charged_sum"] += int(tc)
+        if m.get("was_fallback"):
+            bucket["_fallbacks"] += 1
+            fallback_events += 1
+
+    by_model_list = []
+    for b in by_model.values():
+        reqs = b["requests"] or 1
+        by_model_list.append({
+            "model": b["model"],
+            "requests": b["requests"],
+            "tokens_charged_sum": b["tokens_charged_sum"],
+            "avg_tokens_per_request": round(b["tokens_charged_sum"] / reqs, 1),
+            "fallback_rate": round(b["_fallbacks"] / reqs, 3),
+        })
+    by_model_list.sort(key=lambda x: x["requests"], reverse=True)
+
+    # Категории + средняя уверенность из user_query_log
+    qrows = (await db.execute(
+        select(UserQueryLog).where(UserQueryLog.created_at >= since)
+    )).scalars().all()
+    by_cat: dict[str, dict[str, Any]] = {}
+    for q in qrows:
+        cat = q.final_category or q.detected_category or "—"
+        c = by_cat.setdefault(cat, {"category": cat, "requests": 0, "_conf_sum": 0.0, "_conf_n": 0})
+        c["requests"] += 1
+        if q.detected_confidence is not None:
+            c["_conf_sum"] += float(q.detected_confidence)
+            c["_conf_n"] += 1
+    by_category = [{
+        "category": c["category"],
+        "requests": c["requests"],
+        "avg_confidence": round(c["_conf_sum"] / c["_conf_n"], 2) if c["_conf_n"] else None,
+    } for c in by_cat.values()]
+    by_category.sort(key=lambda x: x["requests"], reverse=True)
+
+    return {
+        "period_days": days,
+        "by_model": by_model_list,
+        "by_category": by_category,
+        "fallback_events": fallback_events,
+    }
+
+
+@router.get("/analytics/plans")
+async def admin_analytics_plans(
+    days: int = Query(default=30, ge=1, le=365),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Утилизация и расход по тарифам. Источник: users.plan +
+    user_token_balances (granted/used) + token_transactions (split qa vs subs)."""
+    since = _utc_now() - timedelta(days=days)
+
+    plans = (await db.execute(select(Plan))).scalars().all()
+    plan_tokens_by_code = {str(p.code): int(p.monthly_tokens or 0) for p in plans}
+
+    # Балансы со связкой на план пользователя
+    bal_rows = (await db.execute(
+        select(UserTokenBalance, User.plan)
+        .join(User, User.id == UserTokenBalance.user_id)
+    )).all()
+
+    agg: dict[str, dict[str, Any]] = {}
+    for bal, plan_code in bal_rows:
+        code = str(plan_code or "—")
+        a = agg.setdefault(code, {
+            "plan": code, "users": 0, "_used_sum": 0, "_granted_sum": 0,
+        })
+        a["users"] += 1
+        a["_used_sum"] += int(bal.monthly_used)
+        a["_granted_sum"] += int(bal.monthly_granted)
+
+    # Split qa vs subscriptions за период — по пользователям каждого плана
+    split_stmt = (
+        select(User.plan, TokenTransaction.reason, func.sum(TokenTransaction.delta))
+        .join(TokenTransaction, TokenTransaction.user_id == User.id)
+        .where(TokenTransaction.delta < 0)
+        .where(TokenTransaction.created_at >= since)
+        .group_by(User.plan, TokenTransaction.reason)
+    )
+    split_by_plan: dict[str, dict[str, int]] = {}
+    for plan_code, reason, delta_sum in (await db.execute(split_stmt)).all():
+        code = str(plan_code or "—")
+        spent = abs(int(delta_sum or 0))
+        sp = split_by_plan.setdefault(code, {"qa": 0, "subscriptions": 0, "other": 0})
+        if reason == "qa_request":
+            sp["qa"] += spent
+        elif reason in ("subscription_event", "subscription_digest"):
+            sp["subscriptions"] += spent
+        else:
+            sp["other"] += spent
+
+    by_plan = []
+    for code, a in agg.items():
+        users = a["users"] or 1
+        granted_sum = a["_granted_sum"] or 0
+        avg_used = round(a["_used_sum"] / users, 1)
+        utilization = round(100 * a["_used_sum"] / granted_sum, 1) if granted_sum else None
+        sp = split_by_plan.get(code, {"qa": 0, "subscriptions": 0, "other": 0})
+        total_spent = sp["qa"] + sp["subscriptions"] + sp["other"]
+        by_plan.append({
+            "plan": code,
+            "users": a["users"],
+            "monthly_tokens_each": plan_tokens_by_code.get(code),
+            "avg_monthly_used": avg_used,
+            "utilization_pct": utilization,
+            "total_tokens_spent": total_spent,
+            "split": sp,
+        })
+    by_plan.sort(key=lambda x: x["users"], reverse=True)
+
+    return {"period_days": days, "by_plan": by_plan}

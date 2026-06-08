@@ -53,6 +53,8 @@ from db.models import (
     UsageCounter,
     UsageEvent,
     UserQueryLog,
+    TokenTransaction,
+    UserTokenBalance,
 )
 
 from db.session import get_db
@@ -368,9 +370,33 @@ async def get_account_usage_history(
 
     rows = (await db.execute(stmt)).scalars().all()
 
+    # Подстраховка для старых записей, у которых tokens_charged не попал в
+    # meta_json (например, подписочные события до фикса _build_run_success_meta).
+    # Фактическое списание лежит в token_transactions.related_event_id — берём
+    # его одним батч-запросом и подставляем там, где meta пустая.
+    event_ids = [int(ev.id) for ev in rows]
+    charged_by_event: dict[int, int] = {}
+    if event_ids:
+        tx_stmt = (
+            select(
+                TokenTransaction.related_event_id,
+                sa.func.sum(TokenTransaction.delta),
+            )
+            .where(TokenTransaction.user_id == user.id)
+            .where(TokenTransaction.related_event_id.in_(event_ids))
+            .group_by(TokenTransaction.related_event_id)
+        )
+        for related_id, delta_sum in (await db.execute(tx_stmt)).all():
+            if related_id is not None:
+                # delta списания отрицательная — отдаём положительное число
+                charged_by_event[int(related_id)] = abs(int(delta_sum or 0))
+
     items: list[dict] = []
     for ev in rows:
         meta = ev.meta_json or {}
+        tokens_charged = meta.get("tokens_charged")
+        if tokens_charged is None:
+            tokens_charged = charged_by_event.get(int(ev.id))
         items.append({
             "id": int(ev.id),
             "created_at": ev.created_at.isoformat() if ev.created_at else None,
@@ -379,8 +405,8 @@ async def get_account_usage_history(
             "source_mode": ev.source_mode,
             "chat_ref": ev.chat_ref,
             "subscription_id": ev.subscription_id,
-            # Поля из meta_json (могут отсутствовать на старых записях)
-            "tokens_charged": meta.get("tokens_charged"),
+            # tokens_charged: сначала из meta_json, иначе из token_transactions
+            "tokens_charged": tokens_charged,
             "used_model": (
                 meta.get("used_model")
                 or meta.get("ai_model")  # legacy fallback
