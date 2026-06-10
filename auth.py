@@ -2,8 +2,9 @@
 import os
 import re
 import hashlib
+import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ from passlib.context import CryptContext
 from db.session import get_db
 from db.models import (
     User,
+    Plan,
     EmailVerificationCode,
     PasswordResetCode,
     Session,
@@ -34,8 +36,11 @@ from db.models import (
     UsageEvent,
 )
 
+import billing
 from email_service import send_verification_email, send_password_reset_email
 from telegram_service import logout_telegram
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -409,6 +414,30 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail="EMAIL_ALREADY_EXISTS")
+
+    # === Токенный баланс нового пользователя ===
+    # Без этой записи пользователь не может делать запросы (check_can_spend
+    # возвращает False) и не видит начисленных токенов. Создаём строку в
+    # user_token_balances с начальным грантом по тарифу free и пишем
+    # транзакцию registration_grant. См. architecture-router-and-credits.md 2.4.
+    try:
+        plan_row = (
+            await db.execute(select(Plan).where(Plan.code == user.plan))
+        ).scalar_one_or_none()
+        plan_monthly_tokens = int(plan_row.monthly_tokens or 0) if plan_row else 0
+        now = _now()
+        await billing.ensure_token_balance(
+            db,
+            user_id=user.id,
+            plan_monthly_tokens=plan_monthly_tokens,
+            period_start=date(now.year, now.month, 1),
+        )
+        await db.commit()
+    except Exception:
+        # Не валим регистрацию из-за гранта — self-heal в горячем пути
+        # запросов добьёт баланс позже. Но логируем как аномалию.
+        await db.rollback()
+        log.exception("register.token_balance_create_failed user_id=%s", user.id)
 
     # создаём код
     code = _make_email_code()

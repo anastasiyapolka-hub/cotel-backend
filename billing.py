@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import sqlalchemy as sa
@@ -49,6 +49,10 @@ REASON_MONTHLY_GRANT = "monthly_grant"
 REASON_TOPUP_PURCHASE = "topup_purchase"
 REASON_REFUND = "refund"
 REASON_ADMIN_ADJUSTMENT = "admin_adjustment"
+# Смена тарифа: ресет месячного гранта до нового порога (см. apply_plan_change).
+REASON_PLAN_CHANGE = "plan_change"
+# Начальный грант при регистрации (см. ensure_token_balance).
+REASON_REGISTRATION_GRANT = "registration_grant"
 
 ALL_REASONS = frozenset({
     REASON_QA_REQUEST,
@@ -59,6 +63,8 @@ ALL_REASONS = frozenset({
     REASON_TOPUP_PURCHASE,
     REASON_REFUND,
     REASON_ADMIN_ADJUSTMENT,
+    REASON_PLAN_CHANGE,
+    REASON_REGISTRATION_GRANT,
 })
 
 
@@ -169,15 +175,40 @@ async def check_can_spend(
     """
     balance = await get_balance(db, user_id=user_id)
     if balance is None:
+        # Self-heal: у пользователя нет строки баланса (старый/сломанный
+        # аккаунт, у которого регистрация не создала баланс). Создаём её
+        # с грантом по текущему тарифу, чтобы пользователь мог работать.
         log.error(
-            "billing.no_balance_row user_id=%s — должна быть создана при регистрации",
+            "billing.no_balance_row user_id=%s — self-heal по тарифу",
             user_id,
         )
-        return False, TokenBalance(monthly_granted=0, monthly_used=0, topup_balance=0)
+        plan_tokens = await _user_plan_monthly_tokens(db, user_id=user_id)
+        now = datetime.now(timezone.utc)
+        await ensure_token_balance(
+            db,
+            user_id=user_id,
+            plan_monthly_tokens=plan_tokens,
+            period_start=date(now.year, now.month, 1),
+        )
+        balance = await get_balance(db, user_id=user_id)
+        if balance is None:
+            return False, TokenBalance(monthly_granted=0, monthly_used=0, topup_balance=0)
 
     floor = MIN_TOKENS_PER_TIER.get(tier, MIN_TOKENS_PER_TIER["light"])
     can_spend = balance.total_remaining >= floor
     return can_spend, balance
+
+
+async def _user_plan_monthly_tokens(db: AsyncSession, *, user_id: int) -> int:
+    """Вернуть plan.monthly_tokens для тарифа пользователя (0 если не найден)."""
+    stmt = (
+        select(Plan.monthly_tokens)
+        .select_from(User)
+        .join(Plan, Plan.code == User.plan)
+        .where(User.id == user_id)
+    )
+    row = (await db.execute(stmt)).scalar_one_or_none()
+    return int(row or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +405,154 @@ async def grant_monthly(
         related_event_id=None,
         meta_json={"period_start": period_start.isoformat()},
     ))
+
+
+# ---------------------------------------------------------------------------
+# 5b. ensure_token_balance — создать баланс если его нет (регистрация / self-heal)
+# ---------------------------------------------------------------------------
+
+
+async def ensure_token_balance(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    plan_monthly_tokens: int,
+    period_start: date,
+    reason: str = REASON_REGISTRATION_GRANT,
+) -> UserTokenBalance:
+    """
+    Гарантировать, что у пользователя есть строка в user_token_balances.
+
+    Если строка УЖЕ есть — ничего не меняем (никаких ресетов monthly_used,
+    чтобы не стереть текущий расход) и просто возвращаем её. Это делает
+    функцию идемпотентной и безопасной для self-heal в горячем пути.
+
+    Если строки НЕТ — создаём с начальным грантом monthly_granted =
+    plan_monthly_tokens, monthly_used = 0, topup_balance = 0 и пишем
+    транзакцию (по умолчанию reason='registration_grant').
+
+    Используется:
+      - при регистрации нового пользователя (auth.register);
+      - как self-heal в горячем пути запросов для пользователей, у которых
+        баланс по какой-то причине не создался (старые/сломанные аккаунты).
+
+    НЕ делает commit — коммитит вызывающий код.
+    """
+    stmt = (
+        select(UserTokenBalance)
+        .where(UserTokenBalance.user_id == user_id)
+        .with_for_update()
+    )
+    balance_row = (await db.execute(stmt)).scalar_one_or_none()
+    if balance_row is not None:
+        return balance_row
+
+    granted = max(0, int(plan_monthly_tokens))
+    balance_row = UserTokenBalance(
+        user_id=user_id,
+        period_start=period_start,
+        monthly_granted=granted,
+        monthly_used=0,
+        topup_balance=0,
+    )
+    db.add(balance_row)
+
+    if granted > 0:
+        db.add(TokenTransaction(
+            user_id=user_id,
+            delta=granted,
+            reason=reason,
+            related_event_id=None,
+            meta_json={"period_start": period_start.isoformat()},
+        ))
+
+    log.info("billing.ensure_balance_created user_id=%s tokens=%s reason=%s",
+             user_id, granted, reason)
+    return balance_row
+
+
+# ---------------------------------------------------------------------------
+# 5c. apply_plan_change — пересчёт токенов при смене тарифа
+# ---------------------------------------------------------------------------
+
+
+async def apply_plan_change(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    new_plan_monthly_tokens: int,
+    period_start: date,
+    old_plan_code: Optional[str] = None,
+    new_plan_code: Optional[str] = None,
+) -> Optional[TokenBalance]:
+    """
+    Применить смену тарифа к токенному балансу пользователя.
+
+    Поведение (согласовано с задачей): при любой смене тарифа — и апгрейде,
+    и даунгрейде — месячный грант сбрасывается на порог НОВОГО тарифа:
+      monthly_granted = new_plan_monthly_tokens
+      monthly_used    = 0
+    То есть после смены у пользователя ровно столько токенов, сколько даёт
+    новый тариф (например, даунгрейд до Basic → 3600, сколько бы ни было до
+    этого). topup_balance НЕ трогаем — купленные токены не сгорают.
+
+    period_start выставляем на переданное значение (обычно начало текущего
+    месяца), чтобы месячный cron не сделал повторный грант в этом же месяце.
+
+    Пишет транзакцию reason='plan_change' с delta = +new_plan_monthly_tokens
+    и meta со старым/новым тарифом для аудита.
+
+    Если строки баланса нет — создаём (через ту же логику, что
+    ensure_token_balance, но с гарантированным ресетом до нового порога).
+
+    НЕ делает commit.
+    """
+    granted = max(0, int(new_plan_monthly_tokens))
+
+    stmt = (
+        select(UserTokenBalance)
+        .where(UserTokenBalance.user_id == user_id)
+        .with_for_update()
+    )
+    balance_row = (await db.execute(stmt)).scalar_one_or_none()
+
+    if balance_row is None:
+        balance_row = UserTokenBalance(
+            user_id=user_id,
+            period_start=period_start,
+            monthly_granted=granted,
+            monthly_used=0,
+            topup_balance=0,
+        )
+        db.add(balance_row)
+    else:
+        balance_row.period_start = period_start
+        balance_row.monthly_granted = granted
+        balance_row.monthly_used = 0
+        # topup_balance не трогаем
+
+    db.add(TokenTransaction(
+        user_id=user_id,
+        delta=granted,
+        reason=REASON_PLAN_CHANGE,
+        related_event_id=None,
+        meta_json={
+            "old_plan": old_plan_code,
+            "new_plan": new_plan_code,
+            "period_start": period_start.isoformat(),
+        },
+    ))
+
+    log.info(
+        "billing.plan_change user_id=%s old=%s new=%s granted=%s",
+        user_id, old_plan_code, new_plan_code, granted,
+    )
+
+    return TokenBalance(
+        monthly_granted=int(balance_row.monthly_granted),
+        monthly_used=int(balance_row.monthly_used),
+        topup_balance=int(balance_row.topup_balance),
+    )
 
 
 # ---------------------------------------------------------------------------

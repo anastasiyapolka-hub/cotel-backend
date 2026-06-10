@@ -6,13 +6,14 @@ from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 from diagnostics import router as diagnostics_router
 
 import os
+import math
 import logging
 import httpx
 import json
 import hashlib
 import secrets
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 import time
 import sqlalchemy as sa
 import re
@@ -68,7 +69,7 @@ from service_account_admin_routes import router as service_account_admin_router
 from admin_routes import router as admin_router
 
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 from telegram_service import (
     send_login_code,
@@ -592,6 +593,23 @@ async def change_account_plan(
         )
     )
 
+    # === Токенный баланс под новый тариф ===
+    # При смене тарифа месячный грант пересчитывается на порог нового
+    # тарифа, а monthly_used обнуляется. То есть после апгрейда пользователь
+    # сразу получает увеличенный лимит, после даунгрейда — ровно столько,
+    # сколько даёт новый тариф (например, Basic → 3600), независимо от
+    # текущего остатка. topup_balance не трогаем — купленные токены не
+    # сгорают. См. billing.apply_plan_change.
+    now_utc = datetime.now(timezone.utc)
+    await billing.apply_plan_change(
+        db,
+        user_id=user.id,
+        new_plan_monthly_tokens=int(plan_row.monthly_tokens or 0),
+        period_start=date(now_utc.year, now_utc.month, 1),
+        old_plan_code=old_plan,
+        new_plan_code=target_plan,
+    )
+
     db.add(
         UsageEvent(
             user_id=user.id,
@@ -600,6 +618,7 @@ async def change_account_plan(
             meta_json={
                 "old_plan": old_plan,
                 "new_plan": target_plan,
+                "new_monthly_tokens": int(plan_row.monthly_tokens or 0),
             },
         )
     )
@@ -2236,6 +2255,18 @@ def _drop_none(d: dict) -> dict:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _media_filter_fee_days(*, period_seconds: Optional[int], days: int) -> int:
+    """
+    Кол-во "дней" для фиксированной платы за медиафильтр без LLM.
+
+    Правило: один день (или любой период меньше дня) считается за 1.
+    7 дней → 7. period_seconds (если задан) имеет приоритет над days.
+    """
+    if period_seconds is not None and int(period_seconds) > 0:
+        return max(1, math.ceil(int(period_seconds) / 86400.0))
+    return max(1, int(days or 1))
+
+
 async def _handle_media_filter_branch(
     db: AsyncSession,
     *,
@@ -2299,12 +2330,34 @@ async def _handle_media_filter_branch(
     used_models = result.billing.used_models
     primary_model_slug = used_models[0] if used_models else None
 
+    # === Сколько токенов списать ===
+    # Умный медиафильтр без пользовательского запроса вообще не дёргает LLM
+    # (parser/reranker не вызываются) → result.tokens_charged == 0. Но сервис
+    # всё равно выполняет работу (читает Telegram, фильтрует), поэтому за
+    # такие запросы берём фиксированную плату: кол-во чатов × кол-во дней
+    # (минимум 1). Если LLM вызывался хотя бы раз — берём фактическую
+    # стоимость по моделям, как раньше.
+    llm_call_count = len(result.llm_results)
+    if llm_call_count == 0:
+        fee_days = _media_filter_fee_days(period_seconds=period_seconds, days=days)
+        num_chats = max(1, len(chat_links))
+        tokens_to_charge = max(1, num_chats * fee_days)
+        flat_fee_applied = True
+    else:
+        fee_days = None
+        num_chats = len(chat_links)
+        tokens_to_charge = int(result.tokens_charged)
+        flat_fee_applied = False
+
     meta: dict = {
         "depth": depth,
         "requested_days": days,
         "query_chars": query_chars,
         "messages_fetched_count": sum(c.fetched_count for c in result.run.chats),
-        "tokens_charged": result.tokens_charged,
+        "tokens_charged": tokens_to_charge,
+        "media_filter_flat_fee": flat_fee_applied,
+        "media_filter_flat_fee_days": fee_days,
+        "media_filter_flat_fee_chats": num_chats if flat_fee_applied else None,
         "duration_ms_total": total_ms,
         "is_media_filter": True,
         "media_filter_per_model": result.billing.per_model,
@@ -2341,22 +2394,26 @@ async def _handle_media_filter_branch(
     usage_event_id = int(event.id)
 
     # --- billing.debit (одна транзакция на запрос; токены суммированы
-    #     по всем LLM-вызовам через compute_billing) ---
-    if result.tokens_charged > 0:
+    #     по всем LLM-вызовам через compute_billing, либо фиксированная
+    #     плата за медиафильтр без LLM) ---
+    if tokens_to_charge > 0:
         await billing.debit(
             db,
             user_id=user.id,
-            amount=result.tokens_charged,
+            amount=tokens_to_charge,
             reason=billing.REASON_QA_REQUEST,
             related_event_id=usage_event_id,
             meta={
                 "is_media_filter": True,
+                "media_filter_flat_fee": flat_fee_applied,
+                "media_filter_flat_fee_days": fee_days,
+                "media_filter_flat_fee_chats": num_chats if flat_fee_applied else None,
                 "used_models": used_models,
                 "per_model_tokens": result.billing.per_model,
                 "input_tokens": result.billing.raw_input_tokens,
                 "output_tokens": result.billing.raw_output_tokens,
                 "thinking_tokens": result.billing.raw_thinking_tokens,
-                "tokens_charged": result.tokens_charged,
+                "tokens_charged": tokens_to_charge,
             },
         )
 
@@ -2378,6 +2435,9 @@ async def _handle_media_filter_branch(
     response = dict(result.response_dict)
     response["status"] = "ok"
     response["source_mode"] = source_mode
+    # Перекрываем tokens_charged итоговой суммой (важно для случая
+    # фиксированной платы без LLM — иначе фронт покажет "Списано: 0").
+    response["tokens_charged"] = tokens_to_charge
     response["usage"] = await build_usage_snapshot(db, user=user)
     return response
 
