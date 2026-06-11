@@ -57,11 +57,13 @@ from db.models import (
     UserQueryLog,
     TokenTransaction,
     UserTokenBalance,
+    SavedQuery,
 )
 
 from db.session import get_db
 from auth import get_current_user as auth_get_current_user
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
+from schemas.saved_queries import SavedQueryCreate, SavedQueryUpdate, SavedQueryOut
 from pydantic import BaseModel
 from typing import Literal, List, Optional
 from email_service import send_feedback_email, FEEDBACK_RECIPIENT_EMAIL
@@ -3543,7 +3545,7 @@ async def toggle_subscription(
             lang = str(user.language or "en").lower()
             if lang.startswith("ru"):
                 msg = "Недостаточно токенов для запуска подписки. " + (
-                    "Докупите токены или перейдите на более широкий тариф."
+                    "Докупите токены или перейдите на расширенный тариф."
                     if topup_enabled
                     else "Перейдите на платный тариф, чтобы запускать подписки."
                 )
@@ -3859,6 +3861,156 @@ async def switch_subscription_mode(
     await db.commit()
     await db.refresh(sub)
     return _serialize_subscription(sub, chats=None)
+
+
+# ---------------------------------------------------------------------------
+# Сохранённые запросы (пресеты) — saved_queries
+# ---------------------------------------------------------------------------
+# Привязаны к пользователю. Хранят имя + params_json (снапшот настроек формы
+# запроса). Фронт сериализует настройки в params_json и defensive-парсит их
+# обратно при применении. Лимит на количество — защита от абьюза.
+
+SAVED_QUERIES_MAX_PER_USER = 50
+
+
+@app.get("/saved-queries", response_model=list[SavedQueryOut])
+async def list_saved_queries(
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Список пресетов пользователя. Сортировка: недавно использованные
+    сверху (last_used_at desc, NULL — в конец), затем по дате создания."""
+    stmt = (
+        select(SavedQuery)
+        .where(SavedQuery.user_id == user.id)
+        .order_by(
+            SavedQuery.last_used_at.desc().nullslast(),
+            SavedQuery.created_at.desc(),
+        )
+    )
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
+@app.post("/saved-queries", response_model=SavedQueryOut, status_code=201)
+async def create_saved_query(
+    payload: SavedQueryCreate,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="SAVED_QUERY_NAME_EMPTY")
+
+    count_res = await db.execute(
+        select(sa.func.count())
+        .select_from(SavedQuery)
+        .where(SavedQuery.user_id == user.id)
+    )
+    if int(count_res.scalar() or 0) >= SAVED_QUERIES_MAX_PER_USER:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SAVED_QUERIES_LIMIT_REACHED",
+                "message": (
+                    f"Достигнут лимит сохранённых запросов "
+                    f"({SAVED_QUERIES_MAX_PER_USER}). Удалите ненужные."
+                ),
+                "limit": SAVED_QUERIES_MAX_PER_USER,
+            },
+        )
+
+    sq = SavedQuery(user_id=user.id, name=name, params_json=payload.params_json)
+    db.add(sq)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SAVED_QUERY_NAME_TAKEN",
+                "message": "Запрос с таким названием уже сохранён.",
+            },
+        )
+    await db.refresh(sq)
+    return sq
+
+
+@app.put("/saved-queries/{saved_query_id}", response_model=SavedQueryOut)
+async def update_saved_query(
+    saved_query_id: int,
+    payload: SavedQueryUpdate,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(SavedQuery).where(SavedQuery.id == saved_query_id))
+    sq = res.scalar_one_or_none()
+    if not sq:
+        raise HTTPException(status_code=404, detail="SAVED_QUERY_NOT_FOUND")
+    if sq.user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    if payload.name is not None:
+        new_name = payload.name.strip()
+        if not new_name:
+            raise HTTPException(status_code=422, detail="SAVED_QUERY_NAME_EMPTY")
+        sq.name = new_name
+    if payload.params_json is not None:
+        sq.params_json = payload.params_json
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SAVED_QUERY_NAME_TAKEN",
+                "message": "Запрос с таким названием уже сохранён.",
+            },
+        )
+    await db.refresh(sq)
+    return sq
+
+
+@app.post("/saved-queries/{saved_query_id}/touch", response_model=SavedQueryOut)
+async def touch_saved_query(
+    saved_query_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Отметить пресет применённым — обновляет last_used_at для сортировки
+    «недавние». Вызывается фронтом при выборе пресета."""
+    res = await db.execute(select(SavedQuery).where(SavedQuery.id == saved_query_id))
+    sq = res.scalar_one_or_none()
+    if not sq:
+        raise HTTPException(status_code=404, detail="SAVED_QUERY_NOT_FOUND")
+    if sq.user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    sq.last_used_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(sq)
+    return sq
+
+
+@app.delete("/saved-queries/{saved_query_id}")
+async def delete_saved_query(
+    saved_query_id: int,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(SavedQuery).where(SavedQuery.id == saved_query_id))
+    sq = res.scalar_one_or_none()
+    if not sq:
+        raise HTTPException(status_code=404, detail="SAVED_QUERY_NOT_FOUND")
+    if sq.user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    await db.delete(sq)
+    await db.commit()
+    return {"ok": True}
 
 
 @app.post("/tg/bot/dispatch")

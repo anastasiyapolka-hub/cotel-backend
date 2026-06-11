@@ -52,13 +52,34 @@ STATUS_NO_TOKENS = "no_tokens"
 STATUS_ACTIVE = "active"
 
 
-def _next_monthly_grant_date(now_utc: datetime) -> date:
-    """Первое число СЛЕДУЮЩЕГО месяца UTC — когда придёт месячный грант."""
-    year = now_utc.year
-    month = now_utc.month
+def _first_of_next_month(d: date | datetime) -> date:
+    """Первое число месяца, следующего за месяцем переданной даты."""
+    year, month = d.year, d.month
     if month == 12:
         return date(year + 1, 1, 1)
     return date(year, month + 1, 1)
+
+
+def _next_grant_date_for_user(period_start: Optional[date], now_utc: datetime) -> date:
+    """
+    Дата следующего месячного начисления токенов для КОНКРЕТНОГО пользователя.
+
+    Месячный грант идёт кроном 1-го числа каждого месяца (см.
+    monthly_grant_runner). Текущий оплаченный период пользователя начинается
+    с `period_start` (1-е число его текущего месяца, хранится в
+    user_token_balances). Значит следующее начисление — 1-е число месяца,
+    следующего за period_start.
+
+    Если period_start неизвестен или вычисленная дата уже прошла (например,
+    крон отставал) — берём ближайшее 1-е число от текущего момента.
+    """
+    today = now_utc.date()
+    if period_start is None:
+        return _first_of_next_month(now_utc)
+    candidate = _first_of_next_month(period_start)
+    if candidate <= today:
+        candidate = _first_of_next_month(now_utc)
+    return candidate
 
 
 def _fmt_grant_date(d: date, language: str) -> str:
@@ -192,10 +213,12 @@ async def clear_low_balance_notified(db: AsyncSession, *, user_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_low_balance_message(*, language: str, topup_enabled: bool, now_utc: datetime) -> str:
+def _build_low_balance_message(
+    *, language: str, topup_enabled: bool, next_grant_date: date,
+) -> str:
     lang = normalize_language(language)
     title = bot_t("subs_paused_no_tokens_title", lang)
-    grant_date = _fmt_grant_date(_next_monthly_grant_date(now_utc), lang)
+    grant_date = _fmt_grant_date(next_grant_date, lang)
     next_grant = bot_t("subs_paused_no_tokens_next_grant", lang, date=grant_date)
     tail = bot_t(
         "subs_paused_no_tokens_topup" if topup_enabled else "subs_paused_no_tokens_upgrade_only",
@@ -253,6 +276,10 @@ async def notify_low_balance_once(*, user_id: int, now_utc: Optional[datetime] =
         language = (row[0] if row else None) or "en"
         topup_enabled = bool(row[1]) if row else False
 
+        # Дата следующего начисления — по персональному периоду пользователя
+        # (period_start из его баланса), а не «1-е число от текущей даты».
+        next_grant_date = _next_grant_date_for_user(bal.period_start, now)
+
         # Помечаем claim ДО отправки (чтобы параллельные тики не задвоили).
         bal.low_balance_notified_at = now
         await db.commit()
@@ -264,7 +291,7 @@ async def notify_low_balance_once(*, user_id: int, now_utc: Optional[datetime] =
         return False
 
     text = _build_low_balance_message(
-        language=language, topup_enabled=topup_enabled, now_utc=now,
+        language=language, topup_enabled=topup_enabled, next_grant_date=next_grant_date,
     )
 
     try:
