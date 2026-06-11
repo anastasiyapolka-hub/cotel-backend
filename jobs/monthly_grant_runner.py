@@ -39,6 +39,7 @@ from db.session import AsyncSessionLocal
 from db.models import Plan, User, UserTokenBalance
 
 import billing
+import subscription_billing
 
 BATCH_SIZE = 100  # сколько пользователей обрабатывать за одну транзакцию
 
@@ -76,6 +77,15 @@ async def _process_one_user(
         user_id=user_id,
         plan_monthly_tokens=plan_monthly_tokens,
         period_start=period_start,
+    )
+
+    # Баланс пополнен → возобновляем подписки, приостановленные из-за
+    # нехватки токенов, и сбрасываем флаг разового уведомления, чтобы при
+    # следующем исчерпании пользователь снова получил пуш.
+    now_utc = datetime.now(timezone.utc)
+    await subscription_billing.clear_low_balance_notified(db, user_id=user_id)
+    await subscription_billing.resume_user_subscriptions_low_balance(
+        db, user_id=user_id, now_utc=now_utc,
     )
     return status
 

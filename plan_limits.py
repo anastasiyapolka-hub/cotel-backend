@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Plan, UsageCounter, UsageEvent, Subscription, User, UserTokenBalance, TokenTransaction
+import subscription_billing
 
 
 def utc_now() -> datetime:
@@ -981,6 +982,24 @@ async def build_usage_snapshot(
     if changed:
         await db.commit()
 
+    # === Сверка подписок с балансом токенов ===
+    # На каждом получении снапшота приводим состояние подписок в соответствие
+    # с балансом: при нехватке токенов — пауза + разовое уведомление, при
+    # достатке — возобновление. Это закрывает «дыру», когда токены кончились,
+    # а подписки в кабинете оставались зелёными и без оповещения.
+    subscriptions_paused_no_tokens = False
+    try:
+        recon = await subscription_billing.reconcile_user_subscriptions_balance(
+            db, user_id=user.id, now_utc=now_utc,
+        )
+        subscriptions_paused_no_tokens = bool(
+            recon.get("subscriptions_paused_no_tokens")
+        )
+        await db.commit()
+    except Exception:
+        # Снапшот не должен падать из-за сверки подписок.
+        await db.rollback()
+
     daily_used = await get_used_count(
         db,
         user_id=user.id,
@@ -1107,5 +1126,9 @@ async def build_usage_snapshot(
             "trial_subscriptions_total": int(trial_total),
             "free_trial_limit_reached": bool(free_trial_limit_reached),
             "free_trial_expired": bool(free_trial_expired),
+
+            # Флаг для UI-баннера: есть приостановленные из-за нехватки
+            # токенов подписки. Фронт показывает баннер в блоке подписок.
+            "subscriptions_paused_no_tokens": subscriptions_paused_no_tokens,
         },
     }

@@ -23,7 +23,12 @@ class Subscription(Base):
 
     id = Column(Integer, primary_key=True)
 
-    owner_user_id = Column(BigInteger, nullable=True, index=True)
+    owner_user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     name = Column(String(200), nullable=False)
     source_mode = Column(String(20), nullable=False, default="personal")
@@ -294,7 +299,12 @@ class BotUserLink(Base):
 
     id = Column(Integer, primary_key=True)
 
-    owner_user_id = Column(BigInteger, nullable=True, index=True)
+    owner_user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     telegram_chat_id = Column(BigInteger, nullable=False, unique=True)
     telegram_user_id = Column(BigInteger, nullable=True)
@@ -314,7 +324,12 @@ class BotLinkCode(Base):
     __tablename__ = "bot_link_codes"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False, index=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     code_hash = Column(String(64), nullable=False, unique=True, index=True)
 
@@ -409,6 +424,13 @@ class User(Base):
     timezone = Column(String(64), nullable=False, server_default="UTC")
     logout_revokes_telegram = Column(Boolean, nullable=False, server_default=sa.text("false"))
     default_ai_model = Column(String(64), nullable=False, server_default="openai:gpt-4.1-mini")
+
+    # Сохранять ли историю запросов (лента «запрос → ответ» в query_history)
+    # между сессиями. false = лента живёт только в текущей сессии, после
+    # перезагрузки очищается; true = пишем в query_history и подтягиваем при
+    # входе. Управляется галочкой в настройках профиля.
+    # Дефолт opt-in (false). Чтобы сделать opt-out — поменять на sa.text("true").
+    save_query_history = Column(Boolean, nullable=False, server_default=sa.text("false"))
 
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -1022,6 +1044,17 @@ class UserTokenBalance(Base):
     # Списываются ПОСЛЕ исчерпания monthly (см. раздел 2.6 архитектуры).
     topup_balance = Column(Integer, nullable=False, server_default="0")
 
+    # Когда пользователю было отправлено разовое уведомление о том, что
+    # подписки приостановлены из-за нехватки токенов. NULL = уведомление
+    # ещё не отправлялось (или сброшено после пополнения баланса). Нужно,
+    # чтобы НЕ долбить пользователя пушами на каждом тике раннера/снапшоте,
+    # а уведомить ровно один раз за «эпизод» исчерпания. Сбрасывается в NULL
+    # при пополнении (monthly_grant / top-up / смена тарифа).
+    # MIGRATION REQUIRED:
+    #   ALTER TABLE user_token_balances
+    #     ADD COLUMN low_balance_notified_at TIMESTAMPTZ NULL;
+    low_balance_notified_at = Column(DateTime(timezone=True), nullable=True)
+
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -1146,4 +1179,156 @@ class UserQueryLog(Base):
     __table_args__ = (
         sa.Index("ix_query_log_user_created", "user_id", "created_at"),
         sa.Index("ix_query_log_final_category", "final_category"),
+    )
+
+
+class SavedQuery(Base):
+    """
+    Сохранённый пресет запроса пользователя («Сохранённые запросы» в UI).
+
+    Пользователь настраивает форму запроса (чат/чаты, период, уровень анализа,
+    групповой режим, медиафильтр, текст вопроса), даёт пресету имя и сохраняет.
+    Позже выбирает его из списка — фронт парсит params_json и подставляет все
+    настройки обратно в форму.
+
+    params_json — снапшот настроек в формате, зеркалящем payload эндпоинтов
+    /tg/analyze_chat и /tg/analyze_chats_group, чтобы «применить пресет» и
+    «повторить из истории» использовали одну и ту же сериализацию. Внутри —
+    schema_version для forward-совместимости при изменении формата настроек.
+    Парсинг на стороне фронта должен быть defensive: если пресет ссылается на
+    протухший чат/модель/категорию — подставляем дефолт, а не падаем.
+    """
+    __tablename__ = "saved_queries"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Человекочитаемое имя пресета (по нему пользователь ищет в списке).
+    name = Column(String(255), nullable=False)
+
+    # Снапшот всех настроек запроса. Формат (schema_version=1):
+    #   {
+    #     "schema_version": 1,
+    #     "is_group": false,
+    #     "chat_link": "...",          # одиночный запрос
+    #     "chats": [],                  # групповой запрос (is_group=true)
+    #     "user_query": "...",
+    #     "period_value": 1,
+    #     "period_unit": "days",        # minutes / hours / days
+    #     "depth": "light",             # light / balanced / deep
+    #     "category": null,             # опциональный override категории
+    #     "media_filter": null          # либо объект MediaFilterRequest:
+    #       # {
+    #       #   "enabled": true,
+    #       #   "categories": ["video", "audio", ...],
+    #       #   "video_subtype": "video_files",  # video_files/video_round/video_both
+    #       #   "audio_subtype": "audio_files"   # audio_files/audio_voice/audio_both
+    #       # }
+    #   }
+    params_json = Column(JSONB, nullable=False)
+
+    # Когда пресет последний раз применяли — для сортировки «недавние».
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "name",
+            name="uq_saved_queries_user_name",
+        ),
+        sa.Index(
+            "ix_saved_queries_user_last_used",
+            "user_id",
+            "last_used_at",
+        ),
+    )
+
+
+class QueryHistory(Base):
+    """
+    История запросов пользователя — лента «запрос → ответ» в окне вывода
+    (простыня в стиле ChatGPT, скроллится вверх/вниз).
+
+    Каждая строка — одна пара «запрос пользователя + ответ сервиса».
+    Окно вывода при загрузке тянет последние N строк, скролл вверх подгружает
+    старые (курсорная пагинация по (user_id, created_at)).
+
+    Отдельная таблица от user_query_log (который — внутренняя аналитика
+    роутера и хранит только текст запроса без ответа): у истории другой
+    ретеншен (free 30 дней / платные 90) и она user-facing. Связь с
+    аналитикой/биллингом — через usage_event_id, аналитику не дублируем.
+
+    Ретеншен реализуется отдельной джобой: удаляет строки старше cutoff,
+    где cutoff = now - (30 или 90 дней) по текущему тарифу пользователя.
+    Отдельная колонка под срок хранения не нужна.
+    """
+    __tablename__ = "query_history"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Задел под будущие «диалоги»/«чаты» (правая сворачиваемая панель со
+    # списком тредов, переключение между ними). Пока всегда NULL — лента
+    # показывает все запросы пользователя единым потоком. Когда введём
+    # диалоги, лента начнёт фильтроваться по conversation_id без миграции.
+    conversation_id = Column(BigInteger, nullable=True, index=True)
+
+    # Текст запроса пользователя (как ввёл).
+    query_text = Column(Text, nullable=False)
+
+    # Снапшот настроек запроса в том же формате, что SavedQuery.params_json.
+    # Используется иконкой «повторить» — подставляет настройки обратно в форму
+    # (тот же код, что применение пресета). Внутри media_filter — какие чаты
+    # участвовали, поэтому групповой запрос хранится без отдельной логики.
+    params_json = Column(JSONB, nullable=True)
+
+    # Канонический объект для рендера ответа в ленте: текст обычного Q&A либо
+    # структурные медиа-карточки (formatter.py). Лента рисует его так же, как
+    # при первом ответе. NULL, если запрос упал и ответа нет.
+    response_payload = Column(JSONB, nullable=True)
+
+    # Плоский текст ответа — для превью/поиска. Необязательное дублирование.
+    response_text = Column(Text, nullable=True)
+
+    source_mode = Column(String(20), nullable=False, index=True)  # personal / service
+
+    status = Column(String(32), nullable=False)  # success / failed
+
+    # Связь с биллинговым событием (чтобы не дублировать аналитику).
+    # NULL, если запрос упал до списания токенов.
+    usage_event_id = Column(
+        BigInteger,
+        ForeignKey("usage_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        sa.Index("ix_query_history_user_created", "user_id", "created_at"),
+        sa.Index(
+            "ix_query_history_conversation_created",
+            "conversation_id",
+            "created_at",
+        ),
     )

@@ -38,6 +38,7 @@ from llm.orchestrator import LlmAllModelsFailedError, routing_meta
 from llm.pricing import get_token_rates
 
 import billing
+import subscription_billing
 
 from db.models import (
     User,
@@ -608,6 +609,13 @@ async def change_account_plan(
         period_start=date(now_utc.year, now_utc.month, 1),
         old_plan_code=old_plan,
         new_plan_code=target_plan,
+    )
+
+    # Баланс пополнен под новый тариф → возобновляем подписки, снятые из-за
+    # нехватки токенов, и сбрасываем флаг разового уведомления.
+    await subscription_billing.clear_low_balance_notified(db, user_id=user.id)
+    await subscription_billing.resume_user_subscriptions_low_balance(
+        db, user_id=user.id, now_utc=now_utc,
     )
 
     db.add(
@@ -3520,6 +3528,35 @@ async def toggle_subscription(
         raise HTTPException(status_code=404, detail="SUBSCRIPTION_NOT_FOUND")
     if sub.owner_user_id != user.id:
         raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    # === Ручной запуск (play) запрещён при нехватке токенов ===
+    # Если пользователь жмёт play, но баланс исчерпан — не включаем подписку
+    # и отдаём понятную ошибку с подсказкой (докупить / апгрейд). На free
+    # докупки нет — предлагаем только переход на платный тариф.
+    if bool(payload.is_active):
+        can_spend, _bal = await billing.check_can_spend(
+            db, user_id=user.id, tier="light",
+        )
+        if not can_spend:
+            plan_row = await get_user_plan(db, user)
+            topup_enabled = bool(getattr(plan_row, "topup_enabled", False))
+            lang = str(user.language or "en").lower()
+            if lang.startswith("ru"):
+                msg = "Недостаточно токенов для запуска подписки. " + (
+                    "Докупите токены или перейдите на более широкий тариф."
+                    if topup_enabled
+                    else "Перейдите на платный тариф, чтобы запускать подписки."
+                )
+            else:
+                msg = "Not enough tokens to start the subscription. " + (
+                    "Buy more tokens or upgrade to a higher plan."
+                    if topup_enabled
+                    else "Upgrade to a paid plan to run subscriptions."
+                )
+            raise HTTPException(
+                status_code=402,
+                detail={"code": "INSUFFICIENT_TOKENS", "message": msg},
+            )
 
     await ensure_can_toggle_subscription(
         db,

@@ -28,6 +28,7 @@ from llm.pricing import estimate_llm_cost_usd, cost_kwargs_for_meta, get_token_r
 from plan_limits import utc_now
 
 import billing
+import subscription_billing
 from telegram_service import fetch_chat_messages_for_subscription, disconnect_tg_client
 from service_account_service import fetch_service_chat_messages_for_subscription
 from media_filter.types import MediaFilterRequest
@@ -493,31 +494,50 @@ async def _process_one_subscription(db, sub_id: int, now_utc: datetime) -> None:
 
         # === Soft-block по балансу токенов (cutover) ===
         # Подписки на каждом tick'е проверяют, есть ли у пользователя минимум
-        # токенов на запрос. Если нет — НЕ вызываем Telegram fetch и LLM,
-        # ставим sub.status='no_tokens'. Подписка не «ломается», просто бездействует.
-        # Когда баланс восстановится (top-up, monthly_grant) — следующий tick
-        # пройдёт проверку и подписка снова заработает. status вернётся в 'ok'.
+        # токенов на запрос. Если нет — НЕ вызываем Telegram fetch и LLM.
+        # Раньше мы просто ставили status='no_tokens' и продолжали дёргать
+        # подписку каждый тик (она крутилась вхолостую), а пользователь не
+        # получал никакого уведомления. Теперь:
+        #   • снимаем подписку с автозапуска (is_active=False, next_run_at=None),
+        #     чтобы раннер её больше не подхватывал;
+        #   • один раз (за «эпизод» исчерпания) шлём уведомление в бот.
+        # Возобновление — при пополнении баланса (monthly_grant / top-up /
+        # смена тарифа) через subscription_billing.resume_*, либо вручную через
+        # кнопку play (с проверкой баланса на бэке).
         can_spend, balance = await billing.check_can_spend(
             db, user_id=owner_user_id, tier="light",
         )
         if not can_spend:
             print(
-                f"[subscriptions_runner] SKIP sub_id={sub.id} reason=NO_TOKENS "
+                f"[subscriptions_runner] PAUSE sub_id={sub.id} reason=NO_TOKENS "
                 f"monthly_used={balance.monthly_used}/{balance.monthly_granted} "
                 f"topup={balance.topup_balance}"
             )
             if st is None:
                 st = SubscriptionState(subscription_id=sub.id)
                 db.add(st)
+            sub.is_active = False
             sub.status = "no_tokens"
             sub.last_error = None  # не ошибка, нет токенов — это нормальная ситуация
             st.last_checked_at = now_utc
-            # Обычная периодичность — на следующий tick проверим снова
-            st.next_run_at = now_utc + timedelta(minutes=metrics["frequency_minutes"])
+            st.next_run_at = None  # снято с расписания, пока баланс не пополнят
+
+            # Разовое уведомление пользователю (идемпотентно по флагу в
+            # user_token_balances; своя сессия — не мешает текущей транзакции).
+            try:
+                await subscription_billing.notify_low_balance_once(
+                    user_id=owner_user_id, now_utc=now_utc,
+                )
+            except Exception:
+                print(
+                    f"[subscriptions_runner] low_balance notify failed "
+                    f"user_id={owner_user_id}"
+                )
             return
 
         # Если статус был 'no_tokens', а сейчас баланс восстановился —
-        # возвращаем подписку в нормальное состояние.
+        # возвращаем подписку в нормальное состояние (для legacy-подписок,
+        # которые остались is_active=True; новые приходят сюда уже активными).
         if sub.status == "no_tokens":
             sub.status = "ok"
 

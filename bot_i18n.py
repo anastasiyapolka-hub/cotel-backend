@@ -39,6 +39,11 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "media_kind_voice":       "🎙 Voice",
         "media_kind_document":    "📎 Document",
         "media_kind_url":         "🔗 Link",
+        # Разовое уведомление: подписки приостановлены из-за нехватки токенов.
+        "subs_paused_no_tokens_title": "⚠️ Your subscriptions are paused — you've run out of tokens.",
+        "subs_paused_no_tokens_next_grant": "Next token refill: {date}.",
+        "subs_paused_no_tokens_topup": "To resume right away, you can buy extra tokens or upgrade to a higher plan.",
+        "subs_paused_no_tokens_upgrade_only": "To resume, upgrade to a paid plan.",
         "months": [
             "January", "February", "March", "April", "May", "June",
             "July", "August", "September", "October", "November", "December",
@@ -68,6 +73,11 @@ _STRINGS: dict[str, dict[str, Any]] = {
         "media_kind_voice":       "🎙 Голосовое",
         "media_kind_document":    "📎 Документ",
         "media_kind_url":         "🔗 Ссылка",
+        # Разовое уведомление: подписки приостановлены из-за нехватки токенов.
+        "subs_paused_no_tokens_title": "⚠️ Ваши подписки приостановлены — закончились токены.",
+        "subs_paused_no_tokens_next_grant": "Следующее начисление токенов: {date}.",
+        "subs_paused_no_tokens_topup": "Чтобы возобновить сразу, вы можете приобрести дополнительные токены или перейти на более широкий тариф.",
+        "subs_paused_no_tokens_upgrade_only": "Чтобы возобновить, перейдите на платный тариф.",
         "months": [
             "января", "февраля", "марта", "апреля", "мая", "июня",
             "июля", "августа", "сентября", "октября", "ноября", "декабря",
