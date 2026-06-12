@@ -433,6 +433,26 @@ class User(Base):
     save_query_history = Column(Boolean, nullable=False, server_default=sa.text("false"))
 
     last_login_at = Column(DateTime(timezone=True), nullable=True)
+
+    # === Защита логина от перебора пароля (brute-force) ===
+    # Счётчик неудачных попыток входа подряд (сбрасывается при успешном входе
+    # и при «остывании» — если давно не было промахов).
+    failed_login_count = Column(Integer, nullable=False, server_default="0")
+    # До какого момента вход в аккаунт временно заблокирован (NULL = не
+    # заблокирован). Проверяется в начале /auth/login.
+    lockout_until = Column(DateTime(timezone=True), nullable=True)
+    # Время последней неудачной попытки — для «остывания» счётчика/эскалации.
+    last_failed_login_at = Column(DateTime(timezone=True), nullable=True)
+    # Уровень эскалации блокировки (сколько раз подряд срабатывала блокировка):
+    # чем выше, тем длиннее следующая пауза (15 → 30 → 60 → 120 мин).
+    lockout_level = Column(Integer, nullable=False, server_default="0")
+    # MIGRATION REQUIRED:
+    #   ALTER TABLE users
+    #     ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0,
+    #     ADD COLUMN lockout_until TIMESTAMPTZ NULL,
+    #     ADD COLUMN last_failed_login_at TIMESTAMPTZ NULL,
+    #     ADD COLUMN lockout_level INTEGER NOT NULL DEFAULT 0;
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True),

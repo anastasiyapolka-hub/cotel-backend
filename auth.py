@@ -1,6 +1,7 @@
 # auth.py
 import os
 import re
+import time
 import hashlib
 import logging
 import secrets
@@ -54,6 +55,78 @@ SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 EMAIL_CODE_TTL_MIN = int(os.getenv("EMAIL_CODE_TTL_MIN", "5"))
 EMAIL_RESEND_COOLDOWN_SEC = int(os.getenv("EMAIL_RESEND_COOLDOWN_SEC", "60"))
 DEV_RETURN_EMAIL_CODE = False
+
+# === Защита логина от перебора пароля ===
+# Слой 1 — блокировка по аккаунту: после LOGIN_MAX_FAILS неверных паролей
+# подряд вход в аккаунт замораживается на нарастающую паузу
+# LOGIN_LOCKOUT_MINUTES[уровень]. Счётчик и уровень эскалации хранятся в
+# users (failed_login_count / lockout_level / lockout_until). Эскалация
+# «остывает», если давно (LOGIN_ESCALATION_RESET_HOURS) не было промахов.
+LOGIN_MAX_FAILS = int(os.getenv("LOGIN_MAX_FAILS", "5"))
+LOGIN_LOCKOUT_MINUTES = [15, 30, 60, 120]  # пауза по уровню эскалации
+LOGIN_ESCALATION_RESET_HOURS = int(os.getenv("LOGIN_ESCALATION_RESET_HOURS", "24"))
+
+# Слой 2 — лимит по IP (best-effort, in-memory в рамках процесса): ловит
+# перебор, размазанный по многим аккаунтам с одного адреса. Для мульти-
+# инстанса это нужно вынести в Redis/БД (см. BACKLOG).
+IP_LOGIN_MAX_FAILS = int(os.getenv("IP_LOGIN_MAX_FAILS", "20"))
+IP_LOGIN_WINDOW_SEC = int(os.getenv("IP_LOGIN_WINDOW_SEC", "900"))  # 15 минут
+
+# ip -> список monotonic-таймстемпов неудачных попыток (в пределах окна).
+_ip_fail_log: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    """Реальный IP клиента. За прокси (Render) берём первый хоп
+    X-Forwarded-For, иначе адрес соединения."""
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
+def _ip_prune(ip: str, now_mono: float) -> list[float]:
+    """Оставить только промахи внутри окна; вернуть актуальный список."""
+    cutoff = now_mono - IP_LOGIN_WINDOW_SEC
+    items = [t for t in _ip_fail_log.get(ip, []) if t >= cutoff]
+    if items:
+        _ip_fail_log[ip] = items
+    else:
+        _ip_fail_log.pop(ip, None)
+    return items
+
+
+def _ip_retry_after_sec(ip: str) -> Optional[int]:
+    """Если IP превысил лимит — вернуть, сколько секунд ждать; иначе None."""
+    now_mono = time.monotonic()
+    items = _ip_prune(ip, now_mono)
+    if len(items) < IP_LOGIN_MAX_FAILS:
+        return None
+    # Ждать, пока самый старый промах выпадет из окна.
+    oldest = min(items)
+    retry = int((oldest + IP_LOGIN_WINDOW_SEC) - now_mono)
+    return max(1, retry)
+
+
+def _ip_record_failure(ip: str) -> None:
+    now_mono = time.monotonic()
+    items = _ip_prune(ip, now_mono)
+    items.append(now_mono)
+    _ip_fail_log[ip] = items
+    # Грубая защита от разрастания словаря: если адресов слишком много,
+    # выкидываем заведомо пустые/устаревшие записи.
+    if len(_ip_fail_log) > 10000:
+        for k in list(_ip_fail_log.keys()):
+            _ip_prune(k, now_mono)
+
+
+def _retry_after_parts(seconds: int) -> tuple[int, int]:
+    """(секунды, минуты-вверх) для сообщений об ошибке."""
+    seconds = max(1, int(seconds))
+    minutes = max(1, (seconds + 59) // 60)
+    return seconds, minutes
 
 EMAIL_RE = re.compile(r"^.{1,320}$")
 
@@ -754,22 +827,106 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Asyn
     email = payload.email.strip().lower()
     password = payload.password or ""
 
+    ip = _client_ip(request)
+
+    # --- Слой 2: лимит по IP (до любого обращения к БД) ---
+    ip_retry = _ip_retry_after_sec(ip)
+    if ip_retry is not None:
+        sec, minutes = _retry_after_parts(ip_retry)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "IP_RATE_LIMITED",
+                "retry_after_sec": sec,
+                "retry_after_min": minutes,
+                "message": "Слишком много попыток входа с вашего устройства. "
+                           f"Подождите ~{minutes} мин. и попробуйте снова.",
+            },
+        )
+
     r = await db.execute(select(User).where(User.email == email))
     user = r.scalar_one_or_none()
     if not user:
+        # Несуществующий аккаунт: считаем только по IP (по аккаунту нечего),
+        # и отдаём тот же 401, чтобы не раскрывать наличие email.
+        _ip_record_failure(ip)
         raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
+    now = _now()
+
+    # «Остывание» эскалации: если давно не было промахов — обнуляем серию,
+    # чтобы редкие ошибки за недели не накапливались в длинные блокировки.
+    if (
+        user.last_failed_login_at is not None
+        and (now - user.last_failed_login_at) >= timedelta(hours=LOGIN_ESCALATION_RESET_HOURS)
+    ):
+        user.failed_login_count = 0
+        user.lockout_level = 0
+        user.lockout_until = None
+
+    # --- Слой 1: аккаунт временно заблокирован? ---
+    if user.lockout_until is not None and user.lockout_until > now:
+        await db.commit()  # сохранить возможный сброс «остывания» выше
+        sec, minutes = _retry_after_parts(int((user.lockout_until - now).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "ACCOUNT_LOCKED",
+                "retry_after_sec": sec,
+                "retry_after_min": minutes,
+                "message": "Слишком много неудачных попыток входа. Вход временно "
+                           f"заблокирован. Попробуйте через ~{minutes} мин. или "
+                           "сбросьте пароль.",
+            },
+        )
+
     if not user.is_email_verified:
+        await db.commit()
         raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
 
     if not user.is_active:
+        await db.commit()
         raise HTTPException(status_code=403, detail="USER_INACTIVE")
 
+    # --- Проверка пароля ---
     if not user.password_hash or not pwd_context.verify(password, user.password_hash):
+        _ip_record_failure(ip)
+        user.failed_login_count = int(user.failed_login_count or 0) + 1
+        user.last_failed_login_at = now
+
+        just_locked = False
+        if user.failed_login_count >= LOGIN_MAX_FAILS:
+            # Поднимаем уровень эскалации и ставим блокировку.
+            level = min(int(user.lockout_level or 0) + 1, len(LOGIN_LOCKOUT_MINUTES))
+            user.lockout_level = level
+            dur_min = LOGIN_LOCKOUT_MINUTES[level - 1]
+            user.lockout_until = now + timedelta(minutes=dur_min)
+            user.failed_login_count = 0  # новая серия попыток после разблокировки
+            just_locked = True
+
+        await db.commit()
+
+        if just_locked:
+            sec, minutes = _retry_after_parts(int((user.lockout_until - now).total_seconds()))
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "ACCOUNT_LOCKED",
+                    "retry_after_sec": sec,
+                    "retry_after_min": minutes,
+                    "message": "Слишком много неудачных попыток входа. Вход временно "
+                               f"заблокирован. Попробуйте через ~{minutes} мин. или "
+                               "сбросьте пароль.",
+                },
+            )
         raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
-    # last_login_at
-    user.last_login_at = _now()
+    # --- Успех: сбрасываем счётчики и блокировку ---
+    user.failed_login_count = 0
+    user.lockout_level = 0
+    user.lockout_until = None
+    user.last_failed_login_at = None
+    user.last_login_at = now
     await db.commit()
 
     # создать сессию + cookie
