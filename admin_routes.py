@@ -1691,3 +1691,99 @@ async def admin_analytics_plans(
     by_plan.sort(key=lambda x: x["users"], reverse=True)
 
     return {"period_days": days, "by_plan": by_plan}
+
+
+# ---------------------------------------------------------------------------
+# Тарифы: список + смена тарифа пользователю (демо/тесты)
+# ---------------------------------------------------------------------------
+
+@router.get("/plans")
+async def admin_list_plans(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Список тарифов для селектора смены тарифа в карточке пользователя."""
+    rows = (await db.execute(
+        select(Plan).order_by(Plan.monthly_tokens.asc())
+    )).scalars().all()
+    items = [{
+        "code": p.code,
+        "price_usd": float(p.price_usd),
+        "monthly_tokens": int(p.monthly_tokens or 0),
+        "allowed_tiers": list(p.allowed_tiers or []),
+        "topup_enabled": bool(p.topup_enabled),
+        "is_active": bool(p.is_active),
+    } for p in rows]
+    return {"items": items, "total": len(items)}
+
+
+class PlanChangeBody(BaseModel):
+    plan: str = Field(..., min_length=1, description="Код тарифа: free / basic / pro / super_pro")
+
+
+@router.post("/users/{user_id}/change-plan")
+async def admin_user_change_plan(
+    user_id: int,
+    body: PlanChangeBody,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Перевести пользователя на другой тариф (для демо-доступов и тестов).
+
+    Делает атомарно в одной транзакции:
+      1. users.plan = новый код тарифа
+      2. billing.apply_plan_change — сброс месячного гранта до порога нового
+         тарифа (monthly_granted = plan.monthly_tokens, monthly_used = 0,
+         topup не трогаем) + запись token_transactions reason='plan_change'
+         с old/new плаnом в meta (аудит-след).
+    """
+    new_code = body.plan.strip()
+
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})
+
+    plan = (await db.execute(select(Plan).where(Plan.code == new_code))).scalar_one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=400, detail={"code": "PLAN_NOT_FOUND", "plan": new_code})
+    if not bool(plan.is_active):
+        raise HTTPException(status_code=400, detail={"code": "PLAN_INACTIVE", "plan": new_code})
+
+    old_code = user.plan
+    now = _utc_now()
+    period_start = date(now.year, now.month, 1)
+
+    try:
+        user.plan = plan.code
+        result = await billing.apply_plan_change(
+            db,
+            user_id=user_id,
+            new_plan_monthly_tokens=int(plan.monthly_tokens or 0),
+            period_start=period_start,
+            old_plan_code=old_code,
+            new_plan_code=plan.code,
+        )
+        await db.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"[admin/users/{user_id}/change-plan] failed: {e}")
+        traceback.print_exc()
+        await _safe_rollback(db)
+        raise HTTPException(status_code=500, detail={"code": "PLAN_CHANGE_FAILED"})
+
+    snapshot = None
+    if result is not None:
+        snapshot = {
+            "monthly_granted": result.monthly_granted,
+            "monthly_used": result.monthly_used,
+            "monthly_remaining": result.monthly_remaining,
+            "topup_balance": result.topup_balance,
+            "total_remaining": result.total_remaining,
+        }
+
+    return {
+        "ok": True,
+        "old_plan": old_code,
+        "new_plan": plan.code,
+        "monthly_tokens": int(plan.monthly_tokens or 0),
+        "tokens": snapshot,
+    }
