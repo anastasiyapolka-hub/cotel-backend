@@ -57,6 +57,30 @@ class LlmAllModelsFailedError(Exception):
         self.attempted_models = attempted_models
 
 
+class LlmEmptyResponseError(Exception):
+    """
+    Все модели цепочки отработали без ошибок, но вернули ПУСТОЙ видимый текст.
+
+    Частые причины (см. finish_reasons): MAX_TOKENS (ответ обрезан лимитом),
+    SAFETY/RECITATION (заблокирован фильтром), STOP с пустыми parts (модель
+    просто ничего не выдала). Это не ошибка инфраструктуры и не пустой чат —
+    запрос отработал некорректно. Вызывающий код НЕ должен списывать токены и
+    обязан показать пользователю понятное сообщение. finish_reasons нужны,
+    чтобы понять причину и при необходимости уточнить текст для пользователя.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempted_models: list[str],
+        finish_reasons: list[str],
+    ):
+        super().__init__(message)
+        self.attempted_models = attempted_models
+        self.finish_reasons = finish_reasons
+
+
 # ---------------------------------------------------------------------------
 # Результат вызова
 # ---------------------------------------------------------------------------
@@ -128,6 +152,8 @@ async def run(
     """
     attempted: list[str] = []
     fail_reasons: list[str] = []
+    empty_finish_reasons: list[str] = []
+    had_empty = False
 
     for idx, model in enumerate(decision.fallback_chain):
         attempted.append(model.slug)
@@ -162,6 +188,23 @@ async def run(
             )
             continue
 
+        # Пустой видимый ответ при УСПЕШНОМ вызове — это soft-fail.
+        # Модель ничего не выдала (часто finish_reason=MAX_TOKENS / SAFETY /
+        # STOP с пустыми parts). Биллить и показывать нечего — пробуем
+        # следующую модель цепочки, как при retryable-ошибке.
+        if not (text or "").strip():
+            had_empty = True
+            empty_finish_reasons.append(finish_reason or "UNKNOWN")
+            reason = f"{model.slug}: empty_text (finish_reason={finish_reason})"
+            fail_reasons.append(reason)
+            log.warning(
+                "orchestrator.empty_response position=%s/%s model=%s "
+                "is_primary=%s finish_reason=%s",
+                idx + 1, len(decision.fallback_chain), model.slug,
+                is_primary, finish_reason,
+            )
+            continue
+
         # Успех — отдаём результат
         if not is_primary:
             log.info(
@@ -183,7 +226,24 @@ async def run(
             fallback_reasons=fail_reasons,
         )
 
-    # Все модели в цепочке упали на retryable error
+    # Цепочка исчерпана. Различаем два исхода для корректного биллинга/UX:
+    #   - был хотя бы один пустой ответ → LlmEmptyResponseError (не списываем,
+    #     показываем «модель не вернула ответ»);
+    #   - иначе все модели падали на retryable-ошибках → LlmAllModelsFailedError
+    #     («временные проблемы с провайдерами»).
+    if had_empty:
+        log.error(
+            "orchestrator.all_empty tier=%s category=%s attempted=%s "
+            "finish_reasons=%s",
+            decision.tier, decision.category, attempted, empty_finish_reasons,
+        )
+        raise LlmEmptyResponseError(
+            f"All models in chain returned empty text. "
+            f"finish_reasons={empty_finish_reasons}",
+            attempted_models=attempted,
+            finish_reasons=empty_finish_reasons,
+        )
+
     log.error(
         "orchestrator.all_failed tier=%s category=%s attempted=%s reasons=%s",
         decision.tier, decision.category, attempted, fail_reasons,

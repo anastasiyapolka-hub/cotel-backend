@@ -34,7 +34,7 @@ from llm.service import (
     run_qa_group,
 )
 from llm.adapters import LlmFatalError, LlmRetryableError
-from llm.orchestrator import LlmAllModelsFailedError, routing_meta
+from llm.orchestrator import LlmAllModelsFailedError, LlmEmptyResponseError, routing_meta
 from llm.pricing import get_token_rates
 
 import billing
@@ -1998,6 +1998,31 @@ async def tg_analyze_chat(
                 "message": "Временные проблемы с AI-провайдерами, попробуйте через минуту.",
             },
         )
+    except LlmEmptyResponseError as exc:
+        # Модель(и) вернули пустой ответ — некорректно отработанный запрос.
+        # Токены НЕ списываем. finish_reason пишем в лог для разбора причины.
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            error_code="EMPTY_LLM_RESPONSE",
+            error_message=f"finish_reasons={exc.finish_reasons} attempted={exc.attempted_models}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "EMPTY_LLM_RESPONSE",
+                "message": "Модель не вернула ответ на этот запрос. Токены не списаны — попробуйте ещё раз или выберите более глубокий режим анализа.",
+                "finish_reasons": exc.finish_reasons,
+            },
+        )
     except Exception as e:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
         total_ms = int((time.perf_counter() - total_t0) * 1000)
@@ -2753,6 +2778,29 @@ async def tg_analyze_chats_group(
             detail={
                 "code": "LLM_TEMPORARILY_UNAVAILABLE",
                 "message": "Временные проблемы с AI-провайдерами, попробуйте через минуту.",
+            },
+        )
+    except LlmEmptyResponseError as exc:
+        # Пустой ответ модели(ей) — не списываем токены, пишем причину в лог.
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal",
+            chat_ref=f"group:{group_size}",
+            error_code="EMPTY_LLM_RESPONSE",
+            error_message=f"finish_reasons={exc.finish_reasons} attempted={exc.attempted_models}"[:300],
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "EMPTY_LLM_RESPONSE",
+                "message": "Модель не вернула ответ на этот запрос. Токены не списаны — попробуйте ещё раз или выберите более глубокий режим анализа.",
+                "finish_reasons": exc.finish_reasons,
             },
         )
     except Exception as e:
