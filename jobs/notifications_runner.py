@@ -1,6 +1,7 @@
 # jobs/notifications_runner.py
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -544,6 +545,32 @@ async def _load_digest_events_with_subscriptions(db, event_ids: list[int]):
     return list((await db.execute(q)).all())
 
 
+# Ссылки на сообщения в тексте дайджеста LLM пишет в виде «msg #<id>»
+# (см. system_prompt в build_subscription_digest). Превращаем их в кликабельные
+# HTML-ссылки на конкретное сообщение в Telegram.
+_DIGEST_MSG_REF_RE = re.compile(r"msg\s*#\s*(\d+)", re.IGNORECASE)
+
+
+def _linkify_digest_body(body: str, chat_ref: str | None, chat_id: int | None) -> str:
+    """HTML-escape тела дайджеста + замена «msg #<id>» на <a href=…>.
+
+    Сначала экранируем весь текст (parse_mode='HTML'), затем подставляем
+    ссылки: «msg #<id>» не содержит спецсимволов, поэтому escape его не
+    меняет и regex по-прежнему находит. Если ссылку построить нельзя
+    (нет username/chat_id), оставляем как обычный текст."""
+    esc = _esc(body)
+
+    def _repl(m: "re.Match") -> str:
+        mid = int(m.group(1))
+        url = build_tg_message_link(chat_ref=chat_ref, chat_id=chat_id, message_id=mid)
+        label = m.group(0)  # «msg #10856» — без спецсимволов, безопасно
+        if not url:
+            return label
+        return f'<a href="{url}">{label}</a>'
+
+    return _DIGEST_MSG_REF_RE.sub(_repl, esc)
+
+
 def _format_digest_message(
     sub: Subscription,
     ev: DigestEvent,
@@ -551,14 +578,17 @@ def _format_digest_message(
     language: str = "en",
 ) -> str:
     """
-    Формат:
+    Формат (parse_mode='HTML'):
       заголовок: "Summary for your subscription: {name}" / «Резюме по подписке: {name}»
       период:   "Period: {window_start} — {window_end}" / «Период: …»
       [для группы] чат: «Чат: <название> (<url>)»
-      тело:     digest_text (язык narration уже выставлен LLM по `user.language`)
+      тело:     digest_text со ссылками «msg #<id>» → кликабельные <a href>.
+
+    Весь текст экранируется под HTML; обрезку по лимиту делаем по «сырому»
+    телу ДО вставки тегов, чтобы не разорвать <a>…</a>.
     """
     name = sub.name or f"#{sub.id}"
-    title = bot_t("digest_title", language, name=name)
+    title = _esc(bot_t("digest_title", language, name=name))
 
     ws_dt = getattr(ev, "window_start", None)
     we_dt = getattr(ev, "window_end", None)
@@ -567,9 +597,9 @@ def _format_digest_message(
 
     if ws_dt and we_dt:
         period_human = format_period_variant_f(ws_dt, we_dt, tz_name, language)
-        period = bot_t("digest_period", language, period=period_human)
+        period = _esc(bot_t("digest_period", language, period=period_human))
     else:
-        period = bot_t("digest_period_empty", language)
+        period = _esc(bot_t("digest_period_empty", language))
 
     # Для групповой подписки добавляем под шапкой строку с названием
     # чата. Чтобы юзер видел, по какому именно чату пришло саммари.
@@ -578,18 +608,26 @@ def _format_digest_message(
         chat_title = getattr(ev, "chat_title", None) or getattr(ev, "chat_ref", None) or "—"
         chat_url = _build_chat_url(sub, ev)
         if chat_url:
-            chat_line = "\n" + bot_t("digest_chat_label_with_link", language, chat=chat_title, url=chat_url)
+            chat_line = "\n" + _esc(bot_t("digest_chat_label_with_link", language, chat=chat_title, url=chat_url))
         else:
-            chat_line = "\n" + bot_t("digest_chat_label", language, chat=chat_title)
+            chat_line = "\n" + _esc(bot_t("digest_chat_label", language, chat=chat_title))
 
-    body = (ev.digest_text or "").strip() or "—"
+    header = f"{title}\n{period}{chat_line}\n\n"
 
-    text = f"{title}\n{period}{chat_line}\n\n{body}"
+    # Обрезаем «сырое» тело по доступному месту (лимит Telegram — на видимый
+    # текст, HTML-теги в него не считаются), потом превращаем «msg #» в ссылки.
+    raw_body = (ev.digest_text or "").strip() or "—"
+    avail = TG_MSG_HARD_LIMIT - len(header) - 1
+    if avail > 0 and len(raw_body) > avail:
+        raw_body = raw_body[:avail].rstrip() + "…"
 
-    if len(text) > TG_MSG_HARD_LIMIT:
-        text = text[: TG_MSG_HARD_LIMIT - 1] + "…"
+    body = _linkify_digest_body(
+        raw_body,
+        _event_chat_ref(sub, ev),
+        _event_chat_id(sub, ev),
+    )
 
-    return text
+    return header + body
 
 
 async def _mark_digest_events(db, ids: list[int], status: str) -> None:
@@ -801,7 +839,7 @@ async def run_tick() -> int:
 
                     language = getattr(user, "language", None) or "en"
                     text = _format_digest_message(sub, ev, user, language=language)
-                    await bot_send_message(chat_id=int(dest_chat_id), text=text)
+                    await bot_send_message(chat_id=int(dest_chat_id), text=text, parse_mode="HTML")
 
                     await _mark_digest_events(db, [int(ev.id)], STATUS_SENT)
                     elapsed_ms = int((time.perf_counter() - group_t0) * 1000)
