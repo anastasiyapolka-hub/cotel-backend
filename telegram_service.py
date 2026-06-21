@@ -356,17 +356,22 @@ async def fetch_chat_messages(
     days: int = 7,
     *,
     period_seconds: Optional[int] = None,
+    since_dt: Optional[datetime] = None,
+    until_dt: Optional[datetime] = None,
 ):
     """
     Возвращает:
       entity: объект чата/канала (Telethon entity)
       messages: список в формате [{date, from, text}, ...] для LLM
 
-    Период анализа задаётся одним из двух способов:
-      - period_seconds (новый, в секундах) — приоритетный, поддерживает
-        минуты/часы/дни через единый seconds-параметр.
-      - days (старый) — fallback для совместимости, если новый
-        параметр не передан.
+    Окно анализа задаётся одним из трёх способов (по приоритету):
+      - абсолютный диапазон since_dt..until_dt — если задан since_dt
+        (until_dt опционален: верхняя граница, передаётся в Telethon как
+        offset_date — выбираются сообщения старше until_dt). Нижняя граница
+        since_dt останавливает итерацию.
+      - period_seconds (в секундах) — относительный период «за последние…»,
+        поддерживает минуты/часы/дни.
+      - days (legacy) — fallback для совместимости.
     """
     client = await ensure_connected(db, owner_user_id)
 
@@ -383,12 +388,19 @@ async def fetch_chat_messages(
     if link.startswith("@"):
         link = link[1:].strip()
 
-    # Дата отсечения. Если задан period_seconds — используем его
-    # (поддерживает минуты/часы); иначе fallback на days.
-    if period_seconds is not None and int(period_seconds) > 0:
+    # Нижняя граница (since_dt). Приоритет: явный абсолютный диапазон →
+    # period_seconds → days. until_dt (верхняя граница) используется ниже как
+    # offset_date в iter_messages.
+    if since_dt is not None:
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    elif period_seconds is not None and int(period_seconds) > 0:
         since_dt = datetime.now(timezone.utc) - timedelta(seconds=int(period_seconds))
     else:
         since_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
+
+    if until_dt is not None and until_dt.tzinfo is None:
+        until_dt = until_dt.replace(tzinfo=timezone.utc)
 
     # --- INVITE LINKS: t.me/+HASH or t.me/joinchat/HASH ---
     invite_hash = None
@@ -503,12 +515,20 @@ async def fetch_chat_messages(
         # для самых активных русскоязычных чатов. Минимум 5000 для коротких
         # периодов, максимум 80 000 для очень длинных. Telethon выгружает
         # батчами по 100 — для 50K это ~500 round-trip к Telegram, ~30-60с.
-        if period_seconds is not None and int(period_seconds) > 0:
+        if until_dt is not None:
+            # Абсолютный диапазон: «вес» окна — его длина в днях.
+            requested_days = max(int((until_dt - since_dt).total_seconds()) // 86400, 1)
+        elif period_seconds is not None and int(period_seconds) > 0:
             requested_days = max(int(period_seconds) // 86400, 1)
         else:
             requested_days = max(int(days), 1)
         dynamic_limit = min(80_000, max(5_000, requested_days * 1_500))
-        async for msg in client.iter_messages(entity, limit=dynamic_limit):
+        # offset_date — верхняя граница диапазона: Telethon отдаёт сообщения
+        # старше этой даты (двигаемся к since_dt и останавливаемся на нём ниже).
+        iter_kwargs = {"limit": dynamic_limit}
+        if until_dt is not None:
+            iter_kwargs["offset_date"] = until_dt
+        async for msg in client.iter_messages(entity, **iter_kwargs):
             if not isinstance(msg, Message):
                 continue
 

@@ -107,6 +107,8 @@ from plan_limits import (
     enforce_qa_limits,
     get_user_plan,
     parse_period_from_payload,
+    parse_date_range_from_payload,
+    ensure_range_within_plan,
     record_qa_success,
     record_qa_failure,
     expire_trial_subscription_if_needed,
@@ -1843,6 +1845,11 @@ async def tg_analyze_chat(
     # days — для логов. Для минут/часов отдаём 1 (под-суточный период).
     days = period_value if period_unit == "days" else 1
 
+    # Абсолютный диапазон {date_from, date_to} (приоритетнее относительного
+    # периода, если задан). Лимит тарифа на длину диапазона проверяем ниже,
+    # когда получим план пользователя.
+    range_since, range_until = parse_date_range_from_payload(payload)
+
     # === НОВОЕ: depth вместо ai_model ===
     depth = str(payload.get("depth") or "light").strip().lower()
     # Опциональный override категории от фронта (chip «изменить категорию»)
@@ -1857,6 +1864,11 @@ async def tg_analyze_chat(
     # === Tier check (free → только light) ===
     plan = await get_user_plan(db, user)
     check_tier_allowed_or_raise(plan, depth)
+
+    # Если задан абсолютный диапазон — проверяем его длину против тарифа и
+    # используем его как окно анализа (days — для логов берём из длины диапазона).
+    if range_since is not None and range_until is not None:
+        days = ensure_range_within_plan(since_dt=range_since, until_dt=range_until, plan=plan)
 
     # === Soft-block по балансу токенов ===
     can_spend, balance = await billing.check_can_spend(
@@ -1894,6 +1906,8 @@ async def tg_analyze_chat(
             depth=depth,
             user_query=user_query,
             request=media_filter_req,
+            range_since=range_since,
+            range_until=range_until,
         )
 
     query_chars = len(user_query)
@@ -1903,7 +1917,8 @@ async def tg_analyze_chat(
     fetch_t0 = time.perf_counter()
     try:
         entity, messages = await fetch_chat_messages(
-            db, owner_user_id, chat_link, days, period_seconds=period_seconds
+            db, owner_user_id, chat_link, days, period_seconds=period_seconds,
+            since_dt=range_since, until_dt=range_until,
         )
     except ValueError as ve:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
@@ -2314,6 +2329,8 @@ async def _handle_media_filter_branch(
     depth: str,
     user_query: str,
     request,
+    range_since: Optional[datetime] = None,
+    range_until: Optional[datetime] = None,
 ) -> dict:
     """
     Полная обработка одного запроса с включённым медиафильтром.
@@ -2329,6 +2346,23 @@ async def _handle_media_filter_branch(
     в этой колонке.
     """
     total_t0 = time.perf_counter()
+
+    # Медиафильтр пока строит окно только «от текущего момента назад»
+    # (telethon_search избегает offset_date из-за бага Telethon #1124).
+    # Произвольный прошлый диапазон «С–По» здесь не поддержан — явно говорим
+    # об этом, чтобы не вводить пользователя в заблуждение. См. BACKLOG.
+    if range_since is not None or range_until is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "MEDIA_FILTER_RANGE_UNSUPPORTED",
+                "message": (
+                    "Поиск по медиафильтру пока работает только с периодом "
+                    "«за последние…», без произвольного диапазона дат «С–По». "
+                    "Уберите даты диапазона или отключите медиафильтр."
+                ),
+            },
+        )
 
     chat_ref = chat_links[0] if not is_group else f"group:{len(chat_links)}"
     query_chars = len(user_query or "")
@@ -2581,6 +2615,9 @@ async def tg_analyze_chats_group(
     period_value, period_unit, period_seconds = parse_period_from_payload(payload)
     days = period_value if period_unit == "days" else 1
 
+    # Абсолютный диапазон {date_from, date_to} (приоритетнее относительного).
+    range_since, range_until = parse_date_range_from_payload(payload)
+
     # === НОВОЕ: depth вместо ai_model ===
     depth = str(payload.get("depth") or "light").strip().lower()
     explicit_category = payload.get("category")
@@ -2592,6 +2629,9 @@ async def tg_analyze_chats_group(
     # === Tier check (free → только light) ===
     plan = await get_user_plan(db, user)
     check_tier_allowed_or_raise(plan, depth)
+
+    if range_since is not None and range_until is not None:
+        days = ensure_range_within_plan(since_dt=range_since, until_dt=range_until, plan=plan)
 
     # === Per-plan group size limit (новое поле max_chats_per_group_request) ===
     group_size = len(chat_links)
@@ -2631,6 +2671,8 @@ async def tg_analyze_chats_group(
             depth=depth,
             user_query=user_query,
             request=media_filter_req,
+            range_since=range_since,
+            range_until=range_until,
         )
 
     query_chars = len(user_query)
@@ -2640,7 +2682,8 @@ async def tg_analyze_chats_group(
     fetch_t0 = time.perf_counter()
     fetch_tasks = [
         fetch_chat_messages(
-            db, owner_user_id, link, days, period_seconds=period_seconds
+            db, owner_user_id, link, days, period_seconds=period_seconds,
+            since_dt=range_since, until_dt=range_until,
         )
         for link in chat_links
     ]

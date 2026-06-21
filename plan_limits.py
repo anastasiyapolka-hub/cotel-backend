@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone, timedelta, date
 from typing import Any, Optional
 
@@ -150,6 +151,90 @@ def ensure_days_within_plan(*, requested_days: int, plan: Plan) -> None:
                 "plan_limit_days": int(plan.qa_history_days),
             },
         )
+
+
+def parse_date_range_from_payload(payload: dict):
+    """
+    Разобрать абсолютный диапазон анализа {date_from, date_to} (ISO-8601, UTC).
+
+    Возвращает (since_dt, until_dt) как aware-datetime (UTC), либо (None, None),
+    если диапазон не задан (тогда используется относительный период
+    period_value/period_unit).
+
+    Контракт фронта: date_from и date_to — ISO-строки (обычно сформированы из
+    выбранных дат как начало/конец дня в локали пользователя и переведённые в
+    UTC через Date.toISOString()).
+
+    Валидирует только формат и порядок (date_from <= date_to). Лимит тарифа на
+    длину диапазона проверяется отдельно через ensure_range_within_plan (нужен
+    plan пользователя).
+
+    Бросает HTTPException(400) на некорректный ввод.
+    """
+    raw_from = payload.get("date_from")
+    raw_to = payload.get("date_to")
+
+    # Диапазон не задан вовсе — это нормально, работаем по относительному периоду.
+    if not raw_from and not raw_to:
+        return None, None
+
+    # Частично заданный диапазон — ошибка (фронт тоже это ловит, но дублируем).
+    if not raw_from or not raw_to:
+        raise HTTPException(status_code=400, detail={
+            "code": "DATE_RANGE_INCOMPLETE",
+            "message": "Укажите обе даты диапазона: «С» и «По».",
+        })
+
+    def _parse(s: str) -> datetime:
+        try:
+            # Поддержка суффикса 'Z' (Date.toISOString) — fromisoformat в 3.11+
+            # умеет 'Z', но на всякий случай нормализуем.
+            v = str(s).strip()
+            if v.endswith("Z"):
+                v = v[:-1] + "+00:00"
+            dt = datetime.fromisoformat(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail={
+                "code": "DATE_RANGE_INVALID",
+                "message": "Некорректный формат даты диапазона.",
+            })
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    since_dt = _parse(raw_from)
+    until_dt = _parse(raw_to)
+
+    if since_dt > until_dt:
+        raise HTTPException(status_code=400, detail={
+            "code": "DATE_RANGE_ORDER",
+            "message": "Дата «С» не может быть позже даты «По».",
+        })
+
+    return since_dt, until_dt
+
+
+def ensure_range_within_plan(*, since_dt: datetime, until_dt: datetime, plan: Plan) -> int:
+    """
+    Проверить, что длина диапазона (until - since) не превышает лимит тарифа
+    qa_history_days. Возвращает длину диапазона в днях (ceil, минимум 1) —
+    используется для логов и расчёта dynamic_limit при выборке.
+    """
+    span_seconds = max(0, int((until_dt - since_dt).total_seconds()))
+    span_days = max(1, math.ceil(span_seconds / 86400.0))
+    if span_days > int(plan.qa_history_days):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PLAN_HISTORY_LIMIT_EXCEEDED",
+                "message": (
+                    f"Ваш тариф позволяет анализировать диапазон не больше "
+                    f"{int(plan.qa_history_days)} дней. Сократите период «С–По»."
+                ),
+                "plan_limit_days": int(plan.qa_history_days),
+            },
+        )
+    return span_days
 
 
 # ---------------------------------------------------------------------------

@@ -332,9 +332,19 @@ async def read_messages_from_entity(
     days: int,
     *,
     period_seconds: Optional[int] = None,
+    since_dt: Optional[datetime] = None,
+    until_dt: Optional[datetime] = None,
 ) -> list[dict]:
-    # period_seconds приоритетнее days — поддерживает минуты/часы.
-    if period_seconds is not None and int(period_seconds) > 0:
+    # Приоритет окна: абсолютный диапазон since_dt..until_dt → period_seconds →
+    # days. until_dt передаётся в iter_messages как offset_date (верхняя граница).
+    if since_dt is not None:
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        if until_dt is not None and until_dt.tzinfo is None:
+            until_dt = until_dt.replace(tzinfo=timezone.utc)
+        span_ref = until_dt or utcnow()
+        requested_days = max(int((span_ref - since_dt).total_seconds()) // 86400, 1)
+    elif period_seconds is not None and int(period_seconds) > 0:
         since_dt = utcnow() - timedelta(seconds=int(period_seconds))
         requested_days = max(int(period_seconds) // 86400, 1)
     else:
@@ -347,7 +357,10 @@ async def read_messages_from_entity(
     # since_dt, и модель получает только последние пару дней данных
     # вместо запрошенного периода. См. ту же логику в telegram_service.py.
     dynamic_limit = min(80_000, max(SERVICE_ACCOUNT_MAX_FETCH_MESSAGES, requested_days * 1_500))
-    async for msg in client.iter_messages(entity, limit=dynamic_limit):
+    iter_kwargs = {"limit": dynamic_limit}
+    if until_dt is not None:
+        iter_kwargs["offset_date"] = until_dt  # верхняя граница диапазона
+    async for msg in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(msg, Message):
             continue
 
@@ -784,6 +797,8 @@ async def fetch_public_chat_messages(
     chat_ref: str,
     days: int,
     period_seconds: Optional[int] = None,
+    since_dt: Optional[datetime] = None,
+    until_dt: Optional[datetime] = None,
 ) -> Tuple[object, list[dict]]:
     client = await get_service_tg_client(db, service_account_id)
 
@@ -799,7 +814,8 @@ async def fetch_public_chat_messages(
         entity = await ensure_join_and_access(client, normalized_ref, entity)
 
         messages = await read_messages_from_entity(
-            client, entity, days, period_seconds=period_seconds
+            client, entity, days, period_seconds=period_seconds,
+            since_dt=since_dt, until_dt=until_dt,
         )
         return entity, messages
 
@@ -1290,6 +1306,8 @@ async def analyze_chat_via_service_account(
     ai_model: str,
     fallback_language: str = "en",
     period_seconds: Optional[int] = None,
+    since_dt: Optional[datetime] = None,
+    until_dt: Optional[datetime] = None,
 ) -> dict:
     import time as _time  # local import to avoid touching module header
 
@@ -1316,6 +1334,8 @@ async def analyze_chat_via_service_account(
                 chat_ref=normalized_ref,
                 days=days,
                 period_seconds=period_seconds,
+                since_dt=since_dt,
+                until_dt=until_dt,
             )
             fetch_duration_ms = int((_time.perf_counter() - _fetch_t0) * 1000)
 

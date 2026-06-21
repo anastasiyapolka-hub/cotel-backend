@@ -21,6 +21,9 @@ from plan_limits import (
     build_usage_snapshot,
     resolve_ai_model_for_user,
     parse_period_from_payload,
+    parse_date_range_from_payload,
+    ensure_range_within_plan,
+    get_user_plan,
 )
 from llm import (
     estimate_llm_cost_usd,
@@ -43,6 +46,10 @@ class ServiceAnalyzeRequest(BaseModel):
     # plan_limits.parse_period_from_payload.
     period_value: int | None = None
     period_unit: str | None = None
+    # Абсолютный диапазон {date_from, date_to} (ISO-8601, UTC). Если заданы обе
+    # даты — приоритетнее относительного периода. См. plan_limits.parse_date_range_from_payload.
+    date_from: str | None = None
+    date_to: str | None = None
     ai_model: str | None = None
 
 
@@ -65,14 +72,27 @@ async def tg_service_analyze_chat(
     })
     requested_days_for_log = period_value if period_unit == "days" else 1
 
+    # Абсолютный диапазон {date_from, date_to} — приоритетнее относительного.
+    range_since, range_until = parse_date_range_from_payload({
+        "date_from": payload.date_from,
+        "date_to": payload.date_to,
+    })
+    if range_since is not None and range_until is not None:
+        plan = await get_user_plan(db, user)
+        requested_days_for_log = ensure_range_within_plan(
+            since_dt=range_since, until_dt=range_until, plan=plan,
+        )
+
     # enforce_qa_limits writes qa_request_rejected itself on 429.
+    # При абсолютном диапазоне планная проверка дней уже сделана выше
+    # (ensure_range_within_plan), поэтому здесь её пропускаем.
     await enforce_qa_limits(
         db,
         user=user,
         requested_days=requested_days_for_log,
         source_mode="service",
         chat_ref=payload.chat_link,
-        skip_days_plan_check=(period_unit != "days"),
+        skip_days_plan_check=(period_unit != "days" or range_since is not None),
     )
 
     ai_model = resolve_ai_model_for_user(
@@ -94,6 +114,8 @@ async def tg_service_analyze_chat(
             ai_model=ai_model,
             fallback_language=user.language,
             period_seconds=period_seconds,
+            since_dt=range_since,
+            until_dt=range_until,
         )
     except ServiceAccountError as e:
         # Telegram/service-account failure — no LLM call happened (or LLM
