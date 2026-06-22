@@ -993,12 +993,6 @@ async def run_qa(
     user_prompt = (
         f"{time_block}\n\n"
         f"Chat name: {chat_name}\n\n"
-        "Each message line is labelled with an author tag [author:<id>] right "
-        "before the text. When you cite a message, reproduce its [author:<id>] "
-        "tag EXACTLY as shown (whole token with brackets and number) instead of "
-        "a name — our system replaces [author:<id>] with the real @username "
-        "after you answer. Do not invent author tags and do not turn them into "
-        "names yourself.\n\n"
         f"Chat messages (oldest to newest):\n{context}\n\n"
         f"User question:\n{user_query}"
     )
