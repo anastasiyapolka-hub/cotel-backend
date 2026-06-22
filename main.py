@@ -1914,11 +1914,13 @@ async def tg_analyze_chat(
     total_t0 = time.perf_counter()
 
     # -------- FETCH messages from Telegram --------
+    fetch_stats: dict = {}
     fetch_t0 = time.perf_counter()
     try:
         entity, messages = await fetch_chat_messages(
             db, owner_user_id, chat_link, days, period_seconds=period_seconds,
             since_dt=range_since, until_dt=range_until,
+            fetch_stats=fetch_stats,
         )
     except ValueError as ve:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
@@ -1930,6 +1932,7 @@ async def tg_analyze_chat(
             query_chars=query_chars or None,
             requested_days=days, depth=depth,
             duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            fetch_stats=fetch_stats,
         )
         await db.commit()
         raise HTTPException(status_code=400, detail=str(ve))
@@ -1943,6 +1946,7 @@ async def tg_analyze_chat(
             query_chars=query_chars or None,
             requested_days=days, depth=depth,
             duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            fetch_stats=fetch_stats,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="TELEGRAM_FETCH_FAILED")
@@ -1987,6 +1991,7 @@ async def tg_analyze_chat(
             context_chars=context_chars,
             duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
             duration_ms_llm=llm_ms,
+            fetch_stats=fetch_stats,
         )
         await db.commit()
         raise HTTPException(status_code=502, detail="LLM_ERROR")
@@ -2081,6 +2086,7 @@ async def tg_analyze_chat(
             duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
             duration_ms_llm=llm_ms,
             qa_result=qa_result, tokens_charged=0,
+            fetch_stats=fetch_stats,
         )
         await db.commit()
         return _build_qa_response(
@@ -2118,6 +2124,7 @@ async def tg_analyze_chat(
         duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         duration_ms_llm=llm_ms,
         qa_result=qa_result, tokens_charged=tokens_charged,
+        fetch_stats=fetch_stats,
     )
 
     await billing.debit(
@@ -2186,6 +2193,7 @@ async def _record_qa_success_event(
     duration_ms_llm: int,
     qa_result,
     tokens_charged: int,
+    fetch_stats: Optional[dict] = None,
 ) -> int:
     """
     Записать UsageEvent об успешном Q&A запросе в новой схеме.
@@ -2244,6 +2252,8 @@ async def _record_qa_success_event(
     if qa_result.is_empty:
         meta["is_empty"] = True
 
+    meta.update(_fetch_stats_meta(fetch_stats))
+
     event = UsageEvent(
         user_id=user.id,
         event_type="qa_request_success",
@@ -2273,6 +2283,7 @@ async def _record_qa_failure_event(
     duration_ms_total: Optional[int] = None,
     duration_ms_fetch: Optional[int] = None,
     duration_ms_llm: Optional[int] = None,
+    fetch_stats: Optional[dict] = None,
 ) -> None:
     """
     Записать UsageEvent о failed Q&A запросе. Биллинг НЕ списывается на
@@ -2290,6 +2301,7 @@ async def _record_qa_failure_event(
         "error_code": error_code,
         "error_message": error_message,
     })
+    meta.update(_drop_none(_fetch_stats_meta(fetch_stats)))
     db.add(UsageEvent(
         user_id=user.id,
         event_type="qa_request_failure",
@@ -2303,6 +2315,22 @@ async def _record_qa_failure_event(
 def _drop_none(d: dict) -> dict:
     """Убрать ключи с None-значениями (чтобы не раздувать meta_json)."""
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _fetch_stats_meta(fetch_stats: Optional[dict]) -> dict:
+    """
+    Поля диагностики выгрузки из Telegram для meta_json (видны в админке).
+    Заполняются в telegram_service.fetch_chat_messages через переданный
+    словарь fetch_stats.
+    """
+    if not fetch_stats:
+        return {}
+    return {
+        "sender_lookups": fetch_stats.get("sender_lookups"),
+        "unique_senders": fetch_stats.get("unique_senders"),
+        "flood_wait_count": fetch_stats.get("flood_waits"),
+        "flood_wait_total_seconds": fetch_stats.get("flood_seconds"),
+    }
 
 
 def _media_filter_fee_days(*, period_seconds: Optional[int], days: int) -> int:

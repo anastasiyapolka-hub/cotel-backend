@@ -1,5 +1,6 @@
 # telegram_service.py
 import asyncio
+import logging
 import os
 import base64
 import secrets
@@ -13,6 +14,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
     PhoneNumberInvalidError,
+    FloodWaitError,
 )
 from telethon.errors import InviteHashInvalidError, InviteHashExpiredError, UserAlreadyParticipantError
 
@@ -349,6 +351,53 @@ async def get_current_user(db: AsyncSession, owner_user_id: int):
     return await client.get_me()
 
 
+log = logging.getLogger(__name__)
+
+
+async def _resolve_sender_cached(
+    msg,
+    cache: Dict[int, str],
+    stats: dict,
+) -> Tuple[Optional[int], str]:
+    """
+    Имя автора сообщения с кэшем по sender_id.
+
+    Раньше get_sender() вызывался на КАЖДОЕ сообщение — в активных чатах это
+    тысячи лишних обращений к Telegram и главный источник FloodWait/долгой
+    выгрузки. Уникальных авторов в чате на порядки меньше, поэтому имя по id
+    автора узнаём один раз и переиспользуем.
+
+    `stats` — мутабельный словарь со счётчиками для диагностики выгрузки.
+    """
+    sid = getattr(msg, "sender_id", None)
+    if sid is not None and sid in cache:
+        return sid, cache[sid]
+
+    stats["sender_lookups"] = stats.get("sender_lookups", 0) + 1
+    display = "Unknown"
+    try:
+        sender = await msg.get_sender()
+        if sender is not None:
+            if getattr(sender, "username", None):
+                display = "@" + sender.username
+            else:
+                first = (getattr(sender, "first_name", "") or "").strip()
+                last = (getattr(sender, "last_name", "") or "").strip()
+                display = (first + " " + last).strip() or "Unknown"
+    except FloodWaitError as e:
+        wait_sec = int(getattr(e, "seconds", 0) or 0)
+        stats["flood_waits"] = stats.get("flood_waits", 0) + 1
+        stats["flood_seconds"] = stats.get("flood_seconds", 0) + wait_sec
+        log.warning("QA_DIAG flood_wait stage=get_sender seconds=%d", wait_sec)
+        return sid, display  # Unknown не кэшируем — позволяем повторить позже
+    except Exception:
+        pass
+
+    if sid is not None:
+        cache[sid] = display
+    return sid, display
+
+
 async def fetch_chat_messages(
     db: AsyncSession,
     owner_user_id: int,
@@ -358,6 +407,7 @@ async def fetch_chat_messages(
     period_seconds: Optional[int] = None,
     since_dt: Optional[datetime] = None,
     until_dt: Optional[datetime] = None,
+    fetch_stats: Optional[dict] = None,
 ):
     """
     Возвращает:
@@ -500,6 +550,9 @@ async def fetch_chat_messages(
                 raise ValueError(f"CHAT_RESOLVE_FAILED: {str(e)}")
 
     collected = []
+    sender_cache: Dict[int, str] = {}
+    if fetch_stats is None:
+        fetch_stats = {}
     try:
         # Telethon iter_messages возвращает от новых к старым.
         # Масштабируемый limit: в активных чатах (например, «квартиры в
@@ -547,20 +600,7 @@ async def fetch_chat_messages(
             if not text:
                 continue
 
-            sender_name = "Unknown"
-            try:
-                sender = await msg.get_sender()
-                if sender is not None:
-                    # username предпочтительнее, иначе имя/фамилия
-                    if getattr(sender, "username", None):
-                        sender_name = "@" + sender.username
-                    else:
-                        first = (getattr(sender, "first_name", "") or "").strip()
-                        last = (getattr(sender, "last_name", "") or "").strip()
-                        sender_name = (first + " " + last).strip() or "Unknown"
-            except Exception:
-                # если не получилось получить отправителя — не критично
-                pass
+            _, sender_name = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
 
             collected.append({
                 "message_id": getattr(msg, "id", None),
@@ -574,6 +614,15 @@ async def fetch_chat_messages(
 
     # collected сейчас от новых к старым — разворачиваем, чтобы было "старые -> новые"
     collected.reverse()
+
+    fetch_stats["unique_senders"] = len(sender_cache)
+    fetch_stats["kept"] = len(collected)
+    log.warning(
+        "QA_DIAG fetch path=personal kept=%d sender_lookups=%d unique_senders=%d "
+        "floods=%d flood_sec=%d",
+        len(collected), fetch_stats.get("sender_lookups", 0), len(sender_cache),
+        fetch_stats.get("flood_waits", 0), fetch_stats.get("flood_seconds", 0),
+    )
 
     return entity, collected
 
@@ -923,6 +972,8 @@ async def fetch_chat_messages_for_subscription(
         since_dt = since_dt.replace(tzinfo=timezone.utc)
 
     out = []
+    sender_cache: Dict[int, str] = {}
+    fetch_stats: dict = {}
     async for msg in client.iter_messages(entity, limit=limit, min_id=min_id or 0):
         if not msg or not getattr(msg, "date", None):
             continue
@@ -939,20 +990,7 @@ async def fetch_chat_messages_for_subscription(
         if not text:
             continue
 
-        author_id = None
-        author_display = "Unknown"
-        try:
-            sender = await msg.get_sender()
-            if sender is not None:
-                author_id = getattr(sender, "id", None)
-                if getattr(sender, "username", None):
-                    author_display = "@" + sender.username
-                else:
-                    first = (getattr(sender, "first_name", "") or "").strip()
-                    last = (getattr(sender, "last_name", "") or "").strip()
-                    author_display = (first + " " + last).strip() or "Unknown"
-        except Exception:
-            pass
+        author_id, author_display = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
 
         reply_to = None
         try:
@@ -970,6 +1008,14 @@ async def fetch_chat_messages_for_subscription(
         })
 
     out.reverse()  # старые -> новые
+
+    log.warning(
+        "QA_DIAG fetch path=subscription kept=%d sender_lookups=%d unique_senders=%d "
+        "floods=%d flood_sec=%d",
+        len(out), fetch_stats.get("sender_lookups", 0), len(sender_cache),
+        fetch_stats.get("flood_waits", 0), fetch_stats.get("flood_seconds", 0),
+    )
+
     return entity, out
 
 async def qr_login_status(db: AsyncSession, owner_user_id: int):

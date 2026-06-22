@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -20,9 +21,11 @@ from db.models import (
     ServiceAccountLog,
     ServiceAccountStatusHistory,
 )
-from telegram_service import decrypt_session
+from telegram_service import decrypt_session, _resolve_sender_cached
 from llm.service import summarize_chat_messages
 from llm.usage import LlmTextResult, LlmUsage
+
+log = logging.getLogger(__name__)
 
 # =========================
 # Константы MVP
@@ -351,6 +354,8 @@ async def read_messages_from_entity(
         since_dt = utcnow() - timedelta(days=int(days))
         requested_days = max(int(days), 1)
     collected: list[dict] = []
+    sender_cache: dict[int, str] = {}
+    fetch_stats: dict = {}
 
     # Масштабируемый limit для активных публичных чатов — иначе fetcher
     # упирается в SERVICE_ACCOUNT_MAX_FETCH_MESSAGES (1000) задолго до
@@ -378,18 +383,7 @@ async def read_messages_from_entity(
         if not text:
             continue
 
-        sender_name = "Unknown"
-        try:
-            sender = await msg.get_sender()
-            if sender is not None:
-                if getattr(sender, "username", None):
-                    sender_name = "@" + sender.username
-                else:
-                    first = (getattr(sender, "first_name", "") or "").strip()
-                    last = (getattr(sender, "last_name", "") or "").strip()
-                    sender_name = (first + " " + last).strip() or "Unknown"
-        except Exception:
-            pass
+        _, sender_name = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
 
         # Reply linkage: Telethon does not duplicate the parent message's
         # text in `msg.message`, so we carry only the parent message_id.
@@ -422,6 +416,14 @@ async def read_messages_from_entity(
         )
 
     collected.reverse()
+
+    log.warning(
+        "QA_DIAG fetch path=service kept=%d sender_lookups=%d unique_senders=%d "
+        "floods=%d flood_sec=%d",
+        len(collected), fetch_stats.get("sender_lookups", 0), len(sender_cache),
+        fetch_stats.get("flood_waits", 0), fetch_stats.get("flood_seconds", 0),
+    )
+
     return collected
 
 async def log_event(
@@ -1072,6 +1074,8 @@ async def fetch_service_chat_messages_for_subscription(
         entity = await ensure_join_and_access(client, normalized_ref, entity)
 
         rows: list[dict] = []
+        sender_cache: dict[int, str] = {}
+        fetch_stats: dict = {}
         async for msg in client.iter_messages(entity, limit=limit):
             if not isinstance(msg, Message):
                 continue
@@ -1095,20 +1099,7 @@ async def fetch_service_chat_messages_for_subscription(
             if not text:
                 continue
 
-            author_id = None
-            author_display = "Unknown"
-            try:
-                sender = await msg.get_sender()
-                if sender is not None:
-                    author_id = getattr(sender, "id", None)
-                    if getattr(sender, "username", None):
-                        author_display = "@" + sender.username
-                    else:
-                        first = (getattr(sender, "first_name", "") or "").strip()
-                        last = (getattr(sender, "last_name", "") or "").strip()
-                        author_display = (first + " " + last).strip() or "Unknown"
-            except Exception:
-                pass
+            author_id, author_display = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
 
             reply_to = getattr(msg, "reply_to_msg_id", None)
             if reply_to is None:
@@ -1127,6 +1118,13 @@ async def fetch_service_chat_messages_for_subscription(
             )
 
         rows.reverse()
+
+        log.warning(
+            "QA_DIAG fetch path=service_subscription kept=%d sender_lookups=%d "
+            "unique_senders=%d floods=%d flood_sec=%d",
+            len(rows), fetch_stats.get("sender_lookups", 0), len(sender_cache),
+            fetch_stats.get("flood_waits", 0), fetch_stats.get("flood_seconds", 0),
+        )
 
         now = utcnow()
         account.last_used_at = now
