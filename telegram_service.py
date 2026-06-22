@@ -398,6 +398,55 @@ async def _resolve_sender_cached(
     return sid, display
 
 
+def _name_from_entity(ent) -> str:
+    """Отображаемое имя автора из Telethon-entity: @логин, иначе Имя Фамилия."""
+    if ent is None:
+        return "Unknown"
+    if getattr(ent, "username", None):
+        return "@" + ent.username
+    first = (getattr(ent, "first_name", "") or "").strip()
+    last = (getattr(ent, "last_name", "") or "").strip()
+    name = (first + " " + last).strip()
+    if name:
+        return name
+    return getattr(ent, "title", None) or "Unknown"
+
+
+async def resolve_sender_logins(
+    db: AsyncSession,
+    owner_user_id: int,
+    sender_ids,
+) -> Dict[int, str]:
+    """
+    Разрешить отображаемые имена для НЕБОЛЬШОГО набора sender_id — тех авторов,
+    что LLM процитировала в ответе (Вариант А).
+
+    Резолвим через клиент пользователя; access_hash авторов уже в кэше сессии
+    после выгрузки. Неразрешимые id (удалённый аккаунт и т.п.) тихо пропускаем.
+    Никогда не бросает исключения наружу.
+    """
+    result: Dict[int, str] = {}
+    ids = [int(s) for s in dict.fromkeys(sender_ids) if s is not None]
+    if not ids:
+        return result
+    try:
+        client = await ensure_connected(db, owner_user_id)
+    except Exception:
+        return result
+    for sid in ids:
+        try:
+            ent = await client.get_entity(sid)
+            result[sid] = _name_from_entity(ent)
+        except FloodWaitError as e:
+            log.warning(
+                "QA_DIAG flood_wait stage=resolve_logins seconds=%d",
+                int(getattr(e, "seconds", 0) or 0),
+            )
+        except Exception:
+            pass
+    return result
+
+
 async def fetch_chat_messages(
     db: AsyncSession,
     owner_user_id: int,
@@ -408,6 +457,7 @@ async def fetch_chat_messages(
     since_dt: Optional[datetime] = None,
     until_dt: Optional[datetime] = None,
     fetch_stats: Optional[dict] = None,
+    resolve_authors: bool = True,
 ):
     """
     Возвращает:
@@ -600,12 +650,21 @@ async def fetch_chat_messages(
             if not text:
                 continue
 
-            _, sender_name = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
+            sender_id = getattr(msg, "sender_id", None)
+            if resolve_authors:
+                _, sender_name = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
+            else:
+                # Вариант А: имя НЕ разрешаем на выгрузке (это и есть источник
+                # долгого зависания на активных чатах). Храним только числовой
+                # sender_id; @логин подставится после ответа LLM для
+                # процитированных авторов (см. resolve_sender_logins).
+                sender_name = None
 
             collected.append({
                 "message_id": getattr(msg, "id", None),
                 "date": msg_dt.isoformat(),
                 "from": sender_name,
+                "sender_id": sender_id,
                 "text": text,
             })
 

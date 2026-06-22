@@ -90,6 +90,7 @@ from telegram_service import (
     fetch_chat_messages_for_subscription,
     export_string_session,
     save_user_telegram_session,
+    resolve_sender_logins,
 )
 from service_account_service import (
     ServiceAccountError,
@@ -1813,6 +1814,7 @@ async def tg_confirm_password(
 @app.post("/tg/analyze_chat")
 async def tg_analyze_chat(
     payload: dict,
+    request: Request,
     user: User = Depends(auth_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1920,7 +1922,7 @@ async def tg_analyze_chat(
         entity, messages = await fetch_chat_messages(
             db, owner_user_id, chat_link, days, period_seconds=period_seconds,
             since_dt=range_since, until_dt=range_until,
-            fetch_stats=fetch_stats,
+            fetch_stats=fetch_stats, resolve_authors=False,
         )
     except ValueError as ve:
         fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
@@ -1964,6 +1966,24 @@ async def tg_analyze_chat(
     chat_name = (
         getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
     )
+
+    # Клиент мог отвалиться за время выгрузки — тогда не тратим LLM и не
+    # списываем токены (см. также проверку перед billing.debit ниже).
+    if await request.is_disconnected():
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_failure_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            error_code="CLIENT_DISCONNECTED",
+            error_message="client disconnected during fetch",
+            query_chars=query_chars or None,
+            requested_days=days, depth=depth,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars,
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            fetch_stats=fetch_stats,
+        )
+        await db.commit()
+        raise HTTPException(status_code=499, detail="CLIENT_DISCONNECTED")
 
     # -------- LLM call через новый pipeline --------
     llm_t0 = time.perf_counter()
@@ -2062,6 +2082,9 @@ async def tg_analyze_chat(
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
     summary = qa_result.text
+    # Вариант А: подставляем реальные @логины вместо токенов [author:ID]
+    # (резолвим только процитированных авторов — несколько десятков).
+    summary = await _substitute_author_logins(db, owner_user_id, summary)
 
     # -------- Chat history (всегда, даже если is_empty) --------
     await upsert_user_chat_history(
@@ -2114,6 +2137,24 @@ async def tg_analyze_chat(
             in_per_1k=rates.in_per_1k,
             out_per_1k=rates.out_per_1k,
         )
+
+    # Клиент отвалился, пока готовился ответ (фронт/прокси оборвал долгий
+    # запрос) — пользователь ответа не получит, поэтому НЕ списываем токены.
+    # Фиксируем как успешный запрос с нулевым списанием (видно в админке).
+    if await request.is_disconnected():
+        total_ms = int((time.perf_counter() - total_t0) * 1000)
+        await _record_qa_success_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            depth=depth, requested_days=days, query_chars=query_chars,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars, answer_chars=len(summary or ""),
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+            qa_result=qa_result, tokens_charged=0,
+            fetch_stats=fetch_stats,
+        )
+        await db.commit()
+        raise HTTPException(status_code=499, detail="CLIENT_DISCONNECTED")
 
     # -------- UsageEvent + billing.debit + UserQueryLog (атомарно) --------
     usage_event_id = await _record_qa_success_event(
@@ -2331,6 +2372,35 @@ def _fetch_stats_meta(fetch_stats: Optional[dict]) -> dict:
         "flood_wait_count": fetch_stats.get("flood_waits"),
         "flood_wait_total_seconds": fetch_stats.get("flood_seconds"),
     }
+
+
+_AUTHOR_TOKEN_RE = re.compile(r"\[author:(\d+)\]")
+
+
+async def _substitute_author_logins(
+    db: AsyncSession,
+    owner_user_id: int,
+    text: str,
+) -> str:
+    """
+    Вариант А: заменить токены [author:ID] в ответе LLM на реальные @логины.
+
+    Резолвим ТОЛЬКО тех авторов, которых модель процитировала (несколько
+    десятков), а не всех из выгрузки. Неразрешённые id заменяем нейтральным
+    «участник», чтобы в ответе не осталось сырых токенов.
+    """
+    if not text:
+        return text
+    ids = {int(m) for m in _AUTHOR_TOKEN_RE.findall(text)}
+    if not ids:
+        return text
+    logins = await resolve_sender_logins(db, owner_user_id, ids)
+
+    def _repl(match: "re.Match") -> str:
+        sid = int(match.group(1))
+        return logins.get(sid) or "участник"
+
+    return _AUTHOR_TOKEN_RE.sub(_repl, text)
 
 
 def _media_filter_fee_days(*, period_seconds: Optional[int], days: int) -> int:

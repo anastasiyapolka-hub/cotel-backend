@@ -993,6 +993,12 @@ async def run_qa(
     user_prompt = (
         f"{time_block}\n\n"
         f"Chat name: {chat_name}\n\n"
+        "Each message line is labelled with an author tag [author:<id>] right "
+        "before the text. When you cite a message, reproduce its [author:<id>] "
+        "tag EXACTLY as shown (whole token with brackets and number) instead of "
+        "a name — our system replaces [author:<id>] with the real @username "
+        "after you answer. Do not invent author tags and do not turn them into "
+        "names yourself.\n\n"
         f"Chat messages (oldest to newest):\n{context}\n\n"
         f"User question:\n{user_query}"
     )
@@ -1125,13 +1131,29 @@ async def run_qa_group(
 def _format_qa_chat_context(cleaned_messages: list[dict]) -> str:
     """
     Сформировать context-строку «по строке на сообщение».
-    Формат: `[date] [msg:ID] [reply→msg:PID] sender: text`.
-    Идентичен логике в старой summarize_chat_messages.
+    Формат: `[date] [msg:ID] [reply→msg:PID] [author:SENDER_ID]: text`.
+
+    Автор передаётся НЕ именем, а токеном `[author:<sender_id>]` (числовой id,
+    бесплатный из Telegram). Имя/логин не разрешается на этапе выгрузки (это
+    тысячи лишних запросов и долгое зависание) — `@логин` подставляется уже
+    ПОСЛЕ ответа LLM только для процитированных авторов (см. main.py,
+    подстановку через resolve_sender_logins). LLM инструктируется копировать
+    токен `[author:ID]` дословно, как и `[msg:ID]`.
+
+    Fallback: если sender_id отсутствует — используем имя из поля `from`
+    (совместимость со старым форматом).
     """
     lines: list[str] = []
     for msg in cleaned_messages:
         date = msg.get("date") or ""
-        sender = msg.get("from") or "Unknown"
+        sender_id = msg.get("sender_id")
+        if sender_id is not None:
+            try:
+                author_token = f"[author:{int(sender_id)}]"
+            except (TypeError, ValueError):
+                author_token = msg.get("from") or "Unknown"
+        else:
+            author_token = msg.get("from") or "Unknown"
         text = msg.get("text") or ""
         msg_id = msg.get("message_id")
         reply_to = msg.get("reply_to")
@@ -1144,7 +1166,7 @@ def _format_qa_chat_context(cleaned_messages: list[dict]) -> str:
             except (TypeError, ValueError):
                 pass
         prefix = " ".join(prefix_parts)
-        lines.append(f"{prefix} {sender}: {text}")
+        lines.append(f"{prefix} {author_token}: {text}")
     return "\n".join(lines)
 
 
