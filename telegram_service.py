@@ -654,11 +654,25 @@ async def fetch_chat_messages(
             if resolve_authors:
                 _, sender_name = await _resolve_sender_cached(msg, sender_cache, fetch_stats)
             else:
-                # Вариант А: имя НЕ разрешаем на выгрузке (это и есть источник
-                # долгого зависания на активных чатах). Храним только числовой
-                # sender_id; @логин подставится после ответа LLM для
-                # процитированных авторов (см. resolve_sender_logins).
+                # Вариант А: НЕ делаем сетевых запросов за автором на выгрузке
+                # (это и есть источник долгого зависания на активных чатах).
+                # Но имя автора часто уже лежит в кэше Telethon (min-user из той
+                # же пачки сообщений) — читаем его бесплатно через msg.sender.
+                # Если там пусто — оставляем None, и @логин подставится после
+                # ответа LLM по токену [author:id] (см. resolve_sender_logins).
                 sender_name = None
+                cached_sender = getattr(msg, "sender", None)
+                if cached_sender is not None:
+                    nm = _name_from_entity(cached_sender)
+                    if nm and nm != "Unknown":
+                        sender_name = nm
+                        fetch_stats["named_from_cache"] = (
+                            fetch_stats.get("named_from_cache", 0) + 1
+                        )
+                if sender_name is None:
+                    fetch_stats["author_fallbacks"] = (
+                        fetch_stats.get("author_fallbacks", 0) + 1
+                    )
 
             collected.append({
                 "message_id": getattr(msg, "id", None),
@@ -678,8 +692,9 @@ async def fetch_chat_messages(
     fetch_stats["kept"] = len(collected)
     log.warning(
         "QA_DIAG fetch path=personal kept=%d sender_lookups=%d unique_senders=%d "
-        "floods=%d flood_sec=%d",
+        "named_from_cache=%d author_fallbacks=%d floods=%d flood_sec=%d",
         len(collected), fetch_stats.get("sender_lookups", 0), len(sender_cache),
+        fetch_stats.get("named_from_cache", 0), fetch_stats.get("author_fallbacks", 0),
         fetch_stats.get("flood_waits", 0), fetch_stats.get("flood_seconds", 0),
     )
 

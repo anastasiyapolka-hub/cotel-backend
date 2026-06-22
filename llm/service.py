@@ -1146,14 +1146,20 @@ def _format_qa_chat_context(cleaned_messages: list[dict]) -> str:
     lines: list[str] = []
     for msg in cleaned_messages:
         date = msg.get("date") or ""
+        sender_name = msg.get("from")
         sender_id = msg.get("sender_id")
-        if sender_id is not None:
+        if sender_name:
+            # Имя уже известно (резолв на выгрузке или бесплатный кэш) —
+            # отдаём его как есть, ответ выглядит как раньше.
+            author_token = sender_name
+        elif sender_id is not None:
+            # Имени нет — кладём токен, @логин подставится после ответа LLM.
             try:
                 author_token = f"[author:{int(sender_id)}]"
             except (TypeError, ValueError):
-                author_token = msg.get("from") or "Unknown"
+                author_token = "Unknown"
         else:
-            author_token = msg.get("from") or "Unknown"
+            author_token = "Unknown"
         text = msg.get("text") or ""
         msg_id = msg.get("message_id")
         reply_to = msg.get("reply_to")

@@ -2369,12 +2369,14 @@ def _fetch_stats_meta(fetch_stats: Optional[dict]) -> dict:
     return {
         "sender_lookups": fetch_stats.get("sender_lookups"),
         "unique_senders": fetch_stats.get("unique_senders"),
+        "named_from_cache": fetch_stats.get("named_from_cache"),
+        "author_fallbacks": fetch_stats.get("author_fallbacks"),
         "flood_wait_count": fetch_stats.get("flood_waits"),
         "flood_wait_total_seconds": fetch_stats.get("flood_seconds"),
     }
 
 
-_AUTHOR_TOKEN_RE = re.compile(r"\[author:(\d+)\]")
+_AUTHOR_TOKEN_RE = re.compile(r"\[author:(-?\d+)\]")
 
 
 async def _substitute_author_logins(
