@@ -3104,12 +3104,14 @@ def _build_group_response(
     usage_snapshot: dict,
 ) -> dict:
     """Собрать JSON-ответ endpoint'а tg_analyze_chats_group."""
+    total_messages = sum(int(c.get("messages_count") or 0) for c in per_chat)
     body = {
         "status": "ok",
         "group_size": group_size,
         "results": per_chat,
         "summary": group_summary,
         "source_mode": "personal",
+        "messages_count": total_messages,
         "tokens_charged": tokens_charged,
         "usage": usage_snapshot,
     }
