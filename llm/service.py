@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
 
@@ -8,6 +10,10 @@ from .models import resolve_model_config, DEFAULT_AI_MODEL
 from .adapters import get_adapter
 from .classifier import (
     ALL_CATEGORIES,
+    CATEGORY_DIGEST,
+    CATEGORY_FILTER_RANK,
+    CATEGORY_SIMPLE_QA,
+    CATEGORY_SOURCE_SYNTHESIS,
     ClassificationResult,
     DEFAULT_CATEGORY,
     classify_query,
@@ -24,9 +30,12 @@ from .usage import (
     LlmUsage,
     LlmTextResult,
     LlmJsonResult,
+    TOKENS_SOURCE_API,
     TOKENS_SOURCE_EMPTY,
 )
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +914,7 @@ class QaRunResult:
     llm: Optional[LlmRunResult]
     classification: Optional[ClassificationResult]
     decision: Optional[RoutingDecision]
+    chunks_count: int = 1  # >1 если ответ собран чанкованием (map-reduce)
 
 
 def _resolve_category(
@@ -927,6 +937,218 @@ def _resolve_category(
     if classification is not None:
         return classification.category, False
     return DEFAULT_CATEGORY, False
+
+
+# ---------------------------------------------------------------------------
+# Чанкование больших запросов (map-reduce)
+# ---------------------------------------------------------------------------
+#
+# Если контекст не влезает в безопасный бюджет модели — режем сообщения на
+# части (хронологически, в рамках ОДНОГО чата), на каждой части извлекаем
+# релевантное (map), затем отдельным вызовом собираем единый ответ с
+# дедупликацией (reduce). Включено только для хорошо делящихся категорий.
+# ---------------------------------------------------------------------------
+
+_CHUNKABLE_CATEGORIES = {
+    CATEGORY_FILTER_RANK,
+    CATEGORY_DIGEST,
+    CATEGORY_SIMPLE_QA,
+    CATEGORY_SOURCE_SYNTHESIS,
+}
+_CHUNK_BUDGET_FACTOR = 0.5     # доля лимита контекста модели на один кусок
+_CHARS_PER_TOKEN = 2.0         # консервативная оценка для кириллицы
+_MAX_CHUNKS = 16               # потолок числа частей (стоимость/время)
+_MAX_PARALLEL_CHUNKS = 3       # сколько частей гоним одновременно (волнами)
+
+
+def _chunk_messages_by_chars(
+    cleaned_messages: list[dict],
+    budget_chars: int,
+) -> list[list[dict]]:
+    """Разбить сообщения (в хронологическом порядке) на куски так, чтобы объём
+    текста в каждом куске не превышал budget_chars. Границы — между
+    сообщениями, сами сообщения не дробим."""
+    chunks: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_chars = 0
+    for m in cleaned_messages:
+        c = len(m.get("text") or "") + len(m.get("from") or "") + 40
+        if cur and cur_chars + c > budget_chars:
+            chunks.append(cur)
+            cur = []
+            cur_chars = 0
+        cur.append(m)
+        cur_chars += c
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _build_map_user_prompt(
+    time_block: str,
+    chat_name: str,
+    context: str,
+    user_query: str,
+    part_idx: int,
+    parts_total: int,
+) -> str:
+    return (
+        f"{time_block}\n\n"
+        f"Chat name: {chat_name}\n\n"
+        f"This is PART {part_idx} of {parts_total} of the chat history "
+        "(a contiguous time slice of ONE chat). Extract EVERY item relevant "
+        "to the user's question from THIS part only, using the same citation "
+        "format (author tag + short quote + [msg:ID]). Output findings only — "
+        "no intro, no conclusion, no 'nothing found' notes. If nothing in this "
+        "part is relevant, return an empty answer.\n\n"
+        f"Chat messages (oldest to newest):\n{context}\n\n"
+        f"User question:\n{user_query}"
+    )
+
+
+def _build_reduce_prompts(
+    user_query: str,
+    fallback_lang_name: str,
+    partial_texts: list[str],
+) -> tuple[str, str]:
+    system = (
+        "You are CoTel. You are given partial findings extracted independently "
+        "from consecutive parts of ONE Telegram chat, all answering the same "
+        "user question. Merge them into ONE final answer.\n"
+        "- Combine duplicates: if the same author or item appears in several "
+        "parts, keep it once.\n"
+        "- Preserve citations EXACTLY: keep every [msg:ID] token and author tag "
+        "as-is; never invent or renumber them.\n"
+        "- Keep only items relevant to the question; drop empty or off-topic "
+        "notes.\n"
+        "- Never repeat the same line more than once.\n"
+        f"- Write any narration in {fallback_lang_name} unless the question "
+        "clearly implies another language. No preamble, no restating the "
+        "question."
+    )
+    joined = "\n\n".join(
+        f"--- Part {i + 1} ---\n{t}"
+        for i, t in enumerate(partial_texts)
+        if (t or "").strip()
+    )
+    user = (
+        f"User question:\n{user_query}\n\n"
+        f"Partial findings to merge into one answer:\n{joined}"
+    )
+    return system, user
+
+
+def _sum_usages(usages: list[LlmUsage]) -> LlmUsage:
+    """Сумма usage по всем вызовам map+reduce — для биллинга по факту."""
+    if not usages:
+        return LlmUsage.empty()
+    in_t = sum(int(u.input_tokens) for u in usages)
+    out_t = sum(int(u.output_tokens) for u in usages)
+    think = sum(int(getattr(u, "thinking_tokens", 0) or 0) for u in usages)
+    total = sum(int(u.total_tokens) for u in usages)
+    source = (
+        TOKENS_SOURCE_API
+        if any(u.tokens_source == TOKENS_SOURCE_API for u in usages)
+        else usages[0].tokens_source
+    )
+    return LlmUsage(
+        input_tokens=in_t,
+        output_tokens=out_t,
+        total_tokens=total,
+        tokens_source=source,
+        thinking_tokens=think,
+    )
+
+
+async def _run_qa_chunked(
+    *,
+    cleaned_messages: list[dict],
+    user_query: str,
+    chat_name: str,
+    fallback_lang_name: str,
+    fallback_language: str,
+    requested_period_days: Optional[int],
+    decision: RoutingDecision,
+    classification: Optional[ClassificationResult],
+    chunk_budget_chars: int,
+) -> "QaRunResult":
+    chunks = _chunk_messages_by_chars(cleaned_messages, chunk_budget_chars)
+    if len(chunks) > _MAX_CHUNKS:
+        # Потолок: берём самые свежие части (хвост). Red-зону с подтверждением
+        # пользователя добавим отдельно.
+        log.warning(
+            "qa.chunked over_cap parts=%d cap=%d — берём последние %d",
+            len(chunks), _MAX_CHUNKS, _MAX_CHUNKS,
+        )
+        chunks = chunks[-_MAX_CHUNKS:]
+    parts_total = len(chunks)
+
+    oldest_date, newest_date = _extract_message_date_window(cleaned_messages)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+    system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
+
+    async def _map_one(chunk_msgs: list[dict], idx: int) -> LlmRunResult:
+        ctx = _format_qa_chat_context(chunk_msgs)
+        up = _build_map_user_prompt(
+            time_block, chat_name, ctx, user_query, idx + 1, parts_total
+        )
+        return await orchestrator_run(
+            decision=decision,
+            system_prompt=system_prompt,
+            user_prompt=up,
+            temperature=0.2,
+        )
+
+    # MAP — волнами по _MAX_PARALLEL_CHUNKS.
+    map_results: list[LlmRunResult] = []
+    for wave_start in range(0, parts_total, _MAX_PARALLEL_CHUNKS):
+        wave_idx = range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, parts_total))
+        wave = [_map_one(chunks[i], i) for i in wave_idx]
+        map_results.extend(await asyncio.gather(*wave))
+
+    partial_texts = [r.text for r in map_results]
+    usages = [r.usage for r in map_results]
+
+    # REDUCE — отдельный вызов: объединить, убрать дубли.
+    red_system, red_user = _build_reduce_prompts(
+        user_query, fallback_lang_name, partial_texts
+    )
+    reduce_result = await orchestrator_run(
+        decision=decision,
+        system_prompt=red_system,
+        user_prompt=red_user,
+        temperature=0.2,
+    )
+    usages.append(reduce_result.usage)
+
+    combined_usage = _sum_usages(usages)
+    combined_llm = LlmRunResult(
+        text=reduce_result.text,
+        usage=combined_usage,
+        finish_reason=reduce_result.finish_reason,
+        used_model=reduce_result.used_model,
+        primary_model=decision.primary_model,
+        attempted_models=reduce_result.attempted_models,
+        fallback_reasons=reduce_result.fallback_reasons,
+    )
+    log.warning(
+        "qa.chunked parts=%d model=%s in_tok=%d out_tok=%d",
+        parts_total, reduce_result.used_model.slug,
+        combined_usage.input_tokens, combined_usage.output_tokens,
+    )
+    return QaRunResult(
+        text=reduce_result.text,
+        is_empty=False,
+        llm=combined_llm,
+        classification=classification,
+        decision=decision,
+        chunks_count=parts_total,
+    )
 
 
 async def run_qa(
@@ -981,6 +1203,24 @@ async def run_qa(
         category=final_category,
         needs_structured_format=classification.needs_structured_format,
     )
+
+    # Чанкование: если контекст не влезает в безопасный бюджет выбранной
+    # модели И категория хорошо делится — режем на части, обрабатываем
+    # волнами и собираем единый ответ (map-reduce). Иначе — один вызов.
+    model_limit = getattr(decision.primary_model, "context_limit", 1_000_000)
+    chunk_budget_chars = int(model_limit * _CHUNK_BUDGET_FACTOR * _CHARS_PER_TOKEN)
+    if final_category in _CHUNKABLE_CATEGORIES and len(context) > chunk_budget_chars:
+        return await _run_qa_chunked(
+            cleaned_messages=cleaned_messages,
+            user_query=user_query,
+            chat_name=chat_name,
+            fallback_lang_name=fallback_lang_name,
+            fallback_language=fallback_language,
+            requested_period_days=requested_period_days,
+            decision=decision,
+            classification=classification,
+            chunk_budget_chars=chunk_budget_chars,
+        )
 
     system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
     oldest_date, newest_date = _extract_message_date_window(cleaned_messages)

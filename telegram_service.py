@@ -368,22 +368,34 @@ async def _resolve_sender_cached(
     автора узнаём один раз и переиспользуем.
 
     `stats` — мутабельный словарь со счётчиками для диагностики выгрузки.
+
+    Порядок: (1) кэш по sender_id, (2) БЕСПЛАТНОЕ имя из кэша Telethon
+    (`msg.sender`, min-user из той же пачки — без сети), (3) только если пусто —
+    сетевой get_sender(). Шаг (2) убирает тысячи лишних сетевых запросов на
+    активных чатах (раньше это был главный источник FloodWait и зависания) —
+    одинаково для группового запроса, подписок и служебных аккаунтов.
     """
     sid = getattr(msg, "sender_id", None)
     if sid is not None and sid in cache:
         return sid, cache[sid]
 
+    # (2) Бесплатно из кэша Telethon, без сетевого запроса.
+    cached_sender = getattr(msg, "sender", None)
+    if cached_sender is not None:
+        nm = _name_from_entity(cached_sender)
+        if nm and nm != "Unknown":
+            if sid is not None:
+                cache[sid] = nm
+            stats["named_from_cache"] = stats.get("named_from_cache", 0) + 1
+            return sid, nm
+
+    # (3) Fallback: сетевой запрос (медленно — считаем как lookup).
     stats["sender_lookups"] = stats.get("sender_lookups", 0) + 1
     display = "Unknown"
     try:
         sender = await msg.get_sender()
         if sender is not None:
-            if getattr(sender, "username", None):
-                display = "@" + sender.username
-            else:
-                first = (getattr(sender, "first_name", "") or "").strip()
-                last = (getattr(sender, "last_name", "") or "").strip()
-                display = (first + " " + last).strip() or "Unknown"
+            display = _name_from_entity(sender)
     except FloodWaitError as e:
         wait_sec = int(getattr(e, "seconds", 0) or 0)
         stats["flood_waits"] = stats.get("flood_waits", 0) + 1

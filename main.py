@@ -2085,6 +2085,8 @@ async def tg_analyze_chat(
     # Вариант А: подставляем реальные @логины вместо токенов [author:ID]
     # (резолвим только процитированных авторов — несколько десятков).
     summary = await _substitute_author_logins(db, owner_user_id, summary)
+    # Guardrail против петли повторения модели.
+    summary = _dedupe_repeated_lines(summary)
 
     # -------- Chat history (всегда, даже если is_empty) --------
     await upsert_user_chat_history(
@@ -2292,6 +2294,8 @@ async def _record_qa_success_event(
             meta.update(routing_meta(qa_result.llm, qa_result.decision))
     if qa_result.is_empty:
         meta["is_empty"] = True
+    if getattr(qa_result, "chunks_count", 1) and qa_result.chunks_count > 1:
+        meta["chunks_count"] = qa_result.chunks_count
 
     meta.update(_fetch_stats_meta(fetch_stats))
 
@@ -2403,6 +2407,27 @@ async def _substitute_author_logins(
         return logins.get(sid) or "участник"
 
     return _AUTHOR_TOKEN_RE.sub(_repl, text)
+
+
+def _dedupe_repeated_lines(text: str) -> str:
+    """
+    Guardrail против петли повторения LLM: модель иногда «залипает» и повторяет
+    один и тот же пункт списка много раз подряд. Убираем точные повторы
+    СОДЕРЖАТЕЛЬНЫХ строк (длиннее 20 символов), оставляя первое вхождение.
+    Короткие и пустые строки не трогаем, чтобы не ломать обычное форматирование.
+    """
+    if not text:
+        return text
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.split("\n"):
+        key = line.strip()
+        if len(key) > 20:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(line)
+    return "\n".join(out)
 
 
 def _media_filter_fee_days(*, period_seconds: Optional[int], days: int) -> int:
@@ -2652,6 +2677,8 @@ def _build_qa_response(
     if qa_result.classification is not None:
         body["detected_category"] = qa_result.classification.category
         body["detected_confidence"] = qa_result.classification.confidence
+    if getattr(qa_result, "chunks_count", 1) and qa_result.chunks_count > 1:
+        body["chunks_count"] = qa_result.chunks_count
 
     return body
 
@@ -2963,7 +2990,7 @@ async def tg_analyze_chats_group(
         raise HTTPException(status_code=502, detail="LLM_ERROR")
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
-    group_summary = qa_result.text
+    group_summary = _dedupe_repeated_lines(qa_result.text)
 
     # ---- Per-chat permalink maps ----
     # Build a {message_id: permalink} dict for each ok-chat. The

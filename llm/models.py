@@ -33,6 +33,11 @@ class ModelConfig:
     provider: str
     provider_model: str
     label: str
+    # Лимит входного контекста модели в токенах провайдера. Нужен для
+    # чанкования больших запросов: размер куска = context_limit * 0.5.
+    # По умолчанию 1M; для 200K-моделей (Sonnet, o-серия, reasoning-mini)
+    # переопределяем явно ниже.
+    context_limit: int = 1_000_000
 
 
 SUPPORTED_MODELS: dict[str, ModelConfig] = {
@@ -48,6 +53,7 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider="openai",
         provider_model="gpt-5.4-mini",
         label="OpenAI GPT-5.4 mini",
+        context_limit=200_000,  # reasoning-модель, консервативно
     ),
     OPENAI_PRO_MODEL_SLUG: ModelConfig(
         slug=OPENAI_PRO_MODEL_SLUG,
@@ -60,12 +66,14 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider="openai",
         provider_model="o3",
         label="OpenAI o3",
+        context_limit=200_000,
     ),
     OPENAI_O4_MINI_SLUG: ModelConfig(
         slug=OPENAI_O4_MINI_SLUG,
         provider="openai",
         provider_model="o4-mini",
         label="OpenAI o4-mini",
+        context_limit=200_000,
     ),
     # ---- Anthropic ----
     ANTHROPIC_HAIKU_SLUG: ModelConfig(
@@ -73,12 +81,14 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
         provider="anthropic",
         provider_model="claude-haiku-4-5",
         label="Claude Haiku 4.5",
+        context_limit=200_000,
     ),
     ANTHROPIC_MODEL_SLUG: ModelConfig(
         slug=ANTHROPIC_MODEL_SLUG,
         provider="anthropic",
         provider_model="claude-sonnet-4-6",
         label="Claude Sonnet 4.6",
+        context_limit=200_000,
     ),
     # ---- Google Gemini ----
     GEMINI_LITE_MODEL_SLUG: ModelConfig(
