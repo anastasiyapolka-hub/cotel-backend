@@ -685,6 +685,54 @@ class UsageEvent(Base):
         sa.Index("ix_usage_events_user_created", "user_id", "created_at"),
         sa.Index("ix_usage_events_user_type_created", "user_id", "event_type", "created_at"),
     )
+
+
+class AnalysisJob(Base):
+    """
+    Асинхронная задача анализа чата (личный одиночный Q&A).
+
+    Нужна, чтобы тяжёлый запрос (выгрузка + LLM, минуты) не упирался в
+    таймаут краевого прокси: submit создаёт строку и сразу отдаёт job_id,
+    фоновая задача пишет сюда статус/результат, фронт опрашивает по job_id.
+
+    `id` — публичный uuid-строкой (не перечислимый). `params_json` хранит
+    вход (чат, период, depth, текст запроса) — чтобы воркер был
+    самодостаточным. `result_json` — тот же словарь, что отдаёт
+    _build_qa_response, его фронт рендерит как обычный ответ.
+    """
+    __tablename__ = "analysis_jobs"
+
+    id = Column(String(36), primary_key=True)  # uuid4 — публичный job_id
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    # pending / running / done / error
+
+    source_mode = Column(String(20), nullable=True)  # personal (group — позже)
+
+    params_json = Column(JSONB, nullable=False)
+    result_json = Column(JSONB, nullable=True)
+
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    tokens_charged = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        sa.Index("ix_analysis_jobs_user_created", "user_id", "created_at"),
+    )
 # --Счетчики лимитов
 
 class EmailVerificationCode(Base):
