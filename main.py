@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request, Depends
+from fastapi import Request, Depends, BackgroundTasks
+from fastapi.encoders import jsonable_encoder
 from auth import router as auth_router
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 from diagnostics import router as diagnostics_router
@@ -15,6 +16,7 @@ import secrets
 
 from datetime import datetime, date, timezone, timedelta
 import time
+import uuid
 import sqlalchemy as sa
 import re
 
@@ -58,9 +60,10 @@ from db.models import (
     TokenTransaction,
     UserTokenBalance,
     SavedQuery,
+    AnalysisJob,
 )
 
-from db.session import get_db
+from db.session import get_db, AsyncSessionLocal
 from auth import get_current_user as auth_get_current_user
 from schemas.subscriptions import SubscriptionCreate, SubscriptionOut, ToggleRequest
 from schemas.saved_queries import SavedQueryCreate, SavedQueryUpdate, SavedQueryOut
@@ -2212,6 +2215,337 @@ async def tg_analyze_chat(
         entity=entity, messages=messages,
         usage_snapshot=await build_usage_snapshot(db, user=user),
     )
+
+
+# ---------------------------------------------------------------------------
+# Асинхронный личный одиночный Q&A (через таблицу analysis_jobs)
+# ---------------------------------------------------------------------------
+#
+# Тяжёлый запрос (выгрузка + LLM) не помещается в таймаут краевого прокси,
+# поэтому: submit делает быстрые пре-чеки, создаёт job и сразу отдаёт job_id;
+# фоновая задача в СВОЕЙ сессии БД выполняет работу и пишет результат в job;
+# фронт опрашивает /tg/analyze_job/{job_id}.
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+async def _run_personal_qa_core(
+    db: AsyncSession,
+    *,
+    user: User,
+    chat_link: str,
+    user_query: str,
+    depth: str,
+    days: int,
+    period_seconds: Optional[int],
+    range_since,
+    range_until,
+    explicit_category,
+) -> dict:
+    """
+    Тяжёлая часть личного одиночного Q&A: выгрузка → run_qa → подстановка
+    логинов/дедуп → история чата → биллинг → словарь ответа (как
+    _build_qa_response). Бросает Llm*Error / ValueError при сбоях — вызывающий
+    (фоновый воркер) мапит их в ошибку job.
+    """
+    owner_user_id = user.id
+    query_chars = len(user_query)
+    fetch_stats: dict = {}
+
+    total_t0 = time.perf_counter()
+    fetch_t0 = time.perf_counter()
+    entity, messages = await fetch_chat_messages(
+        db, owner_user_id, chat_link, days, period_seconds=period_seconds,
+        since_dt=range_since, until_dt=range_until,
+        fetch_stats=fetch_stats, resolve_authors=False,
+    )
+    fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+
+    messages_fetched_count = len(messages)
+    context_chars = sum(
+        len(m.get("text") or "") + len(m.get("from") or "") + len(m.get("date") or "") + 4
+        for m in messages
+    )
+    chat_name = (
+        getattr(entity, "title", None) or getattr(entity, "username", "Без названия")
+    )
+
+    llm_t0 = time.perf_counter()
+    qa_result = await run_qa(
+        user_query=user_query,
+        chat_name=chat_name,
+        text_messages=messages,
+        fallback_language=user.language,
+        depth=depth,
+        requested_period_days=days,
+        explicit_category=explicit_category,
+    )
+    llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+
+    summary = qa_result.text
+    summary = await _substitute_author_logins(db, owner_user_id, summary)
+    summary = _dedupe_repeated_lines(summary)
+
+    await upsert_user_chat_history(
+        db, owner_user_id=owner_user_id, source_mode="personal",
+        chat_ref=chat_link, chat_title=chat_name,
+        chat_username=getattr(entity, "username", None),
+        chat_id=getattr(entity, "id", None),
+    )
+
+    total_ms = int((time.perf_counter() - total_t0) * 1000)
+
+    if qa_result.is_empty:
+        await _record_qa_success_event(
+            db, user=user, source_mode="personal", chat_ref=chat_link,
+            depth=depth, requested_days=days, query_chars=query_chars,
+            messages_fetched_count=messages_fetched_count,
+            context_chars=context_chars, answer_chars=len(summary or ""),
+            duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+            duration_ms_llm=llm_ms,
+            qa_result=qa_result, tokens_charged=0, fetch_stats=fetch_stats,
+        )
+        await db.commit()
+        return _build_qa_response(
+            summary=summary, chat_name=chat_name,
+            messages_fetched_count=messages_fetched_count,
+            qa_result=qa_result, tokens_charged=0, entity=entity, messages=messages,
+            usage_snapshot=await build_usage_snapshot(db, user=user),
+        )
+
+    used_model_slug = qa_result.llm.used_model.slug
+    rates = await get_token_rates(db, used_model_slug)
+    if rates is None:
+        logging.getLogger(__name__).error(
+            "billing.no_pricing_row used_model=%s", used_model_slug
+        )
+        tokens_charged = 1
+    else:
+        tokens_charged = billing.compute_tokens_for_llm_call(
+            input_tokens=qa_result.llm.usage.input_tokens or 0,
+            output_tokens=qa_result.llm.usage.output_tokens or 0,
+            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
+            in_per_1k=rates.in_per_1k,
+            out_per_1k=rates.out_per_1k,
+        )
+
+    usage_event_id = await _record_qa_success_event(
+        db, user=user, source_mode="personal", chat_ref=chat_link,
+        depth=depth, requested_days=days, query_chars=query_chars,
+        messages_fetched_count=messages_fetched_count,
+        context_chars=context_chars, answer_chars=len(summary or ""),
+        duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
+        duration_ms_llm=llm_ms,
+        qa_result=qa_result, tokens_charged=tokens_charged, fetch_stats=fetch_stats,
+    )
+
+    await billing.debit(
+        db,
+        user_id=user.id,
+        amount=tokens_charged,
+        reason=billing.REASON_QA_REQUEST,
+        related_event_id=usage_event_id,
+        meta={
+            "used_model": used_model_slug,
+            "input_tokens": qa_result.llm.usage.input_tokens,
+            "output_tokens": qa_result.llm.usage.output_tokens,
+            "thinking_tokens": qa_result.llm.usage.thinking_tokens,
+            "tokens_charged": tokens_charged,
+            "in_per_1k": float(rates.in_per_1k) if rates else None,
+            "out_per_1k": float(rates.out_per_1k) if rates else None,
+        },
+    )
+
+    db.add(UserQueryLog(
+        user_id=user.id,
+        usage_event_id=usage_event_id,
+        query_text=user_query or "",
+        detected_category=(
+            qa_result.classification.category if qa_result.classification else None
+        ),
+        detected_confidence=(
+            qa_result.classification.confidence if qa_result.classification else None
+        ),
+        final_category=qa_result.decision.category if qa_result.decision else None,
+        selected_tier=depth,
+        selected_model=used_model_slug,
+    ))
+
+    await db.commit()
+
+    return _build_qa_response(
+        summary=summary, chat_name=chat_name,
+        messages_fetched_count=messages_fetched_count,
+        qa_result=qa_result, tokens_charged=tokens_charged,
+        entity=entity, messages=messages,
+        usage_snapshot=await build_usage_snapshot(db, user=user),
+    )
+
+
+async def _fail_analysis_job(db: AsyncSession, job_id: str, error_code: str, error_message: str) -> None:
+    """Пометить задачу ошибкой (после rollback незакоммиченной транзакции)."""
+    await db.rollback()
+    job = await db.get(AnalysisJob, job_id)
+    if job is None:
+        return
+    job.status = "error"
+    job.error_code = error_code
+    job.error_message = (error_message or "")[:300] or None
+    await db.commit()
+
+
+async def _run_analysis_job(job_id: str) -> None:
+    """Фоновая задача: выполняет работу в СВОЕЙ сессии БД и пишет результат."""
+    async with AsyncSessionLocal() as db:
+        job = await db.get(AnalysisJob, job_id)
+        if job is None:
+            return
+        job.status = "running"
+        await db.commit()
+        params = dict(job.params_json or {})
+        try:
+            user = await db.get(User, job.user_id)
+            if user is None:
+                raise ValueError("USER_NOT_FOUND")
+            body = await _run_personal_qa_core(
+                db,
+                user=user,
+                chat_link=params.get("chat_link") or "",
+                user_query=params.get("user_query") or "",
+                depth=params.get("depth") or "light",
+                days=int(params.get("days") or 1),
+                period_seconds=params.get("period_seconds"),
+                range_since=_parse_iso_dt(params.get("range_since")),
+                range_until=_parse_iso_dt(params.get("range_until")),
+                explicit_category=params.get("category"),
+            )
+            # jsonable_encoder — на случай Decimal/datetime внутри body,
+            # которые сырой JSONB-сериализатор не проглотит.
+            job.result_json = jsonable_encoder(body)
+            job.tokens_charged = body.get("tokens_charged")
+            job.status = "done"
+            await db.commit()
+        except LlmFatalError as exc:
+            await _fail_analysis_job(db, job_id, "LLM_FATAL_ERROR",
+                                     f"{exc.provider}:{exc.provider_model} {exc}")
+        except LlmAllModelsFailedError as exc:
+            await _fail_analysis_job(db, job_id, "LLM_ALL_MODELS_FAILED",
+                                     f"attempted={exc.attempted_models}")
+        except LlmEmptyResponseError as exc:
+            await _fail_analysis_job(db, job_id, "EMPTY_LLM_RESPONSE",
+                                     f"finish_reasons={exc.finish_reasons}")
+        except ValueError as exc:
+            await _fail_analysis_job(db, job_id, "TELEGRAM_FETCH_FAILED", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).exception("analysis_job.failed job=%s", job_id)
+            await _fail_analysis_job(db, job_id, "UNKNOWN", str(exc))
+
+
+@app.post("/tg/analyze_chat_async")
+async def tg_analyze_chat_async(
+    payload: dict,
+    background: BackgroundTasks,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Async-вариант личного одиночного Q&A. Быстрые пре-чеки → создаём job →
+    запускаем фоновую задачу → возвращаем {job_id}. Тяжёлая работа в фоне.
+    """
+    owner_user_id = user.id
+    chat_link = (payload.get("chat_link") or "").strip()
+    user_query = (payload.get("user_query") or "").strip()
+    period_value, period_unit, period_seconds = parse_period_from_payload(payload)
+    days = period_value if period_unit == "days" else 1
+    range_since, range_until = parse_date_range_from_payload(payload)
+    depth = str(payload.get("depth") or "light").strip().lower()
+    explicit_category = payload.get("category")
+
+    me = await tg_get_current_user(db, owner_user_id)
+    if not me:
+        raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
+
+    plan = await get_user_plan(db, user)
+    check_tier_allowed_or_raise(plan, depth)
+
+    if range_since is not None and range_until is not None:
+        days = ensure_range_within_plan(since_dt=range_since, until_dt=range_until, plan=plan)
+
+    # Медиафильтр в async-режиме пока не поддержан — остаётся на синхронном пути.
+    if mf_integration.request_from_payload(payload) is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ASYNC_MEDIA_FILTER_UNSUPPORTED",
+                "message": "Медиафильтр пока работает в обычном (синхронном) режиме.",
+            },
+        )
+
+    can_spend, balance = await billing.check_can_spend(db, user_id=user.id, tier=depth)
+    if not can_spend:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "INSUFFICIENT_TOKENS",
+                "message": (
+                    "Недостаточно токенов на балансе. Дождитесь начала "
+                    "следующего месяца или докупите токены."
+                ),
+                "monthly_used": balance.monthly_used,
+                "monthly_granted": balance.monthly_granted,
+                "topup_balance": balance.topup_balance,
+            },
+        )
+
+    job_id = uuid.uuid4().hex
+    db.add(AnalysisJob(
+        id=job_id,
+        user_id=user.id,
+        status="pending",
+        source_mode="personal",
+        params_json={
+            "chat_link": chat_link,
+            "user_query": user_query,
+            "depth": depth,
+            "days": days,
+            "period_seconds": period_seconds,
+            "range_since": range_since.isoformat() if range_since else None,
+            "range_until": range_until.isoformat() if range_until else None,
+            "category": explicit_category,
+        },
+    ))
+    await db.commit()
+
+    background.add_task(_run_analysis_job, job_id)
+    return {"status": "accepted", "job_id": job_id}
+
+
+@app.get("/tg/analyze_job/{job_id}")
+async def tg_analyze_job_status(
+    job_id: str,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Статус async-задачи. Когда status=done — в `result` лежит готовый ответ."""
+    job = await db.get(AnalysisJob, job_id)
+    if job is None or job.user_id != user.id:
+        raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+    resp: dict = {"status": job.status, "job_id": job.id}
+    if job.status == "done":
+        resp["result"] = job.result_json
+    elif job.status == "error":
+        resp["error_code"] = job.error_code
+        resp["error_message"] = job.error_message
+    return resp
 
 
 # ---------------------------------------------------------------------------
