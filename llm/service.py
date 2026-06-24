@@ -915,6 +915,10 @@ class QaRunResult:
     classification: Optional[ClassificationResult]
     decision: Optional[RoutingDecision]
     chunks_count: int = 1  # >1 если ответ собран чанкованием (map-reduce)
+    # Разбивка по вызовам LLM (slug, usage) — для биллинга КАЖДОГО вызова своей
+    # моделью (важно при чанковании + fallback на другую модель). None = один
+    # вызов (биллим как раньше по qa_result.llm).
+    llm_calls: Optional[list] = None
 
 
 def _resolve_category(
@@ -1013,18 +1017,24 @@ def _build_reduce_prompts(
 ) -> tuple[str, str]:
     system = (
         "You are CoTel. You are given partial findings extracted independently "
-        "from consecutive parts of ONE Telegram chat, all answering the same "
-        "user question. Merge them into ONE final answer.\n"
-        "- Combine duplicates: if the same author or item appears in several "
-        "parts, keep it once.\n"
+        "from consecutive parts of ONE Telegram chat, all answering the SAME "
+        "user question. Your job is to ASSEMBLE them into one complete final "
+        "answer to that question.\n"
+        "- Treat this as a MERGE, not a re-summary. Preserve every distinct "
+        "point, item, contact, topic or finding from the parts. Do NOT drop, "
+        "sample, or compress the content into just a few examples.\n"
+        "- Merge only TRUE duplicates — entries from different parts that refer "
+        "to the SAME thing (same person / item / topic). Keep such an entry "
+        "once. Distinct things stay as separate entries even if similar.\n"
         "- Preserve citations EXACTLY: keep every [msg:ID] token and author tag "
-        "as-is; never invent or renumber them.\n"
-        "- Keep only items relevant to the question; drop empty or off-topic "
-        "notes.\n"
-        "- Never repeat the same line more than once.\n"
-        f"- Write any narration in {fallback_lang_name} unless the question "
-        "clearly implies another language. No preamble, no restating the "
-        "question."
+        "as-is; never invent, drop, or renumber them.\n"
+        "- Match the FORM the question implies: a list stays a list; a digest "
+        "of topics stays organized by topic. Drop only entries clearly "
+        "off-topic for the question.\n"
+        "- Apply any explicit limit from the question (e.g. 'take 30 last', "
+        "'top 5') ONLY at the very end, after assembling the full set.\n"
+        f"- Write narration in {fallback_lang_name} unless the question clearly "
+        "implies another language. No preamble, no restating the question."
     )
     joined = "\n\n".join(
         f"--- Part {i + 1} ---\n{t}"
@@ -1114,10 +1124,21 @@ async def _run_qa_chunked(
     partial_texts = [r.text for r in map_results]
     usages = [r.usage for r in map_results]
 
+    # Диагностика: размеры выхода каждой части и модель — чтобы видеть, где
+    # теряются данные (в map'ах или на сборке).
+    for i, r in enumerate(map_results):
+        log.warning(
+            "QA_DIAG chunk_map part=%d/%d model=%s out_chars=%d",
+            i + 1, parts_total, r.used_model.slug, len(r.text or ""),
+        )
+
     # REDUCE — отдельный вызов: объединить, убрать дубли.
     red_system, red_user = _build_reduce_prompts(
         user_query, fallback_lang_name, partial_texts
     )
+    reduce_in_chars = sum(len(t or "") for t in partial_texts)
+    # Лимит вывода reduce = лимит тарифа (как у одиночного вызова): light 2000 /
+    # balanced 4000 / deep 8000. Балансу 8000 не даём — это привилегия deep.
     reduce_result = await orchestrator_run(
         decision=decision,
         system_prompt=red_system,
@@ -1125,6 +1146,11 @@ async def _run_qa_chunked(
         temperature=0.2,
     )
     usages.append(reduce_result.usage)
+    log.warning(
+        "QA_DIAG chunk_reduce model=%s in_chars=%d out_chars=%d finish=%s",
+        reduce_result.used_model.slug, reduce_in_chars,
+        len(reduce_result.text or ""), reduce_result.finish_reason,
+    )
 
     combined_usage = _sum_usages(usages)
     combined_llm = LlmRunResult(
@@ -1136,8 +1162,13 @@ async def _run_qa_chunked(
         attempted_models=reduce_result.attempted_models,
         fallback_reasons=reduce_result.fallback_reasons,
     )
+    # Разбивка по вызовам: каждый map + reduce со СВОЕЙ моделью и usage —
+    # чтобы биллинг тарифицировал каждый вызов по своей цене (важно при
+    # fallback на другую модель).
+    llm_calls = [(r.used_model.slug, r.usage) for r in map_results]
+    llm_calls.append((reduce_result.used_model.slug, reduce_result.usage))
     log.warning(
-        "qa.chunked parts=%d model=%s in_tok=%d out_tok=%d",
+        "qa.chunked parts=%d reduce_model=%s in_tok=%d out_tok=%d",
         parts_total, reduce_result.used_model.slug,
         combined_usage.input_tokens, combined_usage.output_tokens,
     )
@@ -1148,6 +1179,7 @@ async def _run_qa_chunked(
         classification=classification,
         decision=decision,
         chunks_count=parts_total,
+        llm_calls=llm_calls,
     )
 
 

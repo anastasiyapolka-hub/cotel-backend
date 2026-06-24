@@ -2125,23 +2125,10 @@ async def tg_analyze_chat(
         )
 
     # -------- Расчёт стоимости запроса в наших токенах --------
+    # Тарификация по каждому вызову своей моделью (учитывает чанкование+fallback).
     used_model_slug = qa_result.llm.used_model.slug
-    rates = await get_token_rates(db, used_model_slug)
-    if rates is None:
-        # llm_pricing не настроен для этой модели — биллим минимум,
-        # но логируем для админа. На проде такого быть не должно.
-        log = logging.getLogger(__name__)
-        log.error("billing.no_pricing_row used_model=%s — отсутствует строка в llm_pricing",
-                  used_model_slug)
-        tokens_charged = 1
-    else:
-        tokens_charged = billing.compute_tokens_for_llm_call(
-            input_tokens=qa_result.llm.usage.input_tokens or 0,
-            output_tokens=qa_result.llm.usage.output_tokens or 0,
-            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
-            in_per_1k=rates.in_per_1k,
-            out_per_1k=rates.out_per_1k,
-        )
+    rates = await get_token_rates(db, used_model_slug)  # для meta транзакции
+    tokens_charged = await _tokens_charged_for_result(db, qa_result)
 
     # Клиент отвалился, пока готовился ответ (фронт/прокси оборвал долгий
     # запрос) — пользователь ответа не получит, поэтому НЕ списываем токены.
@@ -2237,6 +2224,45 @@ def _parse_iso_dt(value):
         return None
 
 
+async def _tokens_charged_for_result(db: AsyncSession, qa_result) -> int:
+    """
+    Стоимость запроса в наших токенах. При чанковании тарифицируем КАЖДЫЙ
+    вызов LLM по его собственной модели и суммируем — иначе при fallback на
+    другую модель все токены ушли бы по цене одной (был баг: 7 map'ов на
+    Gemini Flash 0.3, а считалось всё по reduce-модели 0.75).
+    """
+    calls = getattr(qa_result, "llm_calls", None)
+    if calls:
+        total = 0
+        for slug, usage in calls:
+            rates = await get_token_rates(db, slug)
+            if rates is None:
+                logging.getLogger(__name__).error("billing.no_pricing_row used_model=%s", slug)
+                total += 1
+            else:
+                total += billing.compute_tokens_for_llm_call(
+                    input_tokens=usage.input_tokens or 0,
+                    output_tokens=usage.output_tokens or 0,
+                    thinking_tokens=usage.thinking_tokens or 0,
+                    in_per_1k=rates.in_per_1k,
+                    out_per_1k=rates.out_per_1k,
+                )
+        return max(1, total)
+
+    slug = qa_result.llm.used_model.slug
+    rates = await get_token_rates(db, slug)
+    if rates is None:
+        logging.getLogger(__name__).error("billing.no_pricing_row used_model=%s", slug)
+        return 1
+    return billing.compute_tokens_for_llm_call(
+        input_tokens=qa_result.llm.usage.input_tokens or 0,
+        output_tokens=qa_result.llm.usage.output_tokens or 0,
+        thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
+        in_per_1k=rates.in_per_1k,
+        out_per_1k=rates.out_per_1k,
+    )
+
+
 async def _run_personal_qa_core(
     db: AsyncSession,
     *,
@@ -2322,20 +2348,8 @@ async def _run_personal_qa_core(
         )
 
     used_model_slug = qa_result.llm.used_model.slug
-    rates = await get_token_rates(db, used_model_slug)
-    if rates is None:
-        logging.getLogger(__name__).error(
-            "billing.no_pricing_row used_model=%s", used_model_slug
-        )
-        tokens_charged = 1
-    else:
-        tokens_charged = billing.compute_tokens_for_llm_call(
-            input_tokens=qa_result.llm.usage.input_tokens or 0,
-            output_tokens=qa_result.llm.usage.output_tokens or 0,
-            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
-            in_per_1k=rates.in_per_1k,
-            out_per_1k=rates.out_per_1k,
-        )
+    rates = await get_token_rates(db, used_model_slug)  # для meta транзакции
+    tokens_charged = await _tokens_charged_for_result(db, qa_result)
 
     usage_event_id = await _record_qa_success_event(
         db, user=user, source_mode="personal", chat_ref=chat_link,
