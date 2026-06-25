@@ -301,6 +301,51 @@ async def resolve_entity_with_invite(client, chat_link: str):
 
     return await client.get_entity(link)
 
+
+async def probe_chat_density(
+    db: AsyncSession,
+    owner_user_id: int,
+    chat_link: str,
+    *,
+    window_hours: int = 2,
+    max_sample: int = 400,
+) -> Optional[tuple[float, float, int]]:
+    """
+    Дешёвая «разведка» плотности чата ДО полной выгрузки (B2, red-зона).
+
+    Тянем только последние сообщения за окно `window_hours` (не больше
+    `max_sample` штук — потолок на случай чата-водопада) и по ним считаем
+    приблизительную плотность. Возвращает кортеж:
+        (сообщений_в_день, средняя_длина_текста, размер_выборки)
+    либо None, если разведка не удалась (нерезолвимый чат и т.п.) — в этом
+    случае вызывающий просто НЕ блокирует запрос.
+
+    iter_messages идёт от новых к старым; останавливаемся, как только сообщение
+    старше границы окна. Плотность экстраполируется: count / window_hours * 24.
+    """
+    client = await get_tg_client(db, owner_user_id)
+    entity = await resolve_entity_with_invite(client, chat_link)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    count = 0
+    chars = 0
+    async for msg in client.iter_messages(entity, limit=max_sample):
+        msg_date = getattr(msg, "date", None)
+        if msg_date is not None and msg_date < cutoff:
+            break
+        text = getattr(msg, "message", None) or getattr(msg, "text", None) or ""
+        count += 1
+        chars += len(text)
+    if count == 0:
+        return (0.0, 0.0, 0)
+    msgs_per_day = count / float(window_hours) * 24.0
+    avg_chars = chars / float(count)
+    log.warning(
+        "QA_DIAG probe chat=%s window_h=%d sample=%d msgs_per_day=%.0f avg_chars=%.0f",
+        chat_link, window_hours, count, msgs_per_day, avg_chars,
+    )
+    return (msgs_per_day, avg_chars, count)
+
+
 async def ensure_connected(db: AsyncSession, owner_user_id: int):
     client = await get_tg_client(db, owner_user_id)
     if not client.is_connected():

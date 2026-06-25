@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Union
 
 from .models import resolve_model_config, DEFAULT_AI_MODEL
-from .adapters import get_adapter
+from .adapters import get_adapter, LlmFatalError
 from .classifier import (
     ALL_CATEGORIES,
     CATEGORY_DIGEST,
@@ -18,7 +18,11 @@ from .classifier import (
     DEFAULT_CATEGORY,
     classify_query,
 )
-from .orchestrator import LlmRunResult, run as orchestrator_run
+from .orchestrator import (
+    LlmRunResult,
+    LlmAllModelsFailedError,
+    run as orchestrator_run,
+)
 from .preprocessing import clean_telegram_messages
 from .routing import (
     RoutingDecision,
@@ -33,7 +37,7 @@ from .usage import (
     TOKENS_SOURCE_API,
     TOKENS_SOURCE_EMPTY,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 
 log = logging.getLogger(__name__)
 
@@ -962,7 +966,72 @@ _CHUNKABLE_CATEGORIES = {
 _CHUNK_BUDGET_FACTOR = 0.5     # доля лимита контекста модели на один кусок
 _CHARS_PER_TOKEN = 2.0         # консервативная оценка для кириллицы
 _MAX_CHUNKS = 16               # потолок числа частей (стоимость/время)
+_MAX_CHUNKS_HEAVY = 64         # потолок, когда пользователь ПОДТВЕРДИЛ тяжёлый
+                               # запрос (B2 red-зона): режем всё, но в разумных
+                               # пределах, без молчаливой обрезки хвостом
 _MAX_PARALLEL_CHUNKS = 3       # сколько частей гоним одновременно (волнами)
+
+# Подстроки в тексте ошибки 400, по которым опознаём «промпт не влез в окно
+# модели» (а не другой bad-request). Нужно для B1: когда основная модель
+# (большое окно) упала, а fallback-модель с маленьким окном отвергает наш
+# крупный кусок — мы его пере-режем под её окно.
+_CONTEXT_OVERFLOW_HINTS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "too long",
+    "too many tokens",
+    "input is too large",
+    "exceeds the maximum",
+    "reduce the length",
+    "string too long",
+)
+
+
+def _chain_min_context_limit(decision: RoutingDecision) -> int:
+    """Минимальное окно среди всех моделей fallback-цепочки (в токенах LLM).
+
+    По нему считается «безопасный» размер куска, который влезет в ЛЮБУЮ модель
+    цепочки — нужен для до-нарезки куска при fallback на маленькую модель."""
+    limits = [
+        int(getattr(m, "context_limit", 1_000_000) or 1_000_000)
+        for m in decision.fallback_chain
+    ]
+    return min(limits) if limits else 1_000_000
+
+
+def _budget_chars_for_tokens(context_limit_tokens: int) -> int:
+    """Бюджет куска в символах из окна модели в токенах."""
+    return int(context_limit_tokens * _CHUNK_BUDGET_FACTOR * _CHARS_PER_TOKEN)
+
+
+def _decision_without_primary(
+    decision: RoutingDecision,
+) -> Optional[RoutingDecision]:
+    """Копия decision без первой (упавшей) модели цепочки.
+
+    Нужно при до-нарезке: если основная модель недоступна, под-куски не должны
+    снова платить retry-таймаут по мёртвой основной — гоним их сразу по
+    оставшимся моделям. Возвращает None, если альтернатив не осталось."""
+    rest = list(decision.fallback_chain[1:])
+    if not rest:
+        return None
+    return _dc_replace(decision, primary_model=rest[0], fallback_chain=rest)
+
+
+def _is_context_overflow_fatal(
+    exc: LlmFatalError, primary_model: ModelConfig
+) -> bool:
+    """True, если fatal — это «промпт не влез» у НЕ-основной модели.
+
+    То есть основная модель (большое окно) упала retryable-ошибкой, fallback
+    переключился на модель с меньшим окном, и та отвергла крупный кусок 400-кой
+    про длину контекста. Именно этот случай лечится до-нарезкой (B1).
+    Конфиг-ошибку самой основной модели сюда не пускаем."""
+    if getattr(exc, "provider_model", None) == getattr(primary_model, "provider_model", None):
+        return False
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _CONTEXT_OVERFLOW_HINTS)
 
 
 def _chunk_messages_by_chars(
@@ -1026,8 +1095,12 @@ def _build_reduce_prompts(
         "- Merge only TRUE duplicates — entries from different parts that refer "
         "to the SAME thing (same person / item / topic). Keep such an entry "
         "once. Distinct things stay as separate entries even if similar.\n"
-        "- Preserve citations EXACTLY: keep every [msg:ID] token and author tag "
-        "as-is; never invent, drop, or renumber them.\n"
+        "- Keep each entry in the SAME rich format the parts use: the author "
+        "tag, a short verbatim quote, and the [msg:ID] citation token. Keep "
+        "[msg:ID] tokens and author tags EXACTLY as-is — never invent, drop, or "
+        "renumber them. Do NOT reduce entries to bare names or logins: every "
+        "entry MUST keep its short quote and its [msg:ID] so the user can click "
+        "through to the source message.\n"
         "- Match the FORM the question implies: a list stays a list; a digest "
         "of topics stays organized by topic. Drop only entries clearly "
         "off-topic for the question.\n"
@@ -1081,16 +1154,18 @@ async def _run_qa_chunked(
     decision: RoutingDecision,
     classification: Optional[ClassificationResult],
     chunk_budget_chars: int,
+    max_chunks: int = _MAX_CHUNKS,
 ) -> "QaRunResult":
     chunks = _chunk_messages_by_chars(cleaned_messages, chunk_budget_chars)
-    if len(chunks) > _MAX_CHUNKS:
-        # Потолок: берём самые свежие части (хвост). Red-зону с подтверждением
-        # пользователя добавим отдельно.
+    if len(chunks) > max_chunks:
+        # Потолок: берём самые свежие части (хвост). При подтверждённом тяжёлом
+        # запросе (B2) потолок поднят до _MAX_CHUNKS_HEAVY — обрезка почти не
+        # срабатывает; для неподтверждённых это последняя защита от перегруза.
         log.warning(
             "qa.chunked over_cap parts=%d cap=%d — берём последние %d",
-            len(chunks), _MAX_CHUNKS, _MAX_CHUNKS,
+            len(chunks), max_chunks, max_chunks,
         )
-        chunks = chunks[-_MAX_CHUNKS:]
+        chunks = chunks[-max_chunks:]
     parts_total = len(chunks)
 
     oldest_date, newest_date = _extract_message_date_window(cleaned_messages)
@@ -1102,24 +1177,66 @@ async def _run_qa_chunked(
     )
     system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
 
-    async def _map_one(chunk_msgs: list[dict], idx: int) -> LlmRunResult:
+    # B1: бюджет «под самую маленькую модель цепочки» и копия decision без
+    # упавшей основной — на случай, если кусок (резанный под Gemini) не влезет
+    # в fallback-модель с меньшим окном.
+    safe_decision = _decision_without_primary(decision)
+    safe_budget_chars = max(
+        1, _budget_chars_for_tokens(_chain_min_context_limit(decision))
+    )
+
+    async def _map_one(chunk_msgs: list[dict], idx: int) -> list[LlmRunResult]:
         ctx = _format_qa_chat_context(chunk_msgs)
         up = _build_map_user_prompt(
             time_block, chat_name, ctx, user_query, idx + 1, parts_total
         )
-        return await orchestrator_run(
-            decision=decision,
-            system_prompt=system_prompt,
-            user_prompt=up,
-            temperature=0.2,
-        )
+        try:
+            res = await orchestrator_run(
+                decision=decision,
+                system_prompt=system_prompt,
+                user_prompt=up,
+                temperature=0.2,
+            )
+            return [res]
+        except LlmFatalError as exc:
+            if not _is_context_overflow_fatal(exc, decision.primary_model):
+                raise  # настоящая конфиг-ошибка — не маскируем до-нарезкой
+            # Основная модель упала retryable-ошибкой, fallback переключился на
+            # модель с меньшим окном, и та отвергла крупный кусок. Режем этот
+            # кусок под безопасный бюджет и гоним под-куски по оставшимся
+            # моделям (без мёртвой основной), чтобы не платить её retry-таймаут.
+            sub_decision = safe_decision or decision
+            sub_chunks = _chunk_messages_by_chars(chunk_msgs, safe_budget_chars)
+            log.warning(
+                "QA_DIAG chunk_resize part=%d/%d sub_parts=%d "
+                "safe_budget_chars=%d reason=fallback_window_overflow",
+                idx + 1, parts_total, len(sub_chunks), safe_budget_chars,
+            )
+            sub_results: list[LlmRunResult] = []
+            for sub in sub_chunks:
+                sub_ctx = _format_qa_chat_context(sub)
+                sub_up = _build_map_user_prompt(
+                    time_block, chat_name, sub_ctx, user_query,
+                    idx + 1, parts_total,
+                )
+                sub_results.append(
+                    await orchestrator_run(
+                        decision=sub_decision,
+                        system_prompt=system_prompt,
+                        user_prompt=sub_up,
+                        temperature=0.2,
+                    )
+                )
+            return sub_results
 
-    # MAP — волнами по _MAX_PARALLEL_CHUNKS.
+    # MAP — волнами по _MAX_PARALLEL_CHUNKS. Каждый кусок может дать несколько
+    # результатов (если был пере-резан под fallback) — расплющиваем.
     map_results: list[LlmRunResult] = []
     for wave_start in range(0, parts_total, _MAX_PARALLEL_CHUNKS):
         wave_idx = range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, parts_total))
         wave = [_map_one(chunks[i], i) for i in wave_idx]
-        map_results.extend(await asyncio.gather(*wave))
+        for part_results in await asyncio.gather(*wave):
+            map_results.extend(part_results)
 
     partial_texts = [r.text for r in map_results]
     usages = [r.usage for r in map_results]
@@ -1192,9 +1309,14 @@ async def run_qa(
     depth: str = TIER_LIGHT,
     requested_period_days: Optional[int] = None,
     explicit_category: Optional[str] = None,
+    allow_heavy: bool = False,
 ) -> QaRunResult:
     """
     Высокоуровневый Q&A вызов с автоматическим выбором модели.
+
+    allow_heavy=True — пользователь подтвердил тяжёлый запрос (B2 red-зона):
+    поднимаем потолок числа частей чанкования (_MAX_CHUNKS_HEAVY), чтобы
+    обработать весь объём, а не молча обрезать хвостом.
 
     Шаги:
       1. Препроцессинг сообщений (drop emoji/short reactions, compact ts)
@@ -1239,6 +1361,7 @@ async def run_qa(
     # Чанкование: если контекст не влезает в безопасный бюджет выбранной
     # модели И категория хорошо делится — режем на части, обрабатываем
     # волнами и собираем единый ответ (map-reduce). Иначе — один вызов.
+    max_chunks = _MAX_CHUNKS_HEAVY if allow_heavy else _MAX_CHUNKS
     model_limit = getattr(decision.primary_model, "context_limit", 1_000_000)
     chunk_budget_chars = int(model_limit * _CHUNK_BUDGET_FACTOR * _CHARS_PER_TOKEN)
     if final_category in _CHUNKABLE_CATEGORIES and len(context) > chunk_budget_chars:
@@ -1252,6 +1375,7 @@ async def run_qa(
             decision=decision,
             classification=classification,
             chunk_budget_chars=chunk_budget_chars,
+            max_chunks=max_chunks,
         )
 
     system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
@@ -1269,12 +1393,43 @@ async def run_qa(
         f"User question:\n{user_query}"
     )
 
-    llm_result = await orchestrator_run(
-        decision=decision,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=0.2,
-    )
+    try:
+        llm_result = await orchestrator_run(
+            decision=decision,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.2,
+        )
+    except LlmFatalError as exc:
+        # B1 (одиночный путь): контекст влезал в основную модель одним вызовом,
+        # но та упала, а fallback-модель с меньшим окном не вместила весь
+        # контекст. Для делимых категорий переходим на чанкование под
+        # безопасный бюджет цепочки. Для неделимых — пробрасываем (нужна
+        # двухпроходная сборка, см. B3).
+        if final_category in _CHUNKABLE_CATEGORIES and _is_context_overflow_fatal(
+            exc, decision.primary_model
+        ):
+            safe_budget = max(
+                1, _budget_chars_for_tokens(_chain_min_context_limit(decision))
+            )
+            log.warning(
+                "qa.single_to_chunked reason=fallback_window_overflow "
+                "safe_budget_chars=%d",
+                safe_budget,
+            )
+            return await _run_qa_chunked(
+                cleaned_messages=cleaned_messages,
+                user_query=user_query,
+                chat_name=chat_name,
+                fallback_lang_name=fallback_lang_name,
+                fallback_language=fallback_language,
+                requested_period_days=requested_period_days,
+                decision=decision,
+                classification=classification,
+                chunk_budget_chars=safe_budget,
+                max_chunks=max_chunks,
+            )
+        raise
 
     return QaRunResult(
         text=llm_result.text,

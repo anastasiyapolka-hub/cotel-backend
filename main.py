@@ -94,6 +94,7 @@ from telegram_service import (
     export_string_session,
     save_user_telegram_session,
     resolve_sender_logins,
+    probe_chat_density,
 )
 from service_account_service import (
     ServiceAccountError,
@@ -2224,6 +2225,65 @@ def _parse_iso_dt(value):
         return None
 
 
+# ---------------------------------------------------------------------------
+# B2: red-зона тяжёлых чатов — прикидка объёма ДО выгрузки + подтверждение.
+# ---------------------------------------------------------------------------
+_RED_ZONE_EST_MSGS = 5000        # ~15 мин выгрузки → предупреждаем (порог-константа)
+_PROBE_MIN_PERIOD_DAYS = 2       # пробинг только если период СТРОГО больше
+_FETCH_MSGS_PER_MIN = 350.0      # из логов: ~1411 сообщений ≈ 4 мин выгрузки
+
+
+async def _estimate_heavy_chat(
+    db: AsyncSession, *, owner_user_id: int, chat_link: str, days: int
+) -> Optional[dict]:
+    """
+    Прикидка объёма ДО полной выгрузки (B2). Дешёвый пробинг плотности по
+    последним сообщениям → экстраполяция на период. Возвращает словарь с
+    оценкой и флагом is_red, либо None если оценка недоступна (тогда НЕ
+    блокируем — работаем как обычно). Пробинг только для периодов > 2 дней:
+    на коротких даже плотный чат выгружается за пару минут.
+    """
+    if not days or days <= _PROBE_MIN_PERIOD_DAYS:
+        return None
+    try:
+        probe = await probe_chat_density(db, owner_user_id, chat_link)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "heavy_chat.probe_failed chat=%s", chat_link, exc_info=True)
+        return None
+    if not probe:
+        return None
+    msgs_per_day, avg_chars, sample = probe
+    est_msgs = int(msgs_per_day * days)
+    est_minutes = max(1, round(est_msgs / _FETCH_MSGS_PER_MIN))
+    est_tokens = int(est_msgs * (avg_chars or 100.0) / 2.0)
+    return {
+        "est_messages": est_msgs,
+        "est_minutes": est_minutes,
+        "est_llm_tokens": est_tokens,
+        "msgs_per_day": int(msgs_per_day),
+        "probe_sample": sample,
+        "is_red": est_msgs >= _RED_ZONE_EST_MSGS,
+    }
+
+
+def _heavy_chat_message(est: dict, lang: Optional[str]) -> str:
+    """Текст подтверждения red-зоны (RU/EN по языку пользователя)."""
+    n = est["est_messages"]
+    mins = est["est_minutes"]
+    if str(lang or "").lower().startswith("en"):
+        return (
+            f"This is a very active chat: roughly {n} messages for the selected "
+            f"period, so downloading will take about {mins} min. Continue anyway, "
+            f"or reduce the period first?"
+        )
+    return (
+        f"Это очень активный чат: за выбранный период примерно {n} сообщений, "
+        f"выгрузка займёт около {mins} мин. Продолжить анализ или сначала "
+        f"уменьшить период?"
+    )
+
+
 async def _tokens_charged_for_result(db: AsyncSession, qa_result) -> int:
     """
     Стоимость запроса в наших токенах. При чанковании тарифицируем КАЖДЫЙ
@@ -2275,6 +2335,7 @@ async def _run_personal_qa_core(
     range_since,
     range_until,
     explicit_category,
+    allow_heavy: bool = False,
 ) -> dict:
     """
     Тяжёлая часть личного одиночного Q&A: выгрузка → run_qa → подстановка
@@ -2313,6 +2374,7 @@ async def _run_personal_qa_core(
         depth=depth,
         requested_period_days=days,
         explicit_category=explicit_category,
+        allow_heavy=allow_heavy,
     )
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
@@ -2440,6 +2502,7 @@ async def _run_analysis_job(job_id: str) -> None:
                 range_since=_parse_iso_dt(params.get("range_since")),
                 range_until=_parse_iso_dt(params.get("range_until")),
                 explicit_category=params.get("category"),
+                allow_heavy=bool(params.get("confirm_heavy")),
             )
             # jsonable_encoder — на случай Decimal/datetime внутри body,
             # которые сырой JSONB-сериализатор не проглотит.
@@ -2519,6 +2582,21 @@ async def tg_analyze_chat_async(
             },
         )
 
+    # B2: red-зона. До тяжёлой выгрузки прикидываем объём пробингом; если чат
+    # «водопад» и пользователь ещё не подтвердил — возвращаем needs_confirmation,
+    # фронт показывает выбор «уменьшить период / выполнить».
+    confirm_heavy = bool(payload.get("confirm_heavy"))
+    if not confirm_heavy:
+        est = await _estimate_heavy_chat(
+            db, owner_user_id=owner_user_id, chat_link=chat_link, days=days)
+        if est and est["is_red"]:
+            return {
+                "status": "needs_confirmation",
+                "code": "HEAVY_CHAT_CONFIRM",
+                "estimate": est,
+                "message": _heavy_chat_message(est, user.language),
+            }
+
     job_id = uuid.uuid4().hex
     db.add(AnalysisJob(
         id=job_id,
@@ -2534,6 +2612,7 @@ async def tg_analyze_chat_async(
             "range_since": range_since.isoformat() if range_since else None,
             "range_until": range_until.isoformat() if range_until else None,
             "category": explicit_category,
+            "confirm_heavy": confirm_heavy,
         },
     ))
     await db.commit()
