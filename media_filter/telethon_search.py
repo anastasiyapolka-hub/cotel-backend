@@ -387,28 +387,44 @@ async def _resolve_chat_entity(client, chat_link: str):
     return await resolve_entity_with_invite(client, link)
 
 
-async def _sender_label(msg: Message) -> tuple[Optional[int], Optional[str], Optional[str]]:
+async def _sender_label(
+    msg: Message,
+    cache: Optional[dict] = None,
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
     """
     Возвращает (sender_id, sender_username, sender_display_name).
-    msg.get_sender() лениво подтягивает из кеша Telethon — в рамках
-    одного iter_messages обычно cheap (уже в response.users/chats).
+
+    Чтобы не дёргать Telegram на КАЖДОЕ сообщение (как в остальных путях
+    выгрузки): сначала пробуем бесплатный `msg.sender` (объект уже в батче
+    `iter_messages`), и только если его нет — ленивый `get_sender()`. Результат
+    кешируется по `sender_id`, так что повторные сообщения одного автора не
+    резолвятся заново.
     """
-    sender_id = None
-    username = None
-    display = None
-    try:
-        sender = await msg.get_sender()
-    except Exception:
-        sender = None
+    sender_id = getattr(msg, "sender_id", None)
+    if cache is not None and sender_id is not None and sender_id in cache:
+        return cache[sender_id]
+
+    sender = getattr(msg, "sender", None)  # бесплатно, из батча
     if sender is None:
-        return sender_id, username, display
-    sender_id = getattr(sender, "id", None)
-    username = getattr(sender, "username", None)
-    first = (getattr(sender, "first_name", "") or "").strip()
-    last = (getattr(sender, "last_name", "") or "").strip()
-    title = (getattr(sender, "title", "") or "").strip()
-    display = (first + " " + last).strip() or title or None
-    return sender_id, username, display
+        try:
+            sender = await msg.get_sender()
+        except Exception:
+            sender = None
+
+    if sender is None:
+        label = (sender_id, None, None)
+    else:
+        sid = getattr(sender, "id", None) or sender_id
+        username = getattr(sender, "username", None)
+        first = (getattr(sender, "first_name", "") or "").strip()
+        last = (getattr(sender, "last_name", "") or "").strip()
+        title = (getattr(sender, "title", "") or "").strip()
+        display = (first + " " + last).strip() or title or None
+        label = (sid, username, display)
+
+    if cache is not None and label[0] is not None:
+        cache[label[0]] = label
+    return label
 
 
 def _normalize_message(
@@ -564,6 +580,7 @@ async def _fetch_one_filter(
     iter_kwargs: dict = {"filter": filter_cls(), "limit": ITER_LIMIT}
     if min_id is not None and min_id > 0:
         iter_kwargs["min_id"] = int(min_id)
+    sender_cache: dict = {}  # sender_id → label, чтобы не резолвить повторно
     while True:
         try:
             collected: list[MediaMessage] = []
@@ -583,7 +600,7 @@ async def _fetch_one_filter(
                 if msg_dt < min_date:
                     break
 
-                sender_id, sender_username, sender_display = await _sender_label(msg)
+                sender_id, sender_username, sender_display = await _sender_label(msg, sender_cache)
                 normalized = _normalize_message(
                     msg,
                     kind=kind,

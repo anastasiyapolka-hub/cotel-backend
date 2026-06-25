@@ -1121,6 +1121,53 @@ def _build_reduce_prompts(
     return system, user
 
 
+def _build_group_reduce_prompts(
+    user_query: str,
+    fallback_lang_name: str,
+    per_chat_partials: list[tuple[str, list[str]]],
+) -> tuple[str, str]:
+    """Reduce-промпт для ГРУППОВОГО чанкования.
+
+    На входе — частичные находки, сгруппированные ПО ЧАТАМ (каждый чат резался
+    отдельно, чаты не смешивались). На выходе — тот же формат, что у обычного
+    группового ответа: секции `## Chat: <name>` по порядку + `## Summary`."""
+    system = (
+        "You are CoTel. You are given partial findings extracted independently "
+        "from consecutive parts of SEVERAL Telegram chats, all answering the "
+        "SAME user question. Findings are grouped PER CHAT. Assemble them into "
+        "one final multi-chat answer.\n"
+        "OUTPUT FORMAT (markdown): one section per chat, in the given order, "
+        "with the heading `## Chat: <chat name>` (use the name verbatim). After "
+        "all chat sections add a final `## Summary` with a 2-3 sentence overall "
+        "conclusion across all chats. If the user's question is in Russian, use "
+        "`## Чат: ...` and `## Общий вывод`.\n"
+        "- This is a MERGE, not a re-summary: preserve every distinct point, "
+        "item, contact, topic or finding. Merge only TRUE duplicates WITHIN the "
+        "same chat.\n"
+        "- NEVER mix evidence between chats; never carry a `[msg:ID]` from one "
+        "chat into another section. Keep `[msg:ID]` tokens and author tags "
+        "EXACTLY as-is, with their short quotes — do not reduce entries to bare "
+        "names.\n"
+        "- If a chat's findings are empty, write one short sentence saying "
+        "nothing relevant was found in that chat.\n"
+        f"- Respond in the user's language; if ambiguous use {fallback_lang_name}.\n"
+        "NO PREAMBLE. Start directly with the first chat section."
+    )
+    blocks: list[str] = []
+    for name, parts in per_chat_partials:
+        joined = "\n\n".join(
+            f"--- Part {i + 1} ---\n{t}"
+            for i, t in enumerate(parts) if (t or "").strip()
+        ) or "(no relevant findings in this chat)"
+        blocks.append(f"=== CHAT: «{name}» ===\n{joined}")
+    user = (
+        f"User question:\n{user_query}\n\n"
+        "Per-chat partial findings to assemble (keep chats strictly separate):\n\n"
+        + "\n\n".join(blocks)
+    )
+    return system, user
+
+
 def _sum_usages(usages: list[LlmUsage]) -> LlmUsage:
     """Сумма usage по всем вызовам map+reduce — для биллинга по факту."""
     if not usages:
@@ -1141,6 +1188,58 @@ def _sum_usages(usages: list[LlmUsage]) -> LlmUsage:
         tokens_source=source,
         thinking_tokens=think,
     )
+
+
+async def _map_chunk_adaptive(
+    *,
+    decision: RoutingDecision,
+    system_prompt: str,
+    time_block: str,
+    chat_name: str,
+    user_query: str,
+    chunk_msgs: list[dict],
+    part_idx: int,
+    parts_total: int,
+    safe_decision: Optional[RoutingDecision],
+    safe_budget_chars: int,
+) -> list[LlmRunResult]:
+    """Один map-вызов с адаптивной до-нарезкой (B1).
+
+    Обычно возвращает один результат. Если основная модель упала и fallback-
+    модель с меньшим окном отвергла крупный кусок (overflow 400), кусок
+    пере-режется под безопасный бюджет и под-куски гонятся по оставшимся
+    моделям (без мёртвой основной). Используется и одиночным, и групповым
+    чанкером (для группы chat_name всегда один — чаты не смешиваются)."""
+    ctx = _format_qa_chat_context(chunk_msgs)
+    up = _build_map_user_prompt(
+        time_block, chat_name, ctx, user_query, part_idx, parts_total
+    )
+    try:
+        return [await orchestrator_run(
+            decision=decision, system_prompt=system_prompt,
+            user_prompt=up, temperature=0.2,
+        )]
+    except LlmFatalError as exc:
+        if not _is_context_overflow_fatal(exc, decision.primary_model):
+            raise  # настоящая конфиг-ошибка — не маскируем до-нарезкой
+        sub_decision = safe_decision or decision
+        sub_chunks = _chunk_messages_by_chars(chunk_msgs, safe_budget_chars)
+        log.warning(
+            "QA_DIAG chunk_resize part=%d/%d sub_parts=%d "
+            "safe_budget_chars=%d reason=fallback_window_overflow",
+            part_idx, parts_total, len(sub_chunks), safe_budget_chars,
+        )
+        out: list[LlmRunResult] = []
+        for sub in sub_chunks:
+            sub_ctx = _format_qa_chat_context(sub)
+            sub_up = _build_map_user_prompt(
+                time_block, chat_name, sub_ctx, user_query, part_idx, parts_total
+            )
+            out.append(await orchestrator_run(
+                decision=sub_decision, system_prompt=system_prompt,
+                user_prompt=sub_up, temperature=0.2,
+            ))
+        return out
 
 
 async def _run_qa_chunked(
@@ -1186,48 +1285,12 @@ async def _run_qa_chunked(
     )
 
     async def _map_one(chunk_msgs: list[dict], idx: int) -> list[LlmRunResult]:
-        ctx = _format_qa_chat_context(chunk_msgs)
-        up = _build_map_user_prompt(
-            time_block, chat_name, ctx, user_query, idx + 1, parts_total
+        return await _map_chunk_adaptive(
+            decision=decision, system_prompt=system_prompt, time_block=time_block,
+            chat_name=chat_name, user_query=user_query, chunk_msgs=chunk_msgs,
+            part_idx=idx + 1, parts_total=parts_total,
+            safe_decision=safe_decision, safe_budget_chars=safe_budget_chars,
         )
-        try:
-            res = await orchestrator_run(
-                decision=decision,
-                system_prompt=system_prompt,
-                user_prompt=up,
-                temperature=0.2,
-            )
-            return [res]
-        except LlmFatalError as exc:
-            if not _is_context_overflow_fatal(exc, decision.primary_model):
-                raise  # настоящая конфиг-ошибка — не маскируем до-нарезкой
-            # Основная модель упала retryable-ошибкой, fallback переключился на
-            # модель с меньшим окном, и та отвергла крупный кусок. Режем этот
-            # кусок под безопасный бюджет и гоним под-куски по оставшимся
-            # моделям (без мёртвой основной), чтобы не платить её retry-таймаут.
-            sub_decision = safe_decision or decision
-            sub_chunks = _chunk_messages_by_chars(chunk_msgs, safe_budget_chars)
-            log.warning(
-                "QA_DIAG chunk_resize part=%d/%d sub_parts=%d "
-                "safe_budget_chars=%d reason=fallback_window_overflow",
-                idx + 1, parts_total, len(sub_chunks), safe_budget_chars,
-            )
-            sub_results: list[LlmRunResult] = []
-            for sub in sub_chunks:
-                sub_ctx = _format_qa_chat_context(sub)
-                sub_up = _build_map_user_prompt(
-                    time_block, chat_name, sub_ctx, user_query,
-                    idx + 1, parts_total,
-                )
-                sub_results.append(
-                    await orchestrator_run(
-                        decision=sub_decision,
-                        system_prompt=system_prompt,
-                        user_prompt=sub_up,
-                        temperature=0.2,
-                    )
-                )
-            return sub_results
 
     # MAP — волнами по _MAX_PARALLEL_CHUNKS. Каждый кусок может дать несколько
     # результатов (если был пере-резан под fallback) — расплющиваем.
@@ -1440,6 +1503,133 @@ async def run_qa(
     )
 
 
+async def _run_qa_group_chunked(
+    *,
+    chats_clean: list[tuple[str, list[dict]]],
+    user_query: str,
+    fallback_lang_name: str,
+    fallback_language: str,
+    requested_period_days: Optional[int],
+    decision: RoutingDecision,
+    classification: Optional[ClassificationResult],
+    chunk_budget_chars: int,
+    max_chunks: int = _MAX_CHUNKS,
+) -> "QaRunResult":
+    """Групповое чанкование (map-reduce). ПРАВИЛО: каждый чат режется отдельно,
+    сообщения разных чатов НИКОГДА не попадают в один кусок. Map — по кускам
+    внутри чатов (волнами, с адаптивной до-нарезкой B1); reduce собирает ответ
+    в групповом формате (## Chat / ## Summary), не смешивая чаты."""
+    num_chats = len(chats_clean)
+    # Потолок частей делим по чатам, чтобы суммарно не превысить max_chunks.
+    per_chat_cap = max(1, max_chunks // max(1, num_chats))
+
+    all_cleaned = [m for _, msgs in chats_clean for m in msgs]
+    oldest_date, newest_date = _extract_message_date_window(all_cleaned)
+    time_block = _build_time_context_block(
+        requested_period_days=requested_period_days,
+        oldest_msg_date=oldest_date,
+        newest_msg_date=newest_date,
+        fallback_lang_code=_normalize_lang_code(fallback_language),
+    )
+    # Map использует одиночный extraction-промпт (находки по ОДНОМУ чату).
+    system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
+    safe_decision = _decision_without_primary(decision)
+    safe_budget_chars = max(
+        1, _budget_chars_for_tokens(_chain_min_context_limit(decision))
+    )
+
+    # Единицы map: (chat_index, chat_name, part_idx, parts_total, chunk_msgs).
+    units: list[tuple] = []
+    for ci, (name, msgs) in enumerate(chats_clean):
+        chs = _chunk_messages_by_chars(msgs, chunk_budget_chars)
+        if len(chs) > per_chat_cap:
+            log.warning(
+                "qa.group_chunked chat=%s over_cap parts=%d cap=%d — хвост",
+                name, len(chs), per_chat_cap,
+            )
+            chs = chs[-per_chat_cap:]
+        for pi, ch in enumerate(chs):
+            units.append((ci, name, pi + 1, len(chs), ch))
+
+    async def _map_unit(u_idx: int) -> tuple[int, list[LlmRunResult]]:
+        ci, name, pi, pt, ch = units[u_idx]
+        res = await _map_chunk_adaptive(
+            decision=decision, system_prompt=system_prompt, time_block=time_block,
+            chat_name=name, user_query=user_query, chunk_msgs=ch,
+            part_idx=pi, parts_total=pt,
+            safe_decision=safe_decision, safe_budget_chars=safe_budget_chars,
+        )
+        return u_idx, res
+
+    results_by_unit: dict[int, list[LlmRunResult]] = {}
+    for wave_start in range(0, len(units), _MAX_PARALLEL_CHUNKS):
+        wave = [
+            _map_unit(i)
+            for i in range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, len(units)))
+        ]
+        for u_idx, res_list in await asyncio.gather(*wave):
+            results_by_unit[u_idx] = res_list
+
+    # Все map-результаты (для биллинга) + частичные находки, сгруппированные
+    # по чату в порядке частей.
+    map_results_all: list[LlmRunResult] = []
+    for u_idx in range(len(units)):
+        map_results_all.extend(results_by_unit.get(u_idx, []))
+
+    per_chat_partials: list[tuple[str, list[str]]] = []
+    for ci, (name, _msgs) in enumerate(chats_clean):
+        texts: list[str] = []
+        for u_idx, u in enumerate(units):
+            if u[0] != ci:
+                continue
+            for r in results_by_unit.get(u_idx, []):
+                if (r.text or "").strip():
+                    texts.append(r.text)
+        per_chat_partials.append((name, texts))
+
+    for i, r in enumerate(map_results_all):
+        log.warning(
+            "QA_DIAG group_chunk_map part=%d/%d model=%s out_chars=%d",
+            i + 1, len(map_results_all), r.used_model.slug, len(r.text or ""),
+        )
+
+    red_system, red_user = _build_group_reduce_prompts(
+        user_query, fallback_lang_name, per_chat_partials
+    )
+    reduce_result = await orchestrator_run(
+        decision=decision, system_prompt=red_system,
+        user_prompt=red_user, temperature=0.2,
+    )
+    log.warning(
+        "QA_DIAG group_chunk_reduce model=%s chats=%d parts=%d out_chars=%d finish=%s",
+        reduce_result.used_model.slug, num_chats, len(units),
+        len(reduce_result.text or ""), reduce_result.finish_reason,
+    )
+
+    usages = [r.usage for r in map_results_all] + [reduce_result.usage]
+    combined_usage = _sum_usages(usages)
+    combined_llm = LlmRunResult(
+        text=reduce_result.text,
+        usage=combined_usage,
+        finish_reason=reduce_result.finish_reason,
+        used_model=reduce_result.used_model,
+        primary_model=decision.primary_model,
+        attempted_models=reduce_result.attempted_models,
+        fallback_reasons=reduce_result.fallback_reasons,
+    )
+    llm_calls = [(r.used_model.slug, r.usage) for r in map_results_all]
+    llm_calls.append((reduce_result.used_model.slug, reduce_result.usage))
+    return QaRunResult(
+        text=reduce_result.text,
+        is_empty=False,
+        llm=combined_llm,
+        classification=classification,
+        decision=decision,
+        chunks_count=len(units),
+        llm_calls=llm_calls,
+    )
+
+
 async def run_qa_group(
     *,
     user_query: str,
@@ -1448,6 +1638,7 @@ async def run_qa_group(
     depth: str = TIER_LIGHT,
     requested_period_days: Optional[int] = None,
     explicit_category: Optional[str] = None,
+    allow_heavy: bool = False,
 ) -> QaRunResult:
     """
     Высокоуровневый групповой Q&A вызов (несколько чатов в одном запросе).
@@ -1472,6 +1663,7 @@ async def run_qa_group(
     sections: list[str] = []
     chat_names: list[str] = []
     all_cleaned: list[dict] = []
+    chats_clean: list[tuple[str, list[dict]]] = []  # для чанкования (B4)
     for idx, c in enumerate(chats, start=1):
         chat_name = (c.get("chat_name") or "").strip() or f"Chat {idx}"
         text_messages = c.get("text_messages") or []
@@ -1485,6 +1677,7 @@ async def run_qa_group(
             sections.append(section)
             chat_names.append(chat_name)
             all_cleaned.extend(cleaned)
+            chats_clean.append((chat_name, cleaned))
 
     if not sections:
         return QaRunResult(
@@ -1512,6 +1705,26 @@ async def run_qa_group(
 
     system_prompt = _build_qa_group_system_prompt(fallback_lang_name)
     combined_context = "\n\n".join(sections)
+
+    # B4: если суммарный контекст не влезает в бюджет модели — чанкуем, строго
+    # ВНУТРИ каждого чата (чаты не смешиваем), затем сводим. Для группы это
+    # применимо к любой категории: ответ всё равно структурирован по чатам.
+    max_chunks = _MAX_CHUNKS_HEAVY if allow_heavy else _MAX_CHUNKS
+    model_limit = getattr(decision.primary_model, "context_limit", 1_000_000)
+    chunk_budget_chars = int(model_limit * _CHUNK_BUDGET_FACTOR * _CHARS_PER_TOKEN)
+    if len(combined_context) > chunk_budget_chars:
+        return await _run_qa_group_chunked(
+            chats_clean=chats_clean,
+            user_query=user_query,
+            fallback_lang_name=fallback_lang_name,
+            fallback_language=fallback_language,
+            requested_period_days=requested_period_days,
+            decision=decision,
+            classification=classification,
+            chunk_budget_chars=chunk_budget_chars,
+            max_chunks=max_chunks,
+        )
+
     oldest_date, newest_date = _extract_message_date_window(all_cleaned)
     time_block = _build_time_context_block(
         requested_period_days=requested_period_days,

@@ -2284,6 +2284,72 @@ def _heavy_chat_message(est: dict, lang: Optional[str]) -> str:
     )
 
 
+async def _estimate_heavy_group(
+    db: AsyncSession, *, owner_user_id: int, chat_links: list[str], days: int
+) -> Optional[dict]:
+    """
+    B4: red-зона для ГРУППЫ. До выгрузки пробегаем ПО ВСЕМ чатам (параллельно),
+    оцениваем плотность каждого. Если хотя бы один чат тяжёлый — суммируем
+    оценку по ВСЕМ тяжёлым чатам и возвращаем её. Если все лёгкие — None
+    (выполняем спокойно). Пробинг только при периоде > 2 дней.
+    """
+    if not days or days <= _PROBE_MIN_PERIOD_DAYS:
+        return None
+
+    async def _one(link: str) -> Optional[dict]:
+        try:
+            probe = await probe_chat_density(db, owner_user_id, link)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "heavy_group.probe_failed chat=%s", link, exc_info=True)
+            return None
+        if not probe:
+            return None
+        msgs_per_day, avg_chars, _sample = probe
+        est = int(msgs_per_day * days)
+        return {
+            "chat_link": link,
+            "est_messages": est,
+            "avg_chars": avg_chars or 100.0,
+            "is_red": est >= _RED_ZONE_EST_MSGS,
+        }
+
+    results = await asyncio.gather(*[_one(l) for l in chat_links])
+    heavy = [r for r in results if r and r["is_red"]]
+    if not heavy:
+        return None
+    total_msgs = sum(r["est_messages"] for r in heavy)
+    est_minutes = max(1, round(total_msgs / _FETCH_MSGS_PER_MIN))
+    est_tokens = int(sum(r["est_messages"] * r["avg_chars"] for r in heavy) / 2.0)
+    return {
+        "est_messages": total_msgs,
+        "est_minutes": est_minutes,
+        "est_llm_tokens": est_tokens,
+        "heavy_count": len(heavy),
+        "total_chats": len(chat_links),
+        "is_red": True,
+    }
+
+
+def _heavy_group_message(est: dict, lang: Optional[str]) -> str:
+    """Текст подтверждения red-зоны для группы (RU/EN)."""
+    n = est["est_messages"]
+    mins = est["est_minutes"]
+    heavy = est["heavy_count"]
+    total = est["total_chats"]
+    if str(lang or "").lower().startswith("en"):
+        return (
+            f"{heavy} of {total} chats are very active: roughly {n} messages in "
+            f"total for the selected period, so downloading will take about "
+            f"{mins} min. Continue anyway, or reduce the period first?"
+        )
+    return (
+        f"{heavy} из {total} чатов очень активны: суммарно примерно {n} "
+        f"сообщений за выбранный период, выгрузка займёт около {mins} мин. "
+        f"Продолжить анализ или сначала уменьшить период?"
+    )
+
+
 async def _tokens_charged_for_result(db: AsyncSession, qa_result) -> int:
     """
     Стоимость запроса в наших токенах. При чанковании тарифицируем КАЖДЫЙ
@@ -2491,25 +2557,48 @@ async def _run_analysis_job(job_id: str) -> None:
             user = await db.get(User, job.user_id)
             if user is None:
                 raise ValueError("USER_NOT_FOUND")
-            body = await _run_personal_qa_core(
-                db,
-                user=user,
-                chat_link=params.get("chat_link") or "",
-                user_query=params.get("user_query") or "",
-                depth=params.get("depth") or "light",
-                days=int(params.get("days") or 1),
-                period_seconds=params.get("period_seconds"),
-                range_since=_parse_iso_dt(params.get("range_since")),
-                range_until=_parse_iso_dt(params.get("range_until")),
-                explicit_category=params.get("category"),
-                allow_heavy=bool(params.get("confirm_heavy")),
-            )
+            mode = job.source_mode or "personal"
+            if mode == "group":
+                body = await _run_group_qa_core(
+                    db,
+                    user=user,
+                    chat_links=list(params.get("chat_links") or []),
+                    user_query=params.get("user_query") or "",
+                    depth=params.get("depth") or "light",
+                    days=int(params.get("days") or 1),
+                    period_seconds=params.get("period_seconds"),
+                    range_since=_parse_iso_dt(params.get("range_since")),
+                    range_until=_parse_iso_dt(params.get("range_until")),
+                    explicit_category=params.get("category"),
+                    confirm_heavy=bool(params.get("confirm_heavy")),
+                )
+            else:
+                body = await _run_personal_qa_core(
+                    db,
+                    user=user,
+                    chat_link=params.get("chat_link") or "",
+                    user_query=params.get("user_query") or "",
+                    depth=params.get("depth") or "light",
+                    days=int(params.get("days") or 1),
+                    period_seconds=params.get("period_seconds"),
+                    range_since=_parse_iso_dt(params.get("range_since")),
+                    range_until=_parse_iso_dt(params.get("range_until")),
+                    explicit_category=params.get("category"),
+                    allow_heavy=bool(params.get("confirm_heavy")),
+                )
             # jsonable_encoder — на случай Decimal/datetime внутри body,
             # которые сырой JSONB-сериализатор не проглотит.
             job.result_json = jsonable_encoder(body)
             job.tokens_charged = body.get("tokens_charged")
             job.status = "done"
             await db.commit()
+        except HTTPException as exc:
+            # Групповое ядро (_run_group_qa_core) конвертирует сбои LLM/выгрузки
+            # в HTTPException — в async-контексте мапим их в ошибку задачи.
+            detail = exc.detail
+            code = detail.get("code") if isinstance(detail, dict) else None
+            msg = detail.get("message") if isinstance(detail, dict) else str(detail)
+            await _fail_analysis_job(db, job_id, code or "ERROR", str(msg))
         except LlmFatalError as exc:
             await _fail_analysis_job(db, job_id, "LLM_FATAL_ERROR",
                                      f"{exc.provider}:{exc.provider_model} {exc}")
@@ -2524,6 +2613,37 @@ async def _run_analysis_job(job_id: str) -> None:
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).exception("analysis_job.failed job=%s", job_id)
             await _fail_analysis_job(db, job_id, "UNKNOWN", str(exc))
+
+
+_STUCK_JOB_MINUTES = 30  # дольше — считаем зависшей (прервана деплоем)
+
+
+@app.on_event("startup")
+async def _sweep_stuck_analysis_jobs() -> None:
+    """
+    C1: при старте приложения помечаем задачи `analysis_jobs`, застрявшие в
+    статусе `running` дольше ~30 минут (обычно прерванные деплоем Render), как
+    `error`. Иначе фронт опрашивал бы их до таймаута (~40 мин). Идемпотентно и
+    безопасно при нескольких воркерах: UPDATE по условию.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=_STUCK_JOB_MINUTES)
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                update(AnalysisJob)
+                .where(AnalysisJob.status == "running", AnalysisJob.updated_at < cutoff)
+                .values(
+                    status="error",
+                    error_code="INTERRUPTED",
+                    error_message="Задача прервана при перезапуске сервиса.",
+                )
+            )
+            await db.commit()
+            n = res.rowcount or 0
+            if n:
+                logging.getLogger(__name__).warning("startup.swept_stuck_jobs n=%d", n)
+    except Exception:
+        logging.getLogger(__name__).warning("startup.sweep_failed", exc_info=True)
 
 
 @app.post("/tg/analyze_chat_async")
@@ -2715,7 +2835,7 @@ async def _record_qa_success_event(
             meta["output_price_per_1m_usd_snapshot"] = cost.output_price_per_1m_usd_snapshot
         except Exception as e:  # noqa: BLE001
             # Стоимость не критична для ответа — не валим запись события.
-            log.warning("estimate_llm_cost_usd failed: %s", e)
+            logging.getLogger(__name__).warning("estimate_llm_cost_usd failed: %s", e)
         # routing info
         if qa_result.decision is not None:
             meta.update(routing_meta(qa_result.llm, qa_result.decision))
@@ -3130,6 +3250,123 @@ def _build_qa_response(
 # fail, we return 502 like the single-chat endpoint does.
 # ---------------------------------------------------------------------------
 
+@app.post("/tg/analyze_chats_group_async")
+async def tg_analyze_chats_group_async(
+    payload: dict,
+    background: BackgroundTasks,
+    user: User = Depends(auth_get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Async-вариант группового Q&A. Пре-чеки + B4 red-зона → создаём job
+    (`source_mode='group'`) → фоновый воркер `_run_analysis_job` → `{job_id}`.
+    Снимает 5-мин таймаут прокси (групповой запрос с чанкованием длиннее).
+    Медиафильтр в async-группе не поддержан — остаётся на синхронном пути.
+    """
+    owner_user_id = user.id
+
+    raw_links = payload.get("chat_links") or []
+    if not isinstance(raw_links, list):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "BAD_PAYLOAD", "message": "chat_links must be a list"},
+        )
+    chat_links: list[str] = []
+    seen: set[str] = set()
+    for v in raw_links:
+        s = str(v or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        chat_links.append(s)
+    if not chat_links:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GROUP_EMPTY",
+                "message": "Не выбрано ни одного чата для группового анализа.",
+            },
+        )
+
+    user_query = (payload.get("user_query") or "").strip()
+    period_value, period_unit, period_seconds = parse_period_from_payload(payload)
+    days = period_value if period_unit == "days" else 1
+    range_since, range_until = parse_date_range_from_payload(payload)
+    depth = str(payload.get("depth") or "light").strip().lower()
+    explicit_category = payload.get("category")
+
+    me = await tg_get_current_user(db, owner_user_id)
+    if not me:
+        raise HTTPException(401, "TELEGRAM_NOT_AUTHORIZED")
+
+    plan = await get_user_plan(db, user)
+    check_tier_allowed_or_raise(plan, depth)
+    if range_since is not None and range_until is not None:
+        days = ensure_range_within_plan(since_dt=range_since, until_dt=range_until, plan=plan)
+    check_max_chats_or_raise(plan, len(chat_links))
+
+    # Медиафильтр в async-группе пока не поддержан — остаётся на синхронном пути.
+    if mf_integration.request_from_payload(payload) is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ASYNC_MEDIA_FILTER_UNSUPPORTED",
+                "message": "Медиафильтр пока работает в обычном (синхронном) режиме.",
+            },
+        )
+
+    can_spend, balance = await billing.check_can_spend(db, user_id=user.id, tier=depth)
+    if not can_spend:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "INSUFFICIENT_TOKENS",
+                "message": (
+                    "Недостаточно токенов на балансе. Дождитесь начала "
+                    "следующего месяца или докупите токены."
+                ),
+                "monthly_used": balance.monthly_used,
+                "monthly_granted": balance.monthly_granted,
+                "topup_balance": balance.topup_balance,
+            },
+        )
+
+    # B4 red-зона группы — до создания задачи (пробинг всех чатов).
+    confirm_heavy = bool(payload.get("confirm_heavy"))
+    if not confirm_heavy and range_since is None and range_until is None:
+        est_group = await _estimate_heavy_group(
+            db, owner_user_id=owner_user_id, chat_links=chat_links, days=days)
+        if est_group and est_group["is_red"]:
+            return {
+                "status": "needs_confirmation",
+                "code": "HEAVY_CHAT_CONFIRM",
+                "estimate": est_group,
+                "message": _heavy_group_message(est_group, user.language),
+            }
+
+    job_id = uuid.uuid4().hex
+    db.add(AnalysisJob(
+        id=job_id,
+        user_id=user.id,
+        status="pending",
+        source_mode="group",
+        params_json={
+            "chat_links": chat_links,
+            "user_query": user_query,
+            "depth": depth,
+            "days": days,
+            "period_seconds": period_seconds,
+            "range_since": range_since.isoformat() if range_since else None,
+            "range_until": range_until.isoformat() if range_until else None,
+            "category": explicit_category,
+            "confirm_heavy": confirm_heavy,
+        },
+    ))
+    await db.commit()
+    background.add_task(_run_analysis_job, job_id)
+    return {"status": "accepted", "job_id": job_id}
+
+
 @app.post("/tg/analyze_chats_group")
 async def tg_analyze_chats_group(
     payload: dict,
@@ -3229,6 +3466,58 @@ async def tg_analyze_chats_group(
             range_until=range_until,
         )
 
+    # B4: red-зона для группы. До выгрузки пробегаем по всем чатам; если хоть
+    # один тяжёлый — просим подтверждение с суммарной оценкой. Только для
+    # относительного периода (диапазон «С–По» текущей плотностью не оценить).
+    confirm_heavy = bool(payload.get("confirm_heavy"))
+    if not confirm_heavy and range_since is None and range_until is None:
+        est_group = await _estimate_heavy_group(
+            db, owner_user_id=owner_user_id, chat_links=chat_links, days=days)
+        if est_group and est_group["is_red"]:
+            return {
+                "status": "needs_confirmation",
+                "code": "HEAVY_CHAT_CONFIRM",
+                "estimate": est_group,
+                "message": _heavy_group_message(est_group, user.language),
+            }
+
+    return await _run_group_qa_core(
+        db,
+        user=user,
+        chat_links=chat_links,
+        user_query=user_query,
+        depth=depth,
+        days=days,
+        period_seconds=period_seconds,
+        range_since=range_since,
+        range_until=range_until,
+        explicit_category=explicit_category,
+        confirm_heavy=confirm_heavy,
+    )
+
+
+async def _run_group_qa_core(
+    db: AsyncSession,
+    *,
+    user: User,
+    chat_links: list[str],
+    user_query: str,
+    depth: str,
+    days: int,
+    period_seconds: Optional[int],
+    range_since,
+    range_until,
+    explicit_category,
+    confirm_heavy: bool = False,
+) -> dict:
+    """
+    Тяжёлая часть группового Q&A: параллельная выгрузка чатов → run_qa_group
+    (с чанкованием B4) → дедуп → permalinks → биллинг по вызовам → ответ.
+    Вынесена из эндпоинта, чтобы её мог вызвать и синхронный путь, и фоновый
+    async-воркер. Ошибки (HTTPException / Llm*Error) пробрасываются вызывающему.
+    """
+    owner_user_id = user.id
+    group_size = len(chat_links)
     query_chars = len(user_query)
     total_t0 = time.perf_counter()
 
@@ -3340,6 +3629,7 @@ async def tg_analyze_chats_group(
             depth=depth,
             requested_period_days=days,
             explicit_category=explicit_category,
+            allow_heavy=confirm_heavy,
         )
     except LlmFatalError as exc:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
@@ -3477,20 +3767,11 @@ async def tg_analyze_chats_group(
         )
 
     used_model_slug = qa_result.llm.used_model.slug
-    rates = await get_token_rates(db, used_model_slug)
-    if rates is None:
-        log = logging.getLogger(__name__)
-        log.error("billing.no_pricing_row used_model=%s — отсутствует строка в llm_pricing",
-                  used_model_slug)
-        tokens_charged = 1
-    else:
-        tokens_charged = billing.compute_tokens_for_llm_call(
-            input_tokens=qa_result.llm.usage.input_tokens or 0,
-            output_tokens=qa_result.llm.usage.output_tokens or 0,
-            thinking_tokens=qa_result.llm.usage.thinking_tokens or 0,
-            in_per_1k=rates.in_per_1k,
-            out_per_1k=rates.out_per_1k,
-        )
+    rates = await get_token_rates(db, used_model_slug)  # для meta транзакции
+    # Биллинг по КАЖДОМУ LLM-вызову (важно после чанкования группы — B4): сумма
+    # реальных токенов всех map+reduce своими моделями. При одиночном вызове
+    # совпадает со старым расчётом.
+    tokens_charged = await _tokens_charged_for_result(db, qa_result)
 
     usage_event_id = await _record_qa_success_event(
         db, user=user, source_mode="personal",
