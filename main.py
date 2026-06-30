@@ -2402,6 +2402,7 @@ async def _run_personal_qa_core(
     range_until,
     explicit_category,
     allow_heavy: bool = False,
+    progress_cb=None,
 ) -> dict:
     """
     Тяжёлая часть личного одиночного Q&A: выгрузка → run_qa → подстановка
@@ -2441,6 +2442,7 @@ async def _run_personal_qa_core(
         requested_period_days=days,
         explicit_category=explicit_category,
         allow_heavy=allow_heavy,
+        progress_cb=progress_cb,
     )
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
 
@@ -2553,6 +2555,20 @@ async def _run_analysis_job(job_id: str) -> None:
         job.status = "running"
         await db.commit()
         params = dict(job.params_json or {})
+
+        # C3: колбэк прогресса чанкования. Пишем в result_json={"_progress":…}
+        # через ОТДЕЛЬНУЮ короткую сессию, чтобы не мешать транзакции ядра.
+        # result_json пуст, пока задача running; на done он перезапишется телом.
+        async def _progress_cb(done: int, total: int) -> None:
+            try:
+                async with AsyncSessionLocal() as pdb:
+                    j = await pdb.get(AnalysisJob, job_id)
+                    if j is not None and j.status == "running":
+                        j.result_json = {"_progress": {"done": int(done), "total": int(total)}}
+                        await pdb.commit()
+            except Exception:  # noqa: BLE001
+                pass  # прогресс не критичен
+
         try:
             user = await db.get(User, job.user_id)
             if user is None:
@@ -2571,6 +2587,7 @@ async def _run_analysis_job(job_id: str) -> None:
                     range_until=_parse_iso_dt(params.get("range_until")),
                     explicit_category=params.get("category"),
                     confirm_heavy=bool(params.get("confirm_heavy")),
+                    progress_cb=_progress_cb,
                 )
             else:
                 body = await _run_personal_qa_core(
@@ -2585,6 +2602,7 @@ async def _run_analysis_job(job_id: str) -> None:
                     range_until=_parse_iso_dt(params.get("range_until")),
                     explicit_category=params.get("category"),
                     allow_heavy=bool(params.get("confirm_heavy")),
+                    progress_cb=_progress_cb,
                 )
             # jsonable_encoder — на случай Decimal/datetime внутри body,
             # которые сырой JSONB-сериализатор не проглотит.
@@ -2758,6 +2776,13 @@ async def tg_analyze_job_status(
     elif job.status == "error":
         resp["error_code"] = job.error_code
         resp["error_message"] = job.error_message
+    elif job.status == "running":
+        # C3: пока задача выполняется, в result_json может лежать прогресс
+        # чанкования {"_progress": {done,total}} — отдаём его фронту.
+        rj = job.result_json or {}
+        prog = rj.get("_progress") if isinstance(rj, dict) else None
+        if prog:
+            resp["progress"] = prog
     return resp
 
 
@@ -2821,18 +2846,41 @@ async def _record_qa_success_event(
         # Токенная система (tokens_charged) — это наша внутренняя валюта;
         # estimated_cost_usd — фактическая стоимость LLM-вызова у провайдера.
         try:
-            cost = await estimate_llm_cost_usd(
-                db,
-                ai_model=qa_result.llm.used_model.slug,
-                input_tokens=qa_result.llm.usage.input_tokens,
-                output_tokens=qa_result.llm.usage.output_tokens,
-                tokens_source=qa_result.llm.usage.tokens_source,
-                thinking_tokens=qa_result.llm.usage.thinking_tokens,
-            )
-            meta["estimated_cost_usd"] = cost.estimated_cost_usd
-            meta["cost_calculation_method"] = cost.cost_calculation_method
-            meta["input_price_per_1m_usd_snapshot"] = cost.input_price_per_1m_usd_snapshot
-            meta["output_price_per_1m_usd_snapshot"] = cost.output_price_per_1m_usd_snapshot
+            # E: при чанковании суммируем стоимость по КАЖДОМУ вызову своей
+            # моделью (как пер-call биллинг токенов). Для одиночного вызова
+            # llm_calls пуст → считаем по used_model, как раньше.
+            calls = getattr(qa_result, "llm_calls", None)
+            if calls:
+                total_cost = 0.0
+                method = None
+                for slug, usage in calls:
+                    c = await estimate_llm_cost_usd(
+                        db,
+                        ai_model=slug,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        tokens_source=usage.tokens_source,
+                        thinking_tokens=getattr(usage, "thinking_tokens", 0),
+                    )
+                    total_cost += float(c.estimated_cost_usd or 0)
+                    method = c.cost_calculation_method
+                meta["estimated_cost_usd"] = total_cost
+                meta["cost_calculation_method"] = method
+                meta["cost_per_call"] = True
+                meta["llm_call_count"] = len(calls)
+            else:
+                cost = await estimate_llm_cost_usd(
+                    db,
+                    ai_model=qa_result.llm.used_model.slug,
+                    input_tokens=qa_result.llm.usage.input_tokens,
+                    output_tokens=qa_result.llm.usage.output_tokens,
+                    tokens_source=qa_result.llm.usage.tokens_source,
+                    thinking_tokens=qa_result.llm.usage.thinking_tokens,
+                )
+                meta["estimated_cost_usd"] = cost.estimated_cost_usd
+                meta["cost_calculation_method"] = cost.cost_calculation_method
+                meta["input_price_per_1m_usd_snapshot"] = cost.input_price_per_1m_usd_snapshot
+                meta["output_price_per_1m_usd_snapshot"] = cost.output_price_per_1m_usd_snapshot
         except Exception as e:  # noqa: BLE001
             # Стоимость не критична для ответа — не валим запись события.
             logging.getLogger(__name__).warning("estimate_llm_cost_usd failed: %s", e)
@@ -2907,6 +2955,27 @@ async def _record_qa_failure_event(
 def _drop_none(d: dict) -> dict:
     """Убрать ключи с None-значениями (чтобы не раздувать meta_json)."""
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _aggregate_fetch_stats(stats_list: list[dict]) -> dict:
+    """
+    D2: сложить fetch_stats по нескольким чатам (групповой/параллельный fetch)
+    в один словарь для meta события. Числовые поля суммируем. unique_senders
+    суммируется по чатам (один автор в разных чатах посчитается несколько раз —
+    это допустимо для диагностики).
+    """
+    agg: dict = {}
+    for s in stats_list:
+        if not s:
+            continue
+        for k in (
+            "sender_lookups", "unique_senders", "named_from_cache",
+            "author_fallbacks", "flood_waits", "flood_seconds",
+        ):
+            v = s.get(k)
+            if isinstance(v, (int, float)):
+                agg[k] = agg.get(k, 0) + v
+    return agg
 
 
 def _fetch_stats_meta(fetch_stats: Optional[dict]) -> dict:
@@ -3509,6 +3578,7 @@ async def _run_group_qa_core(
     range_until,
     explicit_category,
     confirm_heavy: bool = False,
+    progress_cb=None,
 ) -> dict:
     """
     Тяжёлая часть группового Q&A: параллельная выгрузка чатов → run_qa_group
@@ -3522,16 +3592,21 @@ async def _run_group_qa_core(
     total_t0 = time.perf_counter()
 
     # ---- Parallel fetch ----
+    # D2: собираем fetch_stats по КАЖДОМУ чату (отдельный словарь на вызов) и
+    # агрегируем для meta события — иначе flood/выгрузка группы не видны в админке.
     fetch_t0 = time.perf_counter()
+    per_chat_stats: list[dict] = [dict() for _ in chat_links]
     fetch_tasks = [
         fetch_chat_messages(
             db, owner_user_id, link, days, period_seconds=period_seconds,
             since_dt=range_since, until_dt=range_until,
+            fetch_stats=per_chat_stats[i],
         )
-        for link in chat_links
+        for i, link in enumerate(chat_links)
     ]
     fetch_outcomes = await asyncio.gather(*fetch_tasks, return_exceptions=True)
     fetch_ms = int((time.perf_counter() - fetch_t0) * 1000)
+    fetch_agg = _aggregate_fetch_stats(per_chat_stats)
 
     # Per-chat status arrays. We track three buckets:
     #   - ok:    successfully fetched, has messages, will be sent to LLM
@@ -3630,6 +3705,7 @@ async def _run_group_qa_core(
             requested_period_days=days,
             explicit_category=explicit_category,
             allow_heavy=confirm_heavy,
+            progress_cb=progress_cb,
         )
     except LlmFatalError as exc:
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
@@ -3756,7 +3832,7 @@ async def _run_group_qa_core(
             answer_chars=len(group_summary or ""),
             duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
             duration_ms_llm=llm_ms,
-            qa_result=qa_result, tokens_charged=0,
+            qa_result=qa_result, tokens_charged=0, fetch_stats=fetch_agg,
         )
         await db.commit()
         return _build_group_response(
@@ -3783,7 +3859,7 @@ async def _run_group_qa_core(
         answer_chars=len(group_summary or ""),
         duration_ms_total=total_ms, duration_ms_fetch=fetch_ms,
         duration_ms_llm=llm_ms,
-        qa_result=qa_result, tokens_charged=tokens_charged,
+        qa_result=qa_result, tokens_charged=tokens_charged, fetch_stats=fetch_agg,
     )
 
     await billing.debit(

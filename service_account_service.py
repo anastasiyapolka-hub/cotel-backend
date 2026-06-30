@@ -22,8 +22,8 @@ from db.models import (
     ServiceAccountStatusHistory,
 )
 from telegram_service import decrypt_session, _resolve_sender_cached
-from llm.service import summarize_chat_messages
-from llm.usage import LlmTextResult, LlmUsage
+from llm.service import run_qa
+from llm.usage import LlmUsage
 
 log = logging.getLogger(__name__)
 
@@ -337,6 +337,7 @@ async def read_messages_from_entity(
     period_seconds: Optional[int] = None,
     since_dt: Optional[datetime] = None,
     until_dt: Optional[datetime] = None,
+    fetch_stats: Optional[dict] = None,
 ) -> list[dict]:
     # Приоритет окна: абсолютный диапазон since_dt..until_dt → period_seconds →
     # days. until_dt передаётся в iter_messages как offset_date (верхняя граница).
@@ -355,7 +356,9 @@ async def read_messages_from_entity(
         requested_days = max(int(days), 1)
     collected: list[dict] = []
     sender_cache: dict[int, str] = {}
-    fetch_stats: dict = {}
+    # D2: если вызывающий передал словарь — заполняем его (для meta события).
+    if fetch_stats is None:
+        fetch_stats = {}
 
     # Масштабируемый limit для активных публичных чатов — иначе fetcher
     # упирается в SERVICE_ACCOUNT_MAX_FETCH_MESSAGES (1000) задолго до
@@ -801,6 +804,7 @@ async def fetch_public_chat_messages(
     period_seconds: Optional[int] = None,
     since_dt: Optional[datetime] = None,
     until_dt: Optional[datetime] = None,
+    fetch_stats: Optional[dict] = None,
 ) -> Tuple[object, list[dict]]:
     client = await get_service_tg_client(db, service_account_id)
 
@@ -817,7 +821,7 @@ async def fetch_public_chat_messages(
 
         messages = await read_messages_from_entity(
             client, entity, days, period_seconds=period_seconds,
-            since_dt=since_dt, until_dt=until_dt,
+            since_dt=since_dt, until_dt=until_dt, fetch_stats=fetch_stats,
         )
         return entity, messages
 
@@ -825,40 +829,6 @@ async def fetch_public_chat_messages(
         raise
     except Exception as e:
         raise map_telethon_exception_to_service_error(e) from e
-
-# =========================
-# LLM summary
-# =========================
-
-async def summarize_chat(
-    *,
-    user_query: str,
-    chat_name: str,
-    text_messages: list[dict],
-    ai_model: str,
-    fallback_language: str = "en",
-    return_usage: bool = False,
-    requested_period_days: Optional[int] = None,
-):
-    """
-    Thin wrapper. `return_usage=True` returns the full LlmTextResult
-    so the caller can read .usage / .provider / .provider_model for
-    UsageEvent logging. Default behavior is unchanged (returns str).
-
-    `requested_period_days` is passed through so the LLM time-context
-    block can resolve «last month» / «за последний месяц» correctly
-    instead of letting Gemini-family models narrow to the raw data
-    window (see Q4 incident in test-analysis-Q4.md).
-    """
-    return await summarize_chat_messages(
-        user_query=user_query,
-        chat_name=chat_name,
-        text_messages=text_messages,
-        fallback_language=fallback_language,
-        ai_model=ai_model,
-        return_usage=return_usage,
-        requested_period_days=requested_period_days,
-    )
 
 async def validate_service_subscription_target(
     db: AsyncSession,
@@ -1301,7 +1271,7 @@ async def analyze_chat_via_service_account(
     chat_link: str,
     user_query: str,
     days: int,
-    ai_model: str,
+    depth: str = "light",
     fallback_language: str = "en",
     period_seconds: Optional[int] = None,
     since_dt: Optional[datetime] = None,
@@ -1326,6 +1296,7 @@ async def analyze_chat_via_service_account(
         try:
             # ---- measure fetch ----
             _fetch_t0 = _time.perf_counter()
+            fetch_stats: dict = {}  # D2: flood/выгрузка → в meta события
             entity, messages = await fetch_public_chat_messages(
                 db,
                 service_account_id=account.id,
@@ -1334,6 +1305,7 @@ async def analyze_chat_via_service_account(
                 period_seconds=period_seconds,
                 since_dt=since_dt,
                 until_dt=until_dt,
+                fetch_stats=fetch_stats,
             )
             fetch_duration_ms = int((_time.perf_counter() - _fetch_t0) * 1000)
 
@@ -1355,19 +1327,28 @@ async def analyze_chat_via_service_account(
             )
 
             # ---- measure LLM ----
+            # D2: служебный QA теперь идёт через общий run_qa-пайплайн —
+            # классификатор + роутер + ЧАНКОВАНИЕ больших чатов + пер-call учёт.
             _llm_t0 = _time.perf_counter()
-            llm_result: LlmTextResult = await summarize_chat(
+            qa_result = await run_qa(
                 user_query=user_query,
                 chat_name=chat_name,
                 text_messages=messages,
-                ai_model=ai_model,
                 fallback_language=fallback_language,
-                return_usage=True,
+                depth=depth,
                 requested_period_days=days,
             )
             llm_duration_ms = int((_time.perf_counter() - _llm_t0) * 1000)
 
-            summary = llm_result.text
+            summary = qa_result.text
+            if qa_result.is_empty or qa_result.llm is None:
+                _used_model = None
+                _llm_usage = LlmUsage.empty()
+                _llm_calls: list = []
+            else:
+                _used_model = qa_result.llm.used_model.slug
+                _llm_usage = qa_result.llm.usage
+                _llm_calls = list(qa_result.llm_calls or [])
 
             now = utcnow()
 
@@ -1418,7 +1399,7 @@ async def analyze_chat_via_service_account(
                 "chat_ref_normalized": normalized_ref,
                 "chat_id": getattr(entity, "id", None),
                 "chat_username": getattr(entity, "username", None),
-                "ai_model": ai_model,
+                "ai_model": _used_model,
                 "message_links": message_links,
                 # Internal QA metrics for the route to log into UsageEvent.
                 # The route pops these before returning to the frontend.
@@ -1429,9 +1410,13 @@ async def analyze_chat_via_service_account(
                     "answer_chars": len(summary or ""),
                     "fetch_duration_ms": fetch_duration_ms,
                     "llm_duration_ms": llm_duration_ms,
-                    "llm_usage": llm_result.usage,
-                    "llm_provider": llm_result.provider,
-                    "llm_provider_model": llm_result.provider_model,
+                    "llm_usage": _llm_usage,
+                    "llm_calls": _llm_calls,       # [(slug, usage), …] — для пер-call
+                    "used_model": _used_model,
+                    "is_empty": qa_result.is_empty,
+                    "chunks_count": getattr(qa_result, "chunks_count", 1),
+                    "category": qa_result.decision.category if qa_result.decision else None,
+                    "fetch_stats": fetch_stats,
                 },
             }
 

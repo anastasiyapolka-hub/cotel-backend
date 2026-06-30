@@ -4,9 +4,13 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
-from .models import resolve_model_config, DEFAULT_AI_MODEL
+# C3: колбэк прогресса чанкования (done, total) — воркер пишет его в задачу,
+# фронт показывает «часть N из M». Необязателен (синхронные пути не передают).
+ProgressCb = Optional[Callable[[int, int], Awaitable[None]]]
+
+from .models import resolve_model_config, DEFAULT_AI_MODEL, ModelConfig
 from .adapters import get_adapter, LlmFatalError
 from .classifier import (
     ALL_CATEGORIES,
@@ -1190,6 +1194,16 @@ def _sum_usages(usages: list[LlmUsage]) -> LlmUsage:
     )
 
 
+async def _emit_progress(progress_cb: ProgressCb, done: int, total: int) -> None:
+    """Безопасно вызвать колбэк прогресса (C3). Сбой прогресса не валит запрос."""
+    if progress_cb is None:
+        return
+    try:
+        await progress_cb(done, total)
+    except Exception:  # noqa: BLE001
+        log.warning("progress_cb failed", exc_info=True)
+
+
 async def _map_chunk_adaptive(
     *,
     decision: RoutingDecision,
@@ -1254,6 +1268,7 @@ async def _run_qa_chunked(
     classification: Optional[ClassificationResult],
     chunk_budget_chars: int,
     max_chunks: int = _MAX_CHUNKS,
+    progress_cb: ProgressCb = None,
 ) -> "QaRunResult":
     chunks = _chunk_messages_by_chars(cleaned_messages, chunk_budget_chars)
     if len(chunks) > max_chunks:
@@ -1295,11 +1310,13 @@ async def _run_qa_chunked(
     # MAP — волнами по _MAX_PARALLEL_CHUNKS. Каждый кусок может дать несколько
     # результатов (если был пере-резан под fallback) — расплющиваем.
     map_results: list[LlmRunResult] = []
+    await _emit_progress(progress_cb, 0, parts_total)
     for wave_start in range(0, parts_total, _MAX_PARALLEL_CHUNKS):
         wave_idx = range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, parts_total))
         wave = [_map_one(chunks[i], i) for i in wave_idx]
         for part_results in await asyncio.gather(*wave):
             map_results.extend(part_results)
+        await _emit_progress(progress_cb, min(parts_total, wave_start + _MAX_PARALLEL_CHUNKS), parts_total)
 
     partial_texts = [r.text for r in map_results]
     usages = [r.usage for r in map_results]
@@ -1373,6 +1390,7 @@ async def run_qa(
     requested_period_days: Optional[int] = None,
     explicit_category: Optional[str] = None,
     allow_heavy: bool = False,
+    progress_cb: ProgressCb = None,
 ) -> QaRunResult:
     """
     Высокоуровневый Q&A вызов с автоматическим выбором модели.
@@ -1439,6 +1457,7 @@ async def run_qa(
             classification=classification,
             chunk_budget_chars=chunk_budget_chars,
             max_chunks=max_chunks,
+            progress_cb=progress_cb,
         )
 
     system_prompt = _build_qa_single_system_prompt(fallback_lang_name)
@@ -1491,6 +1510,7 @@ async def run_qa(
                 classification=classification,
                 chunk_budget_chars=safe_budget,
                 max_chunks=max_chunks,
+                progress_cb=progress_cb,
             )
         raise
 
@@ -1514,6 +1534,7 @@ async def _run_qa_group_chunked(
     classification: Optional[ClassificationResult],
     chunk_budget_chars: int,
     max_chunks: int = _MAX_CHUNKS,
+    progress_cb: ProgressCb = None,
 ) -> "QaRunResult":
     """Групповое чанкование (map-reduce). ПРАВИЛО: каждый чат режется отдельно,
     сообщения разных чатов НИКОГДА не попадают в один кусок. Map — по кускам
@@ -1562,13 +1583,16 @@ async def _run_qa_group_chunked(
         return u_idx, res
 
     results_by_unit: dict[int, list[LlmRunResult]] = {}
-    for wave_start in range(0, len(units), _MAX_PARALLEL_CHUNKS):
+    units_total = len(units)
+    await _emit_progress(progress_cb, 0, units_total)
+    for wave_start in range(0, units_total, _MAX_PARALLEL_CHUNKS):
         wave = [
             _map_unit(i)
-            for i in range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, len(units)))
+            for i in range(wave_start, min(wave_start + _MAX_PARALLEL_CHUNKS, units_total))
         ]
         for u_idx, res_list in await asyncio.gather(*wave):
             results_by_unit[u_idx] = res_list
+        await _emit_progress(progress_cb, min(units_total, wave_start + _MAX_PARALLEL_CHUNKS), units_total)
 
     # Все map-результаты (для биллинга) + частичные находки, сгруппированные
     # по чату в порядке частей.
@@ -1639,6 +1663,7 @@ async def run_qa_group(
     requested_period_days: Optional[int] = None,
     explicit_category: Optional[str] = None,
     allow_heavy: bool = False,
+    progress_cb: ProgressCb = None,
 ) -> QaRunResult:
     """
     Высокоуровневый групповой Q&A вызов (несколько чатов в одном запросе).
@@ -1723,6 +1748,7 @@ async def run_qa_group(
             classification=classification,
             chunk_budget_chars=chunk_budget_chars,
             max_chunks=max_chunks,
+            progress_cb=progress_cb,
         )
 
     oldest_date, newest_date = _extract_message_date_window(all_cleaned)

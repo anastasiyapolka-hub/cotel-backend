@@ -745,6 +745,7 @@ async def record_qa_success(
     duration_ms_fetch: Optional[int] = None,
     duration_ms_llm: Optional[int] = None,
     tokens_source: Optional[str] = None,
+    meta_extra: Optional[dict] = None,
 ) -> None:
     """
     Record a successful Q&A request.
@@ -805,6 +806,12 @@ async def record_qa_success(
         duration_ms_llm=duration_ms_llm,
         tokens_source=tokens_source,
     )
+
+    # D2: дополнительные поля meta (напр. flood/выгрузка служебного аккаунта).
+    if meta_extra:
+        for _k, _v in meta_extra.items():
+            if _v is not None:
+                meta[_k] = _v
 
     await add_usage_event(
         db,

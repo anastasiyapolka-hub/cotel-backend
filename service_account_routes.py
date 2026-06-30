@@ -19,11 +19,11 @@ from plan_limits import (
     record_qa_success,
     record_qa_failure,
     build_usage_snapshot,
-    resolve_ai_model_for_user,
     parse_period_from_payload,
     parse_date_range_from_payload,
     ensure_range_within_plan,
     get_user_plan,
+    check_tier_allowed_or_raise,
 )
 from llm import (
     estimate_llm_cost_usd,
@@ -51,6 +51,9 @@ class ServiceAnalyzeRequest(BaseModel):
     date_from: str | None = None
     date_to: str | None = None
     ai_model: str | None = None
+    # Новый контракт (как у личного/группового): глубина анализа. Управляет
+    # роутером (классификатор + выбор модели + чанкование). ai_model — legacy.
+    depth: str | None = None
 
 
 @router.post("/tg/service/analyze_chat")
@@ -95,11 +98,10 @@ async def tg_service_analyze_chat(
         skip_days_plan_check=(period_unit != "days" or range_since is not None),
     )
 
-    ai_model = resolve_ai_model_for_user(
-        user=user,
-        requested_ai_model=payload.ai_model,
-        fallback_ai_model=getattr(user, "default_ai_model", None),
-    )
+    # Глубина анализа (роутер + чанкование). Free → только light.
+    depth = (payload.depth or "light").strip().lower()
+    plan = await get_user_plan(db, user)
+    check_tier_allowed_or_raise(plan, depth)
 
     query_chars = len((payload.user_query or "").strip())
 
@@ -111,7 +113,7 @@ async def tg_service_analyze_chat(
             chat_link=payload.chat_link,
             user_query=payload.user_query.strip(),
             days=requested_days_for_log,
-            ai_model=ai_model,
+            depth=depth,
             fallback_language=user.language,
             period_seconds=period_seconds,
             since_dt=range_since,
@@ -129,7 +131,7 @@ async def tg_service_analyze_chat(
             source_mode="service",
             chat_ref=payload.chat_link,
             requested_days=payload.days,
-            ai_model=ai_model,
+            ai_model=None,
             error_code=str(e.code or "SERVICE_ACCOUNT_ERROR"),
             error_message=(e.user_message or "")[:300] or None,
             query_chars=query_chars or None,
@@ -150,7 +152,7 @@ async def tg_service_analyze_chat(
             source_mode="service",
             chat_ref=payload.chat_link,
             requested_days=payload.days,
-            ai_model=ai_model,
+            ai_model=None,
             error_code="INTERNAL_ERROR",
             error_message=(str(e) or "")[:300] or None,
             query_chars=query_chars or None,
@@ -164,16 +166,49 @@ async def tg_service_analyze_chat(
     # Pop internal metrics — never send them to the frontend.
     qa_metrics = result.pop("_qa_metrics", None) or {}
     llm_usage: LlmUsage = qa_metrics.get("llm_usage") or LlmUsage(0, 0, 0, TOKENS_SOURCE_EMPTY)
+    used_model = qa_metrics.get("used_model")
+    llm_calls = qa_metrics.get("llm_calls") or []
 
-    # Cost estimation. Safe against missing llm_pricing table.
-    cost = await estimate_llm_cost_usd(
-        db,
-        ai_model=ai_model,
-        input_tokens=llm_usage.input_tokens,
-        output_tokens=llm_usage.output_tokens,
-        tokens_source=llm_usage.tokens_source,
-        thinking_tokens=llm_usage.thinking_tokens,
-    )
+    # D2: flood/выгрузка служебного аккаунта → в meta события (видно в админке).
+    _fs = qa_metrics.get("fetch_stats") or {}
+    meta_extra: dict = {}
+    if _fs:
+        meta_extra.update({
+            "sender_lookups": _fs.get("sender_lookups"),
+            "unique_senders": _fs.get("unique_senders"),
+            "named_from_cache": _fs.get("named_from_cache"),
+            "author_fallbacks": _fs.get("author_fallbacks"),
+            "flood_wait_count": _fs.get("flood_waits"),
+            "flood_wait_total_seconds": _fs.get("flood_seconds"),
+        })
+    if qa_metrics.get("chunks_count"):
+        meta_extra["chunks_count"] = qa_metrics.get("chunks_count")
+
+    # Cost estimation (админ-косметика). Снапшоты цен берём по фактической
+    # модели; при чанковании estimated_cost_usd — сумма по вызовам (как E).
+    cost = None
+    if used_model:
+        cost = await estimate_llm_cost_usd(
+            db,
+            ai_model=used_model,
+            input_tokens=llm_usage.input_tokens,
+            output_tokens=llm_usage.output_tokens,
+            tokens_source=llm_usage.tokens_source,
+            thinking_tokens=llm_usage.thinking_tokens,
+        )
+        if len(llm_calls) > 1:
+            total_cost = 0.0
+            for _slug, _u in llm_calls:
+                _c = await estimate_llm_cost_usd(
+                    db, ai_model=_slug,
+                    input_tokens=_u.input_tokens, output_tokens=_u.output_tokens,
+                    tokens_source=_u.tokens_source,
+                    thinking_tokens=getattr(_u, "thinking_tokens", 0),
+                )
+                total_cost += float(_c.estimated_cost_usd or 0)
+            meta_extra["estimated_cost_usd"] = total_cost
+            meta_extra["cost_per_call"] = True
+            meta_extra["llm_call_count"] = len(llm_calls)
 
     # Chat history upsert (unchanged behavior).
     normalized_ref = result.get("chat_ref_normalized") or normalize_public_chat_ref(payload.chat_link)
@@ -212,7 +247,7 @@ async def tg_service_analyze_chat(
         source_mode="service",
         chat_ref=payload.chat_link,
         requested_days=payload.days,
-        ai_model=ai_model,
+        ai_model=used_model,
         query_chars=query_chars or None,
         messages_fetched_count=qa_metrics.get("messages_fetched_count"),
         messages_sent_to_llm_count=qa_metrics.get("messages_sent_to_llm_count"),
@@ -221,13 +256,14 @@ async def tg_service_analyze_chat(
         duration_ms_total=total_ms,
         duration_ms_fetch=qa_metrics.get("fetch_duration_ms"),
         duration_ms_llm=qa_metrics.get("llm_duration_ms"),
+        meta_extra=(meta_extra or None),
         **split_usage_for_meta(llm_usage),
-        **cost_kwargs_for_meta(cost),
+        **(cost_kwargs_for_meta(cost) if cost else {}),
     )
 
     await db.execute(stmt)
     await db.commit()
 
     result["usage"] = await build_usage_snapshot(db, user=user)
-    result["ai_model"] = ai_model
+    result["ai_model"] = used_model
     return result

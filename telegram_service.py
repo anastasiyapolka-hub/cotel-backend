@@ -504,6 +504,49 @@ async def resolve_sender_logins(
     return result
 
 
+# D1: управление FloodWait в обычной/групповой выгрузке.
+_FETCH_FLOOD_MAX_SLEEP_SEC = 60   # дольше не ждём — отдаём понятную ошибку
+_FETCH_FLOOD_MAX_RETRIES = 5      # защита от бесконечного флуда
+
+
+async def _iter_with_flood_resume(client, entity, base_kwargs, fetch_stats, stage):
+    """
+    Обёртка над client.iter_messages с обработкой FloodWait и продолжением
+    с места обрыва (resume по offset_id). По умолчанию Telethon при длинном
+    FloodWait (> flood_sleep_threshold) бросает FloodWaitError, и выгрузка
+    падала. Здесь мы ловим её, логируем (видно в Render + считаем в
+    fetch_stats), и при разумной задержке досыпаем и продолжаем со следующего
+    (более старого) сообщения, а не с начала. Тело цикла-вызывающего не
+    меняется — просто итерируем через эту обёртку.
+    """
+    last_id = base_kwargs.get("offset_id")
+    attempts = 0
+    while True:
+        kwargs = dict(base_kwargs)
+        if last_id is not None:
+            kwargs.pop("offset_date", None)  # после первого батча идём по id
+            kwargs["offset_id"] = last_id
+        try:
+            async for msg in client.iter_messages(entity, **kwargs):
+                mid = getattr(msg, "id", None)
+                if mid is not None:
+                    last_id = mid
+                yield msg
+            return  # генератор исчерпан штатно
+        except FloodWaitError as e:
+            wait = int(getattr(e, "seconds", 0) or 0)
+            fetch_stats["flood_waits"] = fetch_stats.get("flood_waits", 0) + 1
+            fetch_stats["flood_seconds"] = fetch_stats.get("flood_seconds", 0) + wait
+            attempts += 1
+            log.warning(
+                "QA_DIAG flood_wait stage=%s seconds=%d resume_from=%s attempt=%d",
+                stage, wait, last_id, attempts,
+            )
+            if wait > _FETCH_FLOOD_MAX_SLEEP_SEC or attempts > _FETCH_FLOOD_MAX_RETRIES:
+                raise ValueError(f"FLOOD_WAIT:{wait}")
+            await asyncio.sleep(wait + 1)
+
+
 async def fetch_chat_messages(
     db: AsyncSession,
     owner_user_id: int,
@@ -688,7 +731,10 @@ async def fetch_chat_messages(
         iter_kwargs = {"limit": dynamic_limit}
         if until_dt is not None:
             iter_kwargs["offset_date"] = until_dt
-        async for msg in client.iter_messages(entity, **iter_kwargs):
+        # D1: итерируем через обёртку с FloodWait-resume (тело цикла без изменений).
+        async for msg in _iter_with_flood_resume(
+            client, entity, iter_kwargs, fetch_stats, "fetch_personal"
+        ):
             if not isinstance(msg, Message):
                 continue
 
@@ -739,6 +785,10 @@ async def fetch_chat_messages(
                 "text": text,
             })
 
+    except ValueError:
+        # Наши осмысленные ошибки (FLOOD_WAIT:… из обёртки, CHAT_RESOLVE_FAILED)
+        # пробрасываем как есть — не маскируем под CHAT_FETCH_FAILED.
+        raise
     except Exception as e:
         raise ValueError(f"CHAT_FETCH_FAILED: {str(e)}")
 
